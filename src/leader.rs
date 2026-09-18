@@ -274,6 +274,25 @@ async fn hold_and_renew(
         tokio::time::sleep_until(std::cmp::min(TokioInstant::now() + RETRY_PERIOD, deadline)).await;
         match tokio::time::timeout_at(deadline, api.get_opt(lease_name)).await {
             Ok(Ok(Some(refreshed))) => {
+                // Crucially, re-check the holder. If another replica acquired the
+                // lease while we were failing to renew, we have genuinely lost it.
+                // Looping round to `replace` with ourselves as holder would steal
+                // it back from a replica that has already set its own
+                // `is_leader = true` — two active leaders at once, which is the
+                // exact split brain this module exists to prevent.
+                let still_ours = refreshed
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.holder_identity.as_deref())
+                    == Some(identity);
+                if !still_ours {
+                    tracing::warn!(
+                        identity = %identity,
+                        "lost leadership: lease was acquired by another replica while renewal was failing"
+                    );
+                    is_leader.store(false, Ordering::Relaxed);
+                    return;
+                }
                 resource_version = refreshed.metadata.resource_version.clone().unwrap_or_default();
                 existing = Some(refreshed);
             }
@@ -383,6 +402,22 @@ mod tests {
         assert_eq!(
             decide_lease_action(Some(&lease), "me", 200, 15),
             LeaseAction::Acquire {
+                resource_version: "1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn held_by_self_but_already_expired_still_returns_renew() {
+        // Holder-is-self takes priority over expiry: `hold_and_renew` is the
+        // right next step even for a lease we have let go stale. This is also
+        // why that function must re-check the holder after a failed renewal —
+        // it can legitimately be entered on an expired lease that another
+        // replica is about to (or already has) taken over.
+        let lease = state(Some("me"), Some(100));
+        assert_eq!(
+            decide_lease_action(Some(&lease), "me", 500, 15),
+            LeaseAction::Renew {
                 resource_version: "1".to_string()
             }
         );
