@@ -27,7 +27,11 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| format!("platform-controller-{}", std::process::id()));
 
     let is_leader = Arc::new(AtomicBool::new(false));
-    tokio::spawn(leader::run(
+    // Supervised below in the `select!`, not fire-and-forget: `tokio::spawn`
+    // swallows panics, and `leader::run` never returns normally, so a panic
+    // would otherwise latch `is_leader` at its last value forever with no log
+    // signal — a phantom leader or a phantom standby.
+    let mut leader_handle = tokio::spawn(leader::run(
         client.clone(),
         LEASE_NAMESPACE.to_string(),
         LEASE_NAME.to_string(),
@@ -69,8 +73,27 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::select! {
         _ = controller => {}
+        // `leader::run` loops forever, so this branch only resolves if it
+        // panicked. Exit non-zero and let Kubernetes restart the pod rather than
+        // limp on with a permanently stale `is_leader` flag.
+        join_result = &mut leader_handle => {
+            tracing::error!(?join_result, "leader-election task exited unexpectedly");
+            return Err(anyhow::anyhow!(
+                "leader-election task exited unexpectedly: {join_result:?}"
+            ));
+        }
+        // SIGTERM wins this race by *dropping* the Controller future, which
+        // aborts any in-flight reconcile wherever it happened to be — unlike
+        // lease loss, which only gates the *next* reconcile. That is safe
+        // because the successor leader's next reconcile re-applies the full
+        // resource set tracked in `status.appliedResources`, converging no
+        // matter how far the interrupted reconcile got.
         _ = sigterm.recv() => {
             tracing::info!("received SIGTERM, releasing lease if held");
+            // Stop the renewal loop before releasing: otherwise its next
+            // `get_opt` could land after `release`'s write, still see itself as
+            // holder, and silently re-renew — undoing the graceful handoff.
+            leader_handle.abort();
             leader::release(client, LEASE_NAMESPACE.to_string(), LEASE_NAME.to_string(), identity).await;
         }
     }

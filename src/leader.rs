@@ -101,10 +101,26 @@ pub async fn run(
     let api: Api<Lease> = Api::namespaced(client, &namespace);
 
     loop {
-        let existing = match api.get_opt(&lease_name).await {
-            Ok(existing) => existing,
-            Err(err) => {
+        // Wall-clock-bound the fetch. `kube`'s client defaults to no read
+        // timeout and retries internally, so a wedged apiserver connection can
+        // otherwise park this loop for minutes while `is_leader` stays latched
+        // at whatever it last was — a stuck "leader" long after the lease
+        // expired and a standby took over. Dropping the future (which is what
+        // an elapsed `timeout` does) cancels the in-flight hyper request rather
+        // than leaking it.
+        let existing = match tokio::time::timeout(RENEW_DEADLINE, api.get_opt(&lease_name)).await {
+            Ok(Ok(existing)) => existing,
+            Ok(Err(err)) => {
                 tracing::warn!(error = %err, "failed to fetch lease, retrying");
+                is_leader.store(false, Ordering::Relaxed);
+                tokio::time::sleep(RETRY_PERIOD).await;
+                continue;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_seconds = RENEW_DEADLINE.as_secs(),
+                    "timed out fetching lease, retrying"
+                );
                 is_leader.store(false, Ordering::Relaxed);
                 tokio::time::sleep(RETRY_PERIOD).await;
                 continue;
@@ -118,13 +134,22 @@ pub async fn run(
         match action {
             LeaseAction::Create => {
                 let lease = build_lease(&lease_name, &identity, LEASE_DURATION_SECONDS, now, 0, None, None);
-                match api.create(&PostParams::default(), &lease).await {
-                    Ok(_) => {
+                match tokio::time::timeout(RENEW_DEADLINE, api.create(&PostParams::default(), &lease)).await {
+                    Ok(Ok(_)) => {
                         tracing::info!(identity = %identity, "acquired leadership (created lease)");
                         is_leader.store(true, Ordering::Relaxed);
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         tracing::debug!(error = %err, "failed to create lease, likely lost race");
+                        is_leader.store(false, Ordering::Relaxed);
+                    }
+                    Err(_elapsed) => {
+                        // Not a lost race — a wedged request. Bounded so this
+                        // loop cannot silently stall forever unable to acquire.
+                        tracing::warn!(
+                            timeout_seconds = RENEW_DEADLINE.as_secs(),
+                            "timed out creating lease, retrying"
+                        );
                         is_leader.store(false, Ordering::Relaxed);
                     }
                 }
@@ -146,13 +171,25 @@ pub async fn run(
                     None,
                     Some(resource_version),
                 );
-                match api.replace(&lease_name, &PostParams::default(), &lease).await {
-                    Ok(_) => {
+                match tokio::time::timeout(
+                    RENEW_DEADLINE,
+                    api.replace(&lease_name, &PostParams::default(), &lease),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
                         tracing::info!(identity = %identity, "acquired leadership");
                         is_leader.store(true, Ordering::Relaxed);
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         tracing::debug!(error = %err, "failed to acquire lease, likely lost race");
+                        is_leader.store(false, Ordering::Relaxed);
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            timeout_seconds = RENEW_DEADLINE.as_secs(),
+                            "timed out acquiring lease, retrying"
+                        );
                         is_leader.store(false, Ordering::Relaxed);
                     }
                 }
@@ -177,6 +214,15 @@ async fn hold_and_renew(
     mut resource_version: String,
     is_leader: &AtomicBool,
 ) {
+    // Every networked call below is bounded by this single absolute instant via
+    // `timeout_at`, not by a fresh `RENEW_DEADLINE` each time. That is the whole
+    // point: whatever is left of the budget when an attempt starts is exactly
+    // how long that attempt gets, so the total wall-clock time this function can
+    // spend across all of its retries and API calls combined stays capped at
+    // RENEW_DEADLINE. A flat `timeout(RENEW_DEADLINE, ...)` per attempt would
+    // let one hung call consume the entire budget and then some, which is how a
+    // replica ends up still believing `is_leader == true` well after the lease's
+    // LEASE_DURATION_SECONDS expiry let a standby take over — split brain.
     let deadline = TokioInstant::now() + RENEW_DEADLINE;
     loop {
         let now = Timestamp::now();
@@ -199,35 +245,46 @@ async fn hold_and_renew(
             Some(resource_version.clone()),
         );
 
-        match api.replace(lease_name, &PostParams::default(), &lease).await {
-            Ok(_) => {
+        match tokio::time::timeout_at(deadline, api.replace(lease_name, &PostParams::default(), &lease)).await {
+            Ok(Ok(_)) => {
                 is_leader.store(true, Ordering::Relaxed);
+                // Pacing before the next renewal attempt, not part of the
+                // renewal budget: the lease was just refreshed, so sleeping
+                // here cannot strand a stale leader.
                 tokio::time::sleep(RETRY_PERIOD).await;
                 return;
             }
-            Err(err) => {
-                tracing::warn!(error = %err, "lease renewal failed");
-                if TokioInstant::now() >= deadline {
-                    tracing::warn!(identity = %identity, "lost leadership after failing to renew within deadline");
-                    is_leader.store(false, Ordering::Relaxed);
-                    return;
-                }
-                tokio::time::sleep(RETRY_PERIOD).await;
-                match api.get_opt(lease_name).await {
-                    Ok(Some(refreshed)) => {
-                        resource_version = refreshed.metadata.resource_version.clone().unwrap_or_default();
-                        existing = Some(refreshed);
-                    }
-                    Ok(None) => {
-                        is_leader.store(false, Ordering::Relaxed);
-                        return;
-                    }
-                    Err(_) => {
-                        // Keep retrying with the same resource_version; it will
-                        // conflict-fail again and this loop re-checks the
-                        // deadline on the next iteration.
-                    }
-                }
+            // Both a real API error and an elapsed timeout mean "this attempt
+            // failed"; they only differ in what gets logged, so they converge on
+            // the shared deadline-check/back-off/refetch path below.
+            Ok(Err(err)) => tracing::warn!(error = %err, "lease renewal failed"),
+            Err(_elapsed) => tracing::warn!(
+                identity = %identity,
+                "lease renewal timed out against the renew deadline"
+            ),
+        }
+
+        if TokioInstant::now() >= deadline {
+            tracing::warn!(identity = %identity, "lost leadership after failing to renew within deadline");
+            is_leader.store(false, Ordering::Relaxed);
+            return;
+        }
+        // Clamp the back-off to the deadline too, so the retry pause cannot
+        // itself push this function past its budget.
+        tokio::time::sleep_until(std::cmp::min(TokioInstant::now() + RETRY_PERIOD, deadline)).await;
+        match tokio::time::timeout_at(deadline, api.get_opt(lease_name)).await {
+            Ok(Ok(Some(refreshed))) => {
+                resource_version = refreshed.metadata.resource_version.clone().unwrap_or_default();
+                existing = Some(refreshed);
+            }
+            Ok(Ok(None)) => {
+                is_leader.store(false, Ordering::Relaxed);
+                return;
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Keep retrying with the same resource_version; it will
+                // conflict-fail again and this loop re-checks the
+                // deadline on the next iteration.
             }
         }
     }
@@ -235,8 +292,16 @@ async fn hold_and_renew(
 
 pub async fn release(client: Client, namespace: String, lease_name: String, identity: String) {
     let api: Api<Lease> = Api::namespaced(client, &namespace);
-    let existing = match api.get_opt(&lease_name).await {
-        Ok(Some(existing)) => existing,
+    // Both calls here are bounded too: this runs on the SIGTERM path with the
+    // process waiting on it, so an unbounded request would stall shutdown until
+    // the kubelet's grace period expired and SIGKILLed us — delaying the very
+    // handoff this function exists to speed up.
+    let existing = match tokio::time::timeout(RENEW_DEADLINE, api.get_opt(&lease_name)).await {
+        Ok(Ok(Some(existing))) => existing,
+        Err(_elapsed) => {
+            tracing::warn!("timed out fetching lease for release on shutdown");
+            return;
+        }
         _ => return,
     };
 
@@ -266,9 +331,15 @@ pub async fn release(client: Client, namespace: String, lease_name: String, iden
         }),
     };
 
-    match api.replace(&lease_name, &PostParams::default(), &lease).await {
-        Ok(_) => tracing::info!(identity = %identity, "released lease on shutdown"),
-        Err(err) => tracing::warn!(error = %err, "failed to release lease on shutdown"),
+    match tokio::time::timeout(
+        RENEW_DEADLINE,
+        api.replace(&lease_name, &PostParams::default(), &lease),
+    )
+    .await
+    {
+        Ok(Ok(_)) => tracing::info!(identity = %identity, "released lease on shutdown"),
+        Ok(Err(err)) => tracing::warn!(error = %err, "failed to release lease on shutdown"),
+        Err(_elapsed) => tracing::warn!("timed out releasing lease on shutdown"),
     }
 }
 
