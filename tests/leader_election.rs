@@ -40,10 +40,29 @@
 //   sed 's|image: platform-controller:latest|image: registry.local:5005/platform-controller:latest|' \
 //     deploy/bootstrap.yaml | kubectl apply -f -
 //   # wait for both replicas to be Running, then:
-//   cargo test --test leader_election -- --ignored --nocapture
+//   cargo test --test leader_election -- --ignored --nocapture --test-threads=1
 //
 //   talosctl cluster destroy --name platform-controller-mvp
 //   docker rm -f platform-registry
+//
+// `--test-threads=1` is REQUIRED, not cosmetic: all three tests in this file
+// mutate the same singleton Lease and the same two pods, so running them
+// concurrently (cargo's default) makes them fight each other and fail
+// nondeterministically. Verified: serially, all three pass in ~20s total.
+//
+// Note on iterating on the controller itself: the Deployment uses
+// `imagePullPolicy: IfNotPresent` with the `:latest` tag, so re-pushing
+// `:latest` and deleting the pods does NOT pick up a rebuilt image — the nodes
+// keep the cached layer. Push a fresh tag and roll onto it instead:
+//
+//   docker tag platform-controller:latest localhost:5005/platform-controller:t2
+//   docker push localhost:5005/platform-controller:t2
+//   kubectl set image -n platform-system deployment/platform-controller \
+//     platform-controller=registry.local:5005/platform-controller:t2
+//   kubectl rollout status -n platform-system deployment/platform-controller
+//   # confirm the digest actually changed:
+//   kubectl get pods -n platform-system -l app=platform-controller \
+//     -o custom-columns='NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID'
 
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Pod;
