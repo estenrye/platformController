@@ -1,0 +1,45 @@
+---
+name: rbac-cluster-admin-tradeoff
+description: The platform-controller's bootstrap ServiceAccount is bound to cluster-admin (must be revisited before production); tracks per-component permission requirements for a future scope-down
+metadata:
+  type: project
+---
+
+The `platform-controller`'s bootstrap manifest (`deploy/bootstrap.yaml`) binds the controller's ServiceAccount to the built-in `cluster-admin` ClusterRole, rather than a scoped custom role.
+
+**Why:** the `tigera-operator` Helm chart (which installs Calico) creates its own ClusterRole with a long, version-dependent permission list (pods, CRDs, networkpolicies, webhooks, jobs, leases, etc.). Kubernetes' privilege-escalation prevention means the controller can only grant permissions it already holds. An initial hand-enumerated permission list was incomplete and caused reconcile to 403. The fix was ruled during [[calico-talos-mvp-2026-09]] implementation: bind to `cluster-admin` instead of maintaining an enumerated list, since (a) the project's spec already explicitly accepts "no fine-grained RBAC scoping" as an MVP trade-off deferred to a fast-follow, and (b) hand-enumerating permissions is fragile — it silently breaks again on the next Calico chart version bump that adds a new resource type.
+
+**The trade-off is bigger than the spec anticipated.** The spec's "broad ClusterRole" language assumed something like "more permissions than strictly needed," not literal root access to the cluster. `cluster-admin` is the maximum privilege level available. This is acceptable for a sandboxed dev/test cluster but is a real production security exposure.
+
+**How to apply:** flag this explicitly whenever asked to review, harden, or productionize this controller, or when building new components that share its ServiceAccount/RBAC. Before any real/production deployment, this needs to be scoped down to the actual permission set the controller and its managed components require (Calico's chart plus whatever future components get added) — likely as its own dedicated task once the MVP's set of managed components stabilizes, since scoping RBAC too early would mean re-deriving it on every new component added.
+
+Documented in-repo at `deploy/bootstrap.yaml` (comment) and in PR #2's description; not yet acted upon as of this writing.
+
+## Permission ledger (for scoping RBAC down later)
+
+Running inventory of what each managed component actually needs, so a future scope-down task doesn't have to re-derive this from scratch. Update this table whenever a new component is added to the controller or a chart-version bump changes what it needs. Verbs are approximate (`get/list/watch/create/update/patch/delete` unless noted) — re-check exact verbs against the pinned chart version's rendered ClusterRole before actually cutting anything over, since chart bumps can add resources silently.
+
+| apiGroup | Resources | Required by | Notes |
+|---|---|---|---|
+| `""` (core) | `namespaces`, `serviceaccounts`, `configmaps`, `secrets`, `services` | Controller itself | Original hand-rolled ClusterRole (pre-cluster-admin) already granted these |
+| `""` (core) | `pods`, `podtemplates`, `endpoints`, `events`, `nodes`, `resourcequotas` | `tigera-operator` chart (Calico) | Found missing from the original ClusterRole during final review (2026-09-18); root cause of the 403 that motivated the cluster-admin switch |
+| `apps` | `deployments`, `daemonsets` | Controller itself | Original ClusterRole |
+| `apps` | `statefulsets`, `deployments/finalizers` | `tigera-operator` chart | Found missing during final review |
+| `rbac.authorization.k8s.io` | `clusterroles`, `clusterrolebindings`, `roles`, `rolebindings` | Controller itself, to create the operator's own ClusterRole | Needs `escalate`/`bind` verbs too (privilege-escalation prevention) — this was the actual C1 defect, not just a missing resource type |
+| `apiextensions.k8s.io` | `customresourcedefinitions` | Controller itself | Applies the tigera-operator CRDs from the chart's `--include-crds` output |
+| `admissionregistration.k8s.io` | `validatingwebhookconfigurations` | Controller itself | Original ClusterRole |
+| `admissionregistration.k8s.io` | `mutatingwebhookconfigurations` | `tigera-operator` chart | Found missing during final review — original only granted *validating* |
+| `apiregistration.k8s.io` | `apiservices` | Controller itself | Original ClusterRole |
+| `operator.tigera.io` | `*` (wildcard) incl. `*/status`, `*/finalizers` | `tigera-operator` chart | Operator's own CRs (`Installation`, `APIServer`, etc.) |
+| `crd.projectcalico.org`, `projectcalico.org` | incl. `tier.networkpolicies`, `tiers` | `tigera-operator` chart | Found missing during final review |
+| `networking.k8s.io` | `networkpolicies` | `tigera-operator` chart | Found missing during final review |
+| `scheduling.k8s.io` | `priorityclasses` | `tigera-operator` chart | Found missing during final review |
+| `policy` | `poddisruptionbudgets`, `podsecuritypolicies` | `tigera-operator` chart | Found missing during final review |
+| `coordination.k8s.io` | `leases` | `tigera-operator` chart | Found missing during final review (likely leader-election support inside the operator itself) |
+| `storage.k8s.io` | `csidrivers` | `tigera-operator` chart | Found missing during final review |
+| `certificates.k8s.io` | `certificatesigningrequests` | `tigera-operator` chart | Found missing during final review |
+| `batch` | `jobs` | *Not currently needed* | The chart's `pre-delete` hook Job would need this, but `--no-hooks` (added to fix C2 — see [[calico-talos-mvp-2026-09]]) means that Job is never rendered/applied. Only add this back if hook-based rendering is ever re-enabled. |
+| `platform.rye.ninja` | `cniinstallations`, `cniinstallations/status` | Controller itself | Its own CRD — get/list/watch/update/patch (no delete needed, it doesn't self-manage) |
+| `""` (core) | `events` (create) | *Not currently needed* | Would be required if Kubernetes `Event` emission (spec §4) is ever implemented — current observability is `tracing` log calls only, no `Recorder`/Event objects, so this permission is unused today |
+
+**Pattern so far:** every row labeled "Controller itself" is stable (it's the controller's own CRD + the objects it needs to create for *any* Helm-chart-based component). Every row labeled "`tigera-operator` chart" is Calico-specific and was only discovered by actually rendering that chart and hitting real 403s — meaning **the same discovery process will likely be needed for every future component** (render its chart/manifests, diff against the current cluster-admin-shadowed permission set, add rows here). This table is the input to that future scope-down task, not a finished spec.

@@ -1,0 +1,115 @@
+use kube::api::DynamicObject;
+use serde::Deserialize;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ManifestError {
+    #[error("failed to parse manifest document {index} as YAML: {source}")]
+    Yaml {
+        index: usize,
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error("failed to convert manifest document {index} into a Kubernetes object: {source}")]
+    Json {
+        index: usize,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+pub fn parse_manifests(rendered: &str) -> Result<Vec<DynamicObject>, ManifestError> {
+    let mut objects = Vec::new();
+
+    for (index, document) in serde_yaml::Deserializer::from_str(rendered).enumerate() {
+        let value = serde_yaml::Value::deserialize(document)
+            .map_err(|source| ManifestError::Yaml { index, source })?;
+
+        if value.is_null() {
+            continue;
+        }
+
+        let json = serde_json::to_value(&value).map_err(|source| ManifestError::Json { index, source })?;
+        let object: DynamicObject =
+            serde_json::from_value(json).map_err(|source| ManifestError::Json { index, source })?;
+
+        objects.push(object);
+    }
+
+    Ok(objects)
+}
+
+pub fn apply_rank(obj: &DynamicObject) -> u8 {
+    let kind = obj.types.as_ref().map(|t| t.kind.as_str()).unwrap_or("");
+    match kind {
+        "Namespace" => 0,
+        "CustomResourceDefinition" => 1,
+        "ServiceAccount" | "ClusterRole" | "ClusterRoleBinding" | "Role" | "RoleBinding" => 2,
+        "ConfigMap" | "Secret" | "Service" | "ValidatingWebhookConfiguration" | "APIService" => 3,
+        "Deployment" | "DaemonSet" => 4,
+        _ => 5,
+    }
+}
+
+pub fn sort_manifests(objects: &mut Vec<DynamicObject>) {
+    objects.sort_by_key(apply_rank);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_MANIFESTS: &str = r#"
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tigera-operator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigera-operator
+  namespace: tigera-operator
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: installations.operator.tigera.io
+---
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+"#;
+
+    #[test]
+    fn parses_every_document_into_a_dynamic_object() {
+        let objects = parse_manifests(SAMPLE_MANIFESTS).expect("manifests should parse");
+        assert_eq!(objects.len(), 4);
+        assert_eq!(objects[0].types.as_ref().unwrap().kind, "Namespace");
+    }
+
+    #[test]
+    fn skips_empty_documents() {
+        let objects = parse_manifests(
+            "---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: x\n---\n---\n",
+        )
+        .expect("manifests should parse");
+        assert_eq!(objects.len(), 1);
+    }
+
+    #[test]
+    fn sorts_namespaces_and_crds_before_workloads_and_operator_crs_last() {
+        let mut objects = parse_manifests(SAMPLE_MANIFESTS).expect("manifests should parse");
+        sort_manifests(&mut objects);
+
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|o| o.types.as_ref().unwrap().kind.as_str())
+            .collect();
+
+        assert_eq!(
+            kinds,
+            vec!["Namespace", "CustomResourceDefinition", "Deployment", "Installation"]
+        );
+    }
+}

@@ -1,0 +1,154 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: cniinstallations.platform.rye.ninja
+spec:
+  group: platform.rye.ninja
+  names:
+    kind: CniInstallation
+    plural: cniinstallations
+    shortNames:
+    - cni
+    singular: cniinstallation
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CniInstallationSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              calico:
+                properties:
+                  apiServerEnabled:
+                    default: false
+                    type: boolean
+                  bgpEnabled:
+                    default: false
+                    type: boolean
+                  chartVersion:
+                    type: string
+                  ipPools:
+                    default: []
+                    items:
+                      properties:
+                        blockSize:
+                          default: 26
+                          format: int32
+                          type: integer
+                        cidr:
+                          type: string
+                        encapsulation:
+                          default: None
+                          enum:
+                          - IPIP
+                          - VXLAN
+                          - None
+                          type: string
+                        name:
+                          type: string
+                        natOutgoing:
+                          default: true
+                          type: boolean
+                        nodeSelector:
+                          default: all()
+                          type: string
+                      required:
+                      - cidr
+                      - name
+                      type: object
+                    type: array
+                  nodeAddressAutodetectionV6Cidrs:
+                    default: []
+                    items:
+                      type: string
+                    type: array
+                required:
+                - chartVersion
+                type: object
+              platformKind:
+                enum:
+                - talos-linux
+                type: string
+              provider:
+                enum:
+                - calico
+                type: string
+            required:
+            - calico
+            - platformKind
+            - provider
+            type: object
+          status:
+            nullable: true
+            properties:
+              appliedResources:
+                default: []
+                items:
+                  properties:
+                    apiVersion:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      default: ''
+                      type: string
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  type: object
+                type: array
+              chartVersion:
+                default: ''
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                default: 0
+                format: int64
+                type: integer
+              phase:
+                default: Pending
+                enum:
+                - Pending
+                - Installing
+                - Ready
+                - Failed
+                type: string
+            type: object
+        required:
+        - spec
+        title: CniInstallation
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

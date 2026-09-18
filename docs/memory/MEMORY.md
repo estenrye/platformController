@@ -1,0 +1,2 @@
+- [RBAC cluster-admin trade-off](rbac-cluster-admin-tradeoff.md) — controller SA bound to cluster-admin; tracks per-component permission ledger for future scope-down
+- [Calico-Talos MVP status](calico-talos-mvp-2026-09.md) — first vertical slice of goals.md's vision, PR #2 open, worktree calico-talos-mvp
