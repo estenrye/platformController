@@ -48,6 +48,12 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
     let api: kube::Api<CniInstallation> = kube::Api::all(ctx.client.clone());
     let chart_version = obj.spec.calico.chart_version.clone();
 
+    let previous = obj
+        .status
+        .as_ref()
+        .map(|status| status.applied_resources.clone())
+        .unwrap_or_default();
+
     if let Err(err) = validate(&obj.spec) {
         update_status(
             &api,
@@ -55,7 +61,7 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
             Phase::Failed,
             obj.metadata.generation,
             &chart_version,
-            &[],
+            &previous,
             "Unsupported",
             &err.to_string(),
         )
@@ -73,11 +79,6 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
         applied.push(reference);
     }
 
-    let previous = obj
-        .status
-        .as_ref()
-        .map(|status| status.applied_resources.clone())
-        .unwrap_or_default();
     for stale in crate::apply::resources_to_prune(&previous, &applied) {
         crate::apply::delete_object(&ctx.client, &stale).await?;
     }
