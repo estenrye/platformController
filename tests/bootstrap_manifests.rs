@@ -18,6 +18,7 @@ fn bootstrap_yaml_parses_into_expected_kinds_in_apply_order() {
             "ServiceAccount",
             "ClusterRoleBinding",
             "Deployment",
+            "PodDisruptionBudget",
             "CniInstallation",
         ]
     );

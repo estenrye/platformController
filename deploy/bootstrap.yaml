@@ -38,7 +38,7 @@ metadata:
   name: platform-controller
   namespace: platform-system
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: platform-controller
@@ -67,6 +67,18 @@ spec:
           effect: NoSchedule
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
+      # Preferred, not required: a small dev/test cluster may only have one or
+      # two control-plane nodes, and a hard requirement could leave a replica
+      # permanently unschedulable.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: platform-controller
       containers:
         - name: platform-controller
           image: platform-controller:latest
@@ -74,6 +86,21 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: platform-controller
+  namespace: platform-system
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platform-controller
 ---
 apiVersion: platform.rye.ninja/v1alpha1
 kind: CniInstallation
