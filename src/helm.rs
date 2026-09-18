@@ -48,6 +48,61 @@ fn encapsulation_str(encapsulation: &Encapsulation) -> &'static str {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum HelmError {
+    #[error("failed to write helm values file: {0}")]
+    WriteValues(#[source] std::io::Error),
+    #[error("failed to launch helm: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("helm exited with status {status}: {stderr}")]
+    NonZeroExit {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+}
+
+pub fn build_render_args(chart_version: &str, values_path: &std::path::Path) -> Vec<String> {
+    vec![
+        "template".to_string(),
+        "calico".to_string(),
+        "--repo".to_string(),
+        "https://projectcalico.docs.tigera.io/charts".to_string(),
+        "tigera-operator".to_string(),
+        "--version".to_string(),
+        chart_version.to_string(),
+        "--values".to_string(),
+        values_path.display().to_string(),
+        "--include-crds".to_string(),
+    ]
+}
+
+pub async fn render(calico: &CalicoSpec) -> Result<String, HelmError> {
+    let values = build_values(calico);
+    let yaml = serde_yaml::to_string(&values).expect("serde_json::Value always serializes to YAML");
+
+    let mut file = tempfile::NamedTempFile::new().map_err(HelmError::WriteValues)?;
+    {
+        use std::io::Write;
+        file.write_all(yaml.as_bytes()).map_err(HelmError::WriteValues)?;
+    }
+
+    let args = build_render_args(&calico.chart_version, file.path());
+    let output = tokio::process::Command::new("helm")
+        .args(&args)
+        .output()
+        .await
+        .map_err(HelmError::Spawn)?;
+
+    if !output.status.success() {
+        return Err(HelmError::NonZeroExit {
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +159,44 @@ mod tests {
             values["installation"]["calicoNetwork"]["ipPools"][0]["encapsulation"],
             "VXLAN"
         );
+    }
+
+    #[test]
+    fn render_args_pin_chart_repo_and_version() {
+        let path = std::path::Path::new("/tmp/values.yaml");
+        let args = build_render_args("v3.29.1", path);
+
+        assert_eq!(
+            args,
+            vec![
+                "template".to_string(),
+                "calico".to_string(),
+                "--repo".to_string(),
+                "https://projectcalico.docs.tigera.io/charts".to_string(),
+                "tigera-operator".to_string(),
+                "--version".to_string(),
+                "v3.29.1".to_string(),
+                "--values".to_string(),
+                "/tmp/values.yaml".to_string(),
+                "--include-crds".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn render_produces_deployment_manifest_for_tigera_operator() {
+        let spec = crate::crd::CalicoSpec {
+            chart_version: "v3.29.1".to_string(),
+            bgp_enabled: false,
+            api_server_enabled: false,
+            ip_pools: vec![],
+            node_address_autodetection_v6_cidrs: vec![],
+        };
+
+        let rendered = render(&spec).await.expect("helm template should succeed");
+
+        assert!(rendered.contains("kind: Deployment"));
+        assert!(rendered.contains("tigera-operator"));
     }
 }
