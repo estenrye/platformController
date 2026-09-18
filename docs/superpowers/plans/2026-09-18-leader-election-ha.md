@@ -15,7 +15,7 @@
 - Lease: name `platform-controller-leader`, namespace `platform-system`.
 - Timings: `leaseDurationSeconds: 15`, `renewDeadlineSeconds: 10`, `retryPeriodSeconds: 2`.
 - Every replica runs the full, unmodified `Controller` loop at all times. Leadership is enforced only by a check at the very start of `reconcile()`, not by starting/stopping the Controller machinery.
-- "Hard cutover, let it finish": no explicit cancellation or drain logic anywhere in this plan. A reconcile that started while leader always runs to completion untouched.
+- "Hard cutover, let it finish": no explicit cancellation or drain logic anywhere in this plan. A reconcile that started while leader always runs to completion untouched **when leadership is what changed** — the `is_leader` flag is only read at the start of a reconcile, so nothing interrupts one in progress. This does *not* extend to process shutdown: SIGTERM (Task 4) wins a `tokio::select!` race that drops the `Controller` future, and `kube-runtime` drives reconciles inline on that future rather than on separate tasks, so an in-flight reconcile is cut off wherever it was. That is safe because the successor leader re-applies the full resource set from `status.appliedResources`. See spec §2.
 - Deployment: `replicas: 2`, preferred pod anti-affinity on `kubernetes.io/hostname`, a `PodDisruptionBudget` with `maxUnavailable: 1`.
 - No RBAC manifest changes — `coordination.k8s.io/leases` is already covered by the existing `cluster-admin` binding — but the permission ledger at `docs/memory/rbac-cluster-admin-tradeoff.md` must gain a row for it.
 - SIGTERM triggers a best-effort Lease release (if currently leader) before the process exits.

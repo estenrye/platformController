@@ -70,6 +70,17 @@ spec:
       # Preferred, not required: a small dev/test cluster may only have one or
       # two control-plane nodes, and a hard requirement could leave a replica
       # permanently unschedulable.
+      #
+      # Consequence on a single control-plane node (e.g. this project's own
+      # Talos-in-Docker test recipe, `talosctl cluster create --workers 1`):
+      # both replicas co-locate, and the PodDisruptionBudget below
+      # (maxUnavailable: 1) will then PERMANENTLY BLOCK a `kubectl drain` or
+      # node upgrade of that node. The first eviction succeeds; the second is
+      # refused forever, since evicting it would leave 0 healthy replicas
+      # against a budget requiring at least 1. Before draining a
+      # single-control-plane-node cluster, either drop the PDB temporarily
+      # (`kubectl delete pdb -n platform-system platform-controller`) or use
+      # `kubectl drain --disable-eviction`.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -96,6 +107,11 @@ kind: PodDisruptionBudget
 metadata:
   name: platform-controller
   namespace: platform-system
+# Gates the Eviction API only (node drains, autoscaler scale-down) — NOT this
+# Deployment's own rollout, which is governed solely by its
+# strategy.rollingUpdate defaults (25% maxUnavailable -> 0, 25% maxSurge -> 1 at
+# 2 replicas, i.e. surge-then-replace). See the drain-deadlock warning on the
+# pod anti-affinity above before draining a single-control-plane-node cluster.
 spec:
   maxUnavailable: 1
   selector:
