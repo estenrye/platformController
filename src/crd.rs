@@ -1,4 +1,3 @@
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -94,7 +93,6 @@ pub struct CniInstallationStatus {
     #[serde(default)]
     pub applied_resources: Vec<AppliedResourceRef>,
     #[serde(default)]
-    #[schemars(skip)]
     pub conditions: Vec<Condition>,
 }
 
@@ -115,6 +113,19 @@ pub struct AppliedResourceRef {
     #[serde(default)]
     pub namespace: String,
     pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status: String,
+    pub reason: String,
+    pub message: String,
+    pub last_transition_time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
 }
 
 #[cfg(test)]
@@ -179,5 +190,63 @@ mod tests {
         assert_eq!(crd.spec.group, "platform.rye.ninja");
         assert_eq!(crd.spec.names.kind, "CniInstallation");
         assert_eq!(crd.spec.scope, "Cluster");
+    }
+
+    #[test]
+    fn condition_serializes_with_correct_camel_case() {
+        let condition = Condition {
+            type_: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: "Installed".to_string(),
+            message: "Calico installed successfully".to_string(),
+            last_transition_time: "2026-09-18T12:00:00Z".to_string(),
+            observed_generation: Some(1),
+        };
+
+        let json = serde_json::to_value(&condition).expect("should serialize");
+
+        // Verify the JSON has camelCase keys as expected
+        assert!(json.get("type").is_some(), "JSON should have 'type' key");
+        assert!(json.get("status").is_some(), "JSON should have 'status' key");
+        assert!(json.get("reason").is_some(), "JSON should have 'reason' key");
+        assert!(json.get("message").is_some(), "JSON should have 'message' key");
+        assert!(json.get("lastTransitionTime").is_some(), "JSON should have 'lastTransitionTime' key");
+        assert!(json.get("observedGeneration").is_some(), "JSON should have 'observedGeneration' key");
+
+        // Verify values are preserved
+        assert_eq!(json.get("type").unwrap().as_str(), Some("Ready"));
+        assert_eq!(json.get("status").unwrap().as_str(), Some("True"));
+    }
+
+    #[test]
+    fn crd_schema_includes_conditions_in_status() {
+        let crd = CniInstallation::crd();
+
+        // Navigate to the schema for the status subresource
+        let schema = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .expect("schema should exist");
+
+        let openapi_schema = schema
+            .open_api_v3_schema
+            .as_ref()
+            .expect("openapi_v3_schema should exist");
+
+        // Convert to serde_json::Value to easily navigate the JSON structure
+        let schema_json = serde_json::to_value(openapi_schema)
+            .expect("should convert schema to JSON");
+
+        // Navigate to status.properties.conditions
+        let status_properties = schema_json
+            .get("properties")
+            .and_then(|p| p.get("status"))
+            .and_then(|s| s.get("properties"))
+            .expect("status.properties should exist");
+
+        assert!(
+            status_properties.get("conditions").is_some(),
+            "status.properties should include 'conditions'"
+        );
     }
 }
