@@ -62,8 +62,11 @@ fn default_nat_outgoing() -> bool {
     true
 }
 
+/// Calico's own IPv4 default. The valid range is 20-32 for IPv4 CIDRs (116-128
+/// for IPv6), so an IPv6-shaped default such as 112 makes the operator reject
+/// the rendered `Installation` for the common IPv4 case.
 fn default_block_size() -> i32 {
-    112
+    26
 }
 
 fn default_node_selector() -> String {
@@ -180,7 +183,7 @@ mod tests {
 
         assert_eq!(pool.encapsulation, Encapsulation::None);
         assert!(pool.nat_outgoing);
-        assert_eq!(pool.block_size, 112);
+        assert_eq!(pool.block_size, 26);
         assert_eq!(pool.node_selector, "all()");
     }
 

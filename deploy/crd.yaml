@@ -34,7 +34,7 @@ spec:
                     items:
                       properties:
                         blockSize:
-                          default: 112
+                          default: 26
                           format: int32
                           type: integer
                         cidr:

@@ -1,5 +1,10 @@
 use crate::crd::{CalicoSpec, Encapsulation};
 
+/// Namespace the tigera-operator chart's namespaced objects belong in. The chart
+/// itself renders no `Namespace` object, so the controller both renders into and
+/// creates this namespace explicitly.
+pub const TIGERA_OPERATOR_NAMESPACE: &str = "tigera-operator";
+
 pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
     let ip_pools: Vec<serde_json::Value> = calico
         .ip_pools
@@ -15,16 +20,24 @@ pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
         })
         .collect();
 
+    let mut calico_network = serde_json::json!({
+        "bgp": bool_to_enum(calico.bgp_enabled),
+        "ipPools": ip_pools,
+    });
+
+    // The operator rejects `nodeAddressAutodetectionV6: {cidrs: []}` (an
+    // autodetection method with no method selected), so omit the key entirely
+    // when no CIDRs are configured.
+    if !calico.node_address_autodetection_v6_cidrs.is_empty() {
+        calico_network["nodeAddressAutodetectionV6"] = serde_json::json!({
+            "cidrs": calico.node_address_autodetection_v6_cidrs,
+        });
+    }
+
     serde_json::json!({
         "installation": {
             "enabled": true,
-            "calicoNetwork": {
-                "bgp": bool_to_enum(calico.bgp_enabled),
-                "ipPools": ip_pools,
-                "nodeAddressAutodetectionV6": {
-                    "cidrs": calico.node_address_autodetection_v6_cidrs,
-                },
-            },
+            "calicoNetwork": calico_network,
         },
         "apiServer": {
             "enabled": calico.api_server_enabled,
@@ -73,6 +86,15 @@ pub fn build_render_args(chart_version: &str, values_path: &std::path::Path) -> 
         "--values".to_string(),
         values_path.display().to_string(),
         "--include-crds".to_string(),
+        // Without --no-hooks the chart emits its pre-delete uninstall Job
+        // (tigera-operator-uninstall), which this controller would then apply as
+        // a live object -- immediately tearing Calico back down.
+        "--no-hooks".to_string(),
+        // Without an explicit namespace, helm resolves .Release.Namespace from
+        // ambient kubeconfig context, so namespaced objects land in the wrong
+        // namespace (or "default") instead of tigera-operator.
+        "--namespace".to_string(),
+        TIGERA_OPERATOR_NAMESPACE.to_string(),
     ]
 }
 
@@ -179,8 +201,23 @@ mod tests {
                 "--values".to_string(),
                 "/tmp/values.yaml".to_string(),
                 "--include-crds".to_string(),
+                "--no-hooks".to_string(),
+                "--namespace".to_string(),
+                "tigera-operator".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn omits_node_address_autodetection_v6_when_no_cidrs_configured() {
+        let mut spec = sample_spec();
+        spec.node_address_autodetection_v6_cidrs = vec![];
+
+        let values = build_values(&spec);
+
+        assert!(values["installation"]["calicoNetwork"]
+            .get("nodeAddressAutodetectionV6")
+            .is_none());
     }
 
     #[tokio::test]

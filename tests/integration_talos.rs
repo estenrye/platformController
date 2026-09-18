@@ -1,10 +1,46 @@
-// Run manually against a real Talos-in-Docker cluster:
-//   talosctl cluster create --name platform-controller-mvp --cni=none --wait
-//   export KUBECONFIG=~/.talos/clusters/platform-controller-mvp/kubeconfig
+// Run manually against a real Talos-in-Docker cluster. Verified against
+// talosctl v1.4.6 (Kubernetes v1.27.3) on Docker.
+//
+// talosctl has no `--cni` flag; CNI is disabled with a machine-config patch, and
+// `--wait` must be off because the cluster cannot become "ready" until this
+// controller installs a CNI:
+//
+//   cat > /tmp/cni-none.yaml <<'EOF'
+//   cluster:
+//     network:
+//       cni:
+//         name: none
+//   EOF
+//
+// The controller image is not on a registry the cluster can reach, so serve it
+// from a local registry and point the nodes at it with a registry mirror:
+//
+//   docker run -d --name platform-registry -p 5005:5000 registry:2
+//   docker build -t platform-controller:latest .
+//   docker tag platform-controller:latest localhost:5005/platform-controller:latest
+//   docker push localhost:5005/platform-controller:latest
+//
+//   talosctl cluster create --name platform-controller-mvp --workers 1 \
+//     --wait=false --config-patch @/tmp/cni-none.yaml \
+//     --registry-mirror registry.local:5005=http://10.5.0.1:5005
+//
+// 10.5.0.1 is the gateway of the cluster network talosctl creates, i.e. the host
+// as seen from the nodes. Then fetch a kubeconfig; the node IP is not routable
+// from the host, so retarget it at the published API port:
+//
+//   talosctl --nodes 10.5.0.2 --endpoints 127.0.0.1 kubeconfig /tmp/kubeconfig --force
+//   export KUBECONFIG=/tmp/kubeconfig
+//   kubectl config set-cluster platform-controller-mvp --server=https://127.0.0.1:6443
+//
 //   kubectl apply -f deploy/crd.yaml
-//   kubectl apply -f deploy/bootstrap.yaml
+//   kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.platform.rye.ninja
+//   sed 's|image: platform-controller:latest|image: registry.local:5005/platform-controller:latest|' \
+//     deploy/bootstrap.yaml | kubectl apply -f -
+//
 //   cargo test --test integration_talos -- --ignored --nocapture
+//
 //   talosctl cluster destroy --name platform-controller-mvp
+//   docker rm -f platform-registry
 
 use k8s_openapi::api::core::v1::Node;
 use kube::api::{Api, ListParams};

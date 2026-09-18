@@ -16,7 +16,6 @@ fn bootstrap_yaml_parses_into_expected_kinds_in_apply_order() {
         vec![
             "Namespace",
             "ServiceAccount",
-            "ClusterRole",
             "ClusterRoleBinding",
             "Deployment",
             "CniInstallation",

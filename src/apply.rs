@@ -60,7 +60,10 @@ pub async fn apply_object(
 
     api.patch(
         &name,
-        &kube::api::PatchParams::apply(field_manager),
+        // force(): the controller is the sole owner of these fields. Without it a
+        // one-off field-ownership conflict (e.g. a manual kubectl edit, or a
+        // previous field manager name) wedges every future reconcile.
+        &kube::api::PatchParams::apply(field_manager).force(),
         &kube::api::Patch::Apply(obj),
     )
     .await

@@ -14,36 +14,6 @@ metadata:
   namespace: platform-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: platform-controller
-rules:
-  - apiGroups: [""]
-    resources: ["namespaces", "serviceaccounts", "configmaps", "secrets", "services"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "daemonsets"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["admissionregistration.k8s.io"]
-    resources: ["validatingwebhookconfigurations"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["apiregistration.k8s.io"]
-    resources: ["apiservices"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["operator.tigera.io"]
-    resources: ["*"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["platform.rye.ninja"]
-    resources: ["cniinstallations", "cniinstallations/status"]
-    verbs: ["get", "list", "watch", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: platform-controller
@@ -51,10 +21,16 @@ subjects:
   - kind: ServiceAccount
     name: platform-controller
     namespace: platform-system
+# The controller renders the tigera-operator chart and server-side-applies every
+# object in it, including the operator's own ClusterRole. Kubernetes refuses a
+# Role/ClusterRole create unless the actor already holds every permission being
+# granted, so a hand-maintained rule list would have to mirror Calico's chart
+# exactly and be updated on every chart bump. Binding cluster-admin is the
+# spec's explicitly-accepted MVP trade-off.
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: platform-controller
+  name: cluster-admin
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -73,7 +49,12 @@ spec:
     spec:
       serviceAccountName: platform-controller
       hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # Default, not ClusterFirstWithHostNet: this controller runs *before* a CNI
+      # exists, so cluster DNS (coredns) cannot be running yet. Pointing at the
+      # cluster DNS service IP makes the helm chart-repo lookup fail forever
+      # ("lookup projectcalico.docs.tigera.io on 10.96.0.10:53"). Default
+      # inherits the node's resolv.conf, which works with no pod network.
+      dnsPolicy: Default
       tolerations:
         - key: node.kubernetes.io/not-ready
           operator: Exists
@@ -89,6 +70,7 @@ spec:
       containers:
         - name: platform-controller
           image: platform-controller:latest
+          imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG
               value: info
@@ -109,3 +91,5 @@ spec:
         cidr: 10.244.0.0/16
         encapsulation: VXLAN
         natOutgoing: true
+        # Valid IPv4 blockSize range is 20-32; 26 is the operator's documented default.
+        blockSize: 26
