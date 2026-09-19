@@ -1,5 +1,7 @@
 use crate::crd::AppliedResourceRef;
 use kube::api::DynamicObject;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use std::time::Duration;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ApplyError {
@@ -17,6 +19,12 @@ pub enum ApplyError {
         #[source]
         source: kube::Error,
     },
+    #[error("CRD {name} did not become Established within {timeout:?} (last observed: {detail})")]
+    NotEstablished {
+        name: String,
+        timeout: Duration,
+        detail: String,
+    },
 }
 
 pub fn resource_ref(obj: &DynamicObject) -> AppliedResourceRef {
@@ -26,6 +34,74 @@ pub fn resource_ref(obj: &DynamicObject) -> AppliedResourceRef {
         kind: types.kind,
         namespace: obj.metadata.namespace.clone().unwrap_or_default(),
         name: obj.metadata.name.clone().unwrap_or_default(),
+    }
+}
+
+fn is_established(crd: &CustomResourceDefinition) -> bool {
+    crd.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .map(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == "Established" && condition.status == "True")
+        })
+        .unwrap_or(false)
+}
+
+fn describe_conditions(crd: &CustomResourceDefinition) -> String {
+    crd.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .map(|conditions| {
+            conditions
+                .iter()
+                .map(|c| format!("{}={}", c.type_, c.status))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "no conditions reported".to_string())
+}
+
+pub async fn wait_for_crd_established(
+    client: &kube::Client,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), ApplyError> {
+    let api: kube::Api<CustomResourceDefinition> = kube::Api::all(client.clone());
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut detail = "no status observed".to_string();
+
+    loop {
+        match tokio::time::timeout_at(deadline, api.get(name)).await {
+            Ok(Ok(crd)) => {
+                if is_established(&crd) {
+                    return Ok(());
+                }
+                detail = describe_conditions(&crd);
+            }
+            Ok(Err(source)) => {
+                tracing::debug!(crd = %name, error = %source, "failed to fetch CRD while waiting for Established");
+                detail = format!("fetch error: {source}");
+            }
+            Err(_) => {
+                return Err(ApplyError::NotEstablished {
+                    name: name.to_string(),
+                    timeout,
+                    detail,
+                });
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApplyError::NotEstablished {
+                name: name.to_string(),
+                timeout,
+                detail,
+            });
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -170,5 +246,75 @@ mod tests {
         assert_eq!(reference.kind, "Deployment");
         assert_eq!(reference.namespace, "tigera-operator");
         assert_eq!(reference.name, "tigera-operator");
+    }
+
+    #[test]
+    fn resource_ref_recognizes_custom_resource_definition_kind() {
+        let objects = crate::manifests::parse_manifests(
+            "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: installations.operator.tigera.io\n",
+        )
+        .expect("manifest should parse");
+
+        let reference = resource_ref(&objects[0]);
+
+        assert_eq!(reference.kind, "CustomResourceDefinition");
+    }
+
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+        CustomResourceDefinition, CustomResourceDefinitionCondition, CustomResourceDefinitionStatus,
+    };
+
+    fn crd_with_conditions(conditions: Vec<CustomResourceDefinitionCondition>) -> CustomResourceDefinition {
+        CustomResourceDefinition {
+            status: Some(CustomResourceDefinitionStatus {
+                conditions: Some(conditions),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn condition(type_: &str, status: &str) -> CustomResourceDefinitionCondition {
+        CustomResourceDefinitionCondition {
+            type_: type_.to_string(),
+            status: status.to_string(),
+            last_transition_time: None,
+            message: None,
+            observed_generation: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn no_status_is_not_established() {
+        let crd = CustomResourceDefinition::default();
+        assert!(!is_established(&crd));
+    }
+
+    #[test]
+    fn no_conditions_is_not_established() {
+        let crd = crd_with_conditions(vec![]);
+        assert!(!is_established(&crd));
+    }
+
+    #[test]
+    fn established_condition_with_false_status_is_not_established() {
+        let crd = crd_with_conditions(vec![condition("Established", "False")]);
+        assert!(!is_established(&crd));
+    }
+
+    #[test]
+    fn established_condition_with_true_status_is_established() {
+        let crd = crd_with_conditions(vec![condition("Established", "True")]);
+        assert!(is_established(&crd));
+    }
+
+    #[test]
+    fn established_true_alongside_other_conditions_is_established() {
+        let crd = crd_with_conditions(vec![
+            condition("NamesAccepted", "True"),
+            condition("Established", "True"),
+        ]);
+        assert!(is_established(&crd));
     }
 }

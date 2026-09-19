@@ -156,6 +156,15 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
 
     for object in &objects {
         let reference = crate::apply::apply_object(&ctx.client, object, "platform-controller").await?;
+        if reference.kind == "CustomResourceDefinition" {
+            crate::apply::wait_for_crd_established(
+                &ctx.client,
+                &reference.name,
+                std::time::Duration::from_secs(10),
+            )
+            .await?;
+            tracing::debug!(crd = %reference.name, "CRD established");
+        }
         applied.push(reference);
     }
     tracing::info!(applied_count = applied.len(), "applied all objects");
