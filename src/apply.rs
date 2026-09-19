@@ -25,6 +25,12 @@ pub enum ApplyError {
         timeout: Duration,
         detail: String,
     },
+    #[error("{kind}/{name} was not removed within {timeout:?}")]
+    NotDeleted {
+        kind: String,
+        name: String,
+        timeout: Duration,
+    },
 }
 
 pub fn resource_ref(obj: &DynamicObject) -> AppliedResourceRef {
@@ -152,10 +158,10 @@ pub async fn apply_object(
     Ok(resource_ref(obj))
 }
 
-pub async fn delete_object(
+async fn dynamic_api_for(
     client: &kube::Client,
     reference: &AppliedResourceRef,
-) -> Result<(), ApplyError> {
+) -> Result<kube::Api<DynamicObject>, ApplyError> {
     let types = kube::api::TypeMeta {
         api_version: reference.api_version.clone(),
         kind: reference.kind.clone(),
@@ -170,11 +176,18 @@ pub async fn delete_object(
             source,
         })?;
 
-    let api: kube::Api<DynamicObject> = if reference.namespace.is_empty() {
+    Ok(if reference.namespace.is_empty() {
         kube::Api::all_with(client.clone(), &api_resource)
     } else {
         kube::Api::namespaced_with(client.clone(), &reference.namespace, &api_resource)
-    };
+    })
+}
+
+pub async fn delete_object(
+    client: &kube::Client,
+    reference: &AppliedResourceRef,
+) -> Result<(), ApplyError> {
+    let api = dynamic_api_for(client, reference).await?;
 
     match api
         .delete(&reference.name, &kube::api::DeleteParams::default())
@@ -187,6 +200,49 @@ pub async fn delete_object(
             name: reference.name.clone(),
             source,
         }),
+    }
+}
+
+pub async fn delete_and_wait_for_removal(
+    client: &kube::Client,
+    reference: &AppliedResourceRef,
+    timeout: Duration,
+) -> Result<(), ApplyError> {
+    delete_object(client, reference).await?;
+
+    let api = dynamic_api_for(client, reference).await?;
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        match tokio::time::timeout_at(deadline, api.get_opt(&reference.name)).await {
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(_))) => {}
+            Ok(Err(source)) => {
+                tracing::debug!(
+                    kind = %reference.kind,
+                    name = %reference.name,
+                    error = %source,
+                    "failed to check whether resource was removed"
+                );
+            }
+            Err(_) => {
+                return Err(ApplyError::NotDeleted {
+                    kind: reference.kind.clone(),
+                    name: reference.name.clone(),
+                    timeout,
+                });
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApplyError::NotDeleted {
+                kind: reference.kind.clone(),
+                name: reference.name.clone(),
+                timeout,
+            });
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
