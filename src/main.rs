@@ -1,15 +1,25 @@
 use futures::StreamExt;
-use kube::runtime::{predicates, reflector, watcher, Controller, WatchStreamExt};
-use kube::{Api, Client};
+use kube::runtime::{predicates, reflector, watcher, Controller, Predicate, WatchStreamExt};
+use kube::{Api, Client, Resource};
 use platform_controller::crd::CniInstallation;
 use platform_controller::leader;
-use platform_controller::reconciler::{error_policy, reconcile, Context};
+use platform_controller::reconciler::{error_policy, reconcile_with_finalizer, Context};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 
 const LEASE_NAMESPACE: &str = "platform-system";
 const LEASE_NAME: &str = "platform-controller-leader";
+
+/// `predicates::generation` alone misses deletions: `kubectl delete` on an
+/// object with a finalizer only sets `metadata.deletionTimestamp`, which,
+/// like a status-subresource write, does not bump `metadata.generation`
+/// (verified against `kube-runtime` 4.2.0's own source). Combined below with
+/// `predicates::generation` so both spec changes and deletion requests pass
+/// through the filter, while status-only self-writes still don't.
+fn deletion_requested(obj: &CniInstallation) -> Option<u64> {
+    obj.meta().deletion_timestamp.is_some().then_some(1)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -58,10 +68,15 @@ async fn main() -> anyhow::Result<()> {
         .default_backoff()
         .reflect(writer)
         .applied_objects()
-        .predicate_filter(predicates::generation, Default::default());
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
 
     let controller = Controller::for_stream(installations, reader)
-        .run(reconcile, error_policy, context)
+        .run(reconcile_with_finalizer, error_policy, context)
         .for_each(|result| async move {
             match result {
                 Ok(action) => tracing::debug!(?action, "reconciled"),
@@ -99,4 +114,46 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_requested_is_none_without_a_deletion_timestamp() {
+        let installation: CniInstallation = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "CniInstallation",
+            "metadata": { "name": "default" },
+            "spec": {
+                "platformKind": "talos-linux",
+                "provider": "calico",
+                "calico": { "chartVersion": "v3.29.1" }
+            }
+        }))
+        .expect("installation should deserialize");
+
+        assert_eq!(deletion_requested(&installation), None);
+    }
+
+    #[test]
+    fn deletion_requested_is_some_once_deletion_timestamp_is_set() {
+        let installation: CniInstallation = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "CniInstallation",
+            "metadata": {
+                "name": "default",
+                "deletionTimestamp": "2026-09-19T00:00:00Z"
+            },
+            "spec": {
+                "platformKind": "talos-linux",
+                "provider": "calico",
+                "calico": { "chartVersion": "v3.29.1" }
+            }
+        }))
+        .expect("installation should deserialize");
+
+        assert_eq!(deletion_requested(&installation), Some(1));
+    }
 }

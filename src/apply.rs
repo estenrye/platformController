@@ -25,6 +25,12 @@ pub enum ApplyError {
         timeout: Duration,
         detail: String,
     },
+    #[error("{kind}/{name} was not removed within {timeout:?}")]
+    NotDeleted {
+        kind: String,
+        name: String,
+        timeout: Duration,
+    },
 }
 
 pub fn resource_ref(obj: &DynamicObject) -> AppliedResourceRef {
@@ -152,28 +158,49 @@ pub async fn apply_object(
     Ok(resource_ref(obj))
 }
 
-pub async fn delete_object(
+async fn dynamic_api_for(
     client: &kube::Client,
     reference: &AppliedResourceRef,
-) -> Result<(), ApplyError> {
+) -> Result<Option<kube::Api<DynamicObject>>, ApplyError> {
     let types = kube::api::TypeMeta {
         api_version: reference.api_version.clone(),
         kind: reference.kind.clone(),
     };
     let gvk = group_version_kind(&types);
 
-    let (api_resource, _caps) = kube::discovery::oneshot::pinned_kind(client, &gvk)
-        .await
-        .map_err(|source| ApplyError::Discovery {
+    match kube::discovery::oneshot::pinned_kind(client, &gvk).await {
+        Ok((api_resource, _caps)) => Ok(Some(if reference.namespace.is_empty() {
+            kube::Api::all_with(client.clone(), &api_resource)
+        } else {
+            kube::Api::namespaced_with(client.clone(), &reference.namespace, &api_resource)
+        })),
+        // The kind's CRD (and therefore its whole API group/resource) has
+        // already been removed from the cluster. During cleanup this means
+        // the resource we were about to act on is unambiguously already
+        // gone, not a real failure — without this, any retry after a CRD is
+        // deleted would permanently wedge on rediscovering it. Any other
+        // discovery error (a malformed reference, transient network
+        // failure, etc.) still propagates.
+        Err(kube::Error::Api(err)) if err.code == 404 => Ok(None),
+        Err(kube::Error::Discovery(
+            kube::error::DiscoveryError::MissingKind(_)
+            | kube::error::DiscoveryError::MissingApiGroup(_)
+            | kube::error::DiscoveryError::EmptyApiGroup(_),
+        )) => Ok(None),
+        Err(source) => Err(ApplyError::Discovery {
             api_version: reference.api_version.clone(),
             kind: reference.kind.clone(),
             source,
-        })?;
+        }),
+    }
+}
 
-    let api: kube::Api<DynamicObject> = if reference.namespace.is_empty() {
-        kube::Api::all_with(client.clone(), &api_resource)
-    } else {
-        kube::Api::namespaced_with(client.clone(), &reference.namespace, &api_resource)
+pub async fn delete_object(
+    client: &kube::Client,
+    reference: &AppliedResourceRef,
+) -> Result<(), ApplyError> {
+    let Some(api) = dynamic_api_for(client, reference).await? else {
+        return Ok(());
     };
 
     match api
@@ -187,6 +214,63 @@ pub async fn delete_object(
             name: reference.name.clone(),
             source,
         }),
+    }
+}
+
+pub async fn delete_and_wait_for_removal(
+    client: &kube::Client,
+    reference: &AppliedResourceRef,
+    timeout: Duration,
+) -> Result<(), ApplyError> {
+    delete_object(client, reference).await?;
+
+    if timeout.is_zero() {
+        // A zero timeout is the documented opt-out for "don't block waiting
+        // for removal" (see spec: cleanupTimeoutSeconds near 0). The delete
+        // was already issued above; there's no meaningful bounded poll to
+        // perform in a zero-length window, and tokio::time::timeout_at with
+        // an already-elapsed deadline can never let a real networked call
+        // complete, so treating this as a timeout failure would make the
+        // documented escape hatch permanently fail instead of "proceed
+        // immediately" as intended.
+        return Ok(());
+    }
+
+    let Some(api) = dynamic_api_for(client, reference).await? else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        match tokio::time::timeout_at(deadline, api.get_opt(&reference.name)).await {
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(_))) => {}
+            Ok(Err(source)) => {
+                tracing::debug!(
+                    kind = %reference.kind,
+                    name = %reference.name,
+                    error = %source,
+                    "failed to check whether resource was removed"
+                );
+            }
+            Err(_) => {
+                return Err(ApplyError::NotDeleted {
+                    kind: reference.kind.clone(),
+                    name: reference.name.clone(),
+                    timeout,
+                });
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApplyError::NotDeleted {
+                kind: reference.kind.clone(),
+                name: reference.name.clone(),
+                timeout,
+            });
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

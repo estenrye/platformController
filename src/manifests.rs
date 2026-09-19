@@ -38,16 +38,26 @@ pub fn parse_manifests(rendered: &str) -> Result<Vec<DynamicObject>, ManifestErr
     Ok(objects)
 }
 
-pub fn apply_rank(obj: &DynamicObject) -> u8 {
-    let kind = obj.types.as_ref().map(|t| t.kind.as_str()).unwrap_or("");
+/// The rank bucket for any kind not explicitly enumerated below. Chart-managed
+/// custom resources (e.g. `Installation`, `APIServer`) always fall here, since
+/// they're applied last, after the CRDs and RBAC/workloads that define and run
+/// them — and, symmetrically, are the first things cleanup deletes.
+pub const CUSTOM_RESOURCE_RANK: u8 = 5;
+
+pub fn rank_for_kind(kind: &str) -> u8 {
     match kind {
         "Namespace" => 0,
         "CustomResourceDefinition" => 1,
         "ServiceAccount" | "ClusterRole" | "ClusterRoleBinding" | "Role" | "RoleBinding" => 2,
         "ConfigMap" | "Secret" | "Service" | "ValidatingWebhookConfiguration" | "APIService" => 3,
         "Deployment" | "DaemonSet" => 4,
-        _ => 5,
+        _ => CUSTOM_RESOURCE_RANK,
     }
+}
+
+pub fn apply_rank(obj: &DynamicObject) -> u8 {
+    let kind = obj.types.as_ref().map(|t| t.kind.as_str()).unwrap_or("");
+    rank_for_kind(kind)
 }
 
 pub fn sort_manifests(objects: &mut Vec<DynamicObject>) {
@@ -111,5 +121,17 @@ metadata:
             kinds,
             vec!["Namespace", "CustomResourceDefinition", "Deployment", "Installation"]
         );
+    }
+
+    #[test]
+    fn rank_for_kind_places_custom_resources_in_the_highest_bucket() {
+        assert_eq!(rank_for_kind("Namespace"), 0);
+        assert_eq!(rank_for_kind("CustomResourceDefinition"), 1);
+        assert_eq!(rank_for_kind("ServiceAccount"), 2);
+        assert_eq!(rank_for_kind("ConfigMap"), 3);
+        assert_eq!(rank_for_kind("Deployment"), 4);
+        assert_eq!(rank_for_kind("Installation"), CUSTOM_RESOURCE_RANK);
+        assert_eq!(rank_for_kind("APIServer"), CUSTOM_RESOURCE_RANK);
+        assert_eq!(CUSTOM_RESOURCE_RANK, 5);
     }
 }
