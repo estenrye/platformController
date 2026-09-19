@@ -217,12 +217,25 @@ async fn hold_and_renew(
     // Every networked call below is bounded by this single absolute instant via
     // `timeout_at`, not by a fresh `RENEW_DEADLINE` each time. That is the whole
     // point: whatever is left of the budget when an attempt starts is exactly
-    // how long that attempt gets, so the total wall-clock time this function can
-    // spend across all of its retries and API calls combined stays capped at
-    // RENEW_DEADLINE. A flat `timeout(RENEW_DEADLINE, ...)` per attempt would
-    // let one hung call consume the entire budget and then some, which is how a
-    // replica ends up still believing `is_leader == true` well after the lease's
-    // LEASE_DURATION_SECONDS expiry let a standby take over — split brain.
+    // how long that attempt gets, so the total wall-clock time THIS INVOCATION
+    // can spend across all of its retries and API calls combined stays capped
+    // at RENEW_DEADLINE. A flat `timeout(RENEW_DEADLINE, ...)` per attempt would
+    // let one hung call consume the entire budget and then some.
+    //
+    // This bounds each call to `hold_and_renew`, but does not compose into a
+    // hard bound across renewal CYCLES: `run()`'s own top-of-loop `get_opt`
+    // (also bounded by RENEW_DEADLINE, but as a fresh budget each time) can
+    // itself run long on the same slow-apiserver conditions this is guarding
+    // against, before the next `hold_and_renew` even starts. In that specific,
+    // narrow scenario a residual window of roughly RETRY_PERIOD + RENEW_DEADLINE
+    // (~12s) beyond the last accepted renewal can still elapse before this
+    // replica's `is_leader` flag clears — versus the unbounded/indefinite hang
+    // this fix replaces, that's a large improvement, not a full guarantee. The
+    // `stand down on holder mismatch` check in the retry-refetch branch below is
+    // what actually closes the split-brain risk in that window: a standby that
+    // has genuinely taken over is what a fresh resourceVersion here would show,
+    // and this function concedes the moment it sees that, rather than relying
+    // solely on wall-clock timing to prevent overlap.
     let deadline = TokioInstant::now() + RENEW_DEADLINE;
     loop {
         let now = Timestamp::now();

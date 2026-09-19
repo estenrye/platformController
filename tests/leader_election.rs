@@ -120,8 +120,10 @@ async fn wait_for_two_live_controller_pods(pods: &Api<Pod>, within: Duration) {
 /// The *graceful* failover path: an ordinary pod delete sends SIGTERM, the
 /// leader's handler runs `leader::release`, and a standby picks the lease up in
 /// roughly one `RETRY_PERIOD` (~2s). See
-/// `force_killing_the_leader_pod_fails_over_via_lease_expiry` for the ungraceful
-/// counterpart.
+/// `a_lease_that_stops_being_renewed_expires_and_a_standby_takes_over` for the
+/// genuine expiry-based counterpart (this test's own "ungraceful" sibling,
+/// `force_deleting_the_leader_pod_with_zero_grace_still_fails_over`, turns out
+/// to still be graceful in practice — see its doc comment).
 #[tokio::test]
 #[ignore = "requires a real Talos cluster with the leader-election bootstrap manifest applied; see module docs for setup"]
 async fn killing_the_leader_pod_fails_over_to_a_standby() {
@@ -241,6 +243,12 @@ async fn a_lease_that_stops_being_renewed_expires_and_a_standby_takes_over() {
 
     // Stand in for a leader that died without releasing: a holder that exists
     // only in the Lease, with a renewTime that is current as of right now.
+    // No `resourceVersion` is set on the write below: this makes it an
+    // unconditional PUT (Kubernetes skips the optimistic-concurrency check
+    // when the incoming object's resourceVersion is empty), so a real
+    // replica's renewal landing in the fetch-then-write gap can never turn
+    // this into a spurious 409 — whichever write lands last simply wins,
+    // which is fine here since we only care about the end state.
     const PHANTOM_HOLDER: &str = "platform-controller-phantom-crashed-leader";
     let existing = leases
         .get(LEASE_NAME)
@@ -253,7 +261,6 @@ async fn a_lease_that_stops_being_renewed_expires_and_a_standby_takes_over() {
     let overwritten = Lease {
         metadata: ObjectMeta {
             name: Some(LEASE_NAME.to_string()),
-            resource_version: existing.metadata.resource_version.clone(),
             ..Default::default()
         },
         spec: Some(spec),
@@ -262,6 +269,7 @@ async fn a_lease_that_stops_being_renewed_expires_and_a_standby_takes_over() {
         .replace(LEASE_NAME, &PostParams::default(), &overwritten)
         .await
         .expect("should be able to hand the lease to a phantom holder");
+    let phantom_write_completed = tokio::time::Instant::now();
 
     // The phantom never renews, so this can only resolve once the lease has
     // genuinely aged out and a real replica has won an Acquire.
@@ -279,6 +287,21 @@ async fn a_lease_that_stops_being_renewed_expires_and_a_standby_takes_over() {
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
     };
+
+    // This is the assertion that actually proves genuine expiry-arithmetic ran,
+    // rather than some instant-takeover path (e.g. a regression of the
+    // stand-down-on-holder-mismatch check in `hold_and_renew`, which is what
+    // makes this test meaningful at all — see its own comment in src/leader.rs).
+    // 10s rather than the full 15s leaves slack for clock skew between the test
+    // host (which stamps `renewTime`) and the cluster nodes (which evaluate the
+    // expiry arithmetic).
+    let elapsed_since_phantom_write = phantom_write_completed.elapsed();
+    assert!(
+        elapsed_since_phantom_write >= Duration::from_secs(10),
+        "failover completed in {elapsed_since_phantom_write:?}, too fast to have gone through \
+         genuine lease expiry (expected >= 10s against a 15s lease duration) — this test is \
+         supposed to prove the expiry path ran, not just that failover happened"
+    );
 
     let live_pods = pods
         .list(&ListParams::default().labels("app=platform-controller"))
