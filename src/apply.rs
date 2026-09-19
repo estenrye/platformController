@@ -161,33 +161,47 @@ pub async fn apply_object(
 async fn dynamic_api_for(
     client: &kube::Client,
     reference: &AppliedResourceRef,
-) -> Result<kube::Api<DynamicObject>, ApplyError> {
+) -> Result<Option<kube::Api<DynamicObject>>, ApplyError> {
     let types = kube::api::TypeMeta {
         api_version: reference.api_version.clone(),
         kind: reference.kind.clone(),
     };
     let gvk = group_version_kind(&types);
 
-    let (api_resource, _caps) = kube::discovery::oneshot::pinned_kind(client, &gvk)
-        .await
-        .map_err(|source| ApplyError::Discovery {
+    match kube::discovery::oneshot::pinned_kind(client, &gvk).await {
+        Ok((api_resource, _caps)) => Ok(Some(if reference.namespace.is_empty() {
+            kube::Api::all_with(client.clone(), &api_resource)
+        } else {
+            kube::Api::namespaced_with(client.clone(), &reference.namespace, &api_resource)
+        })),
+        // The kind's CRD (and therefore its whole API group/resource) has
+        // already been removed from the cluster. During cleanup this means
+        // the resource we were about to act on is unambiguously already
+        // gone, not a real failure — without this, any retry after a CRD is
+        // deleted would permanently wedge on rediscovering it. Any other
+        // discovery error (a malformed reference, transient network
+        // failure, etc.) still propagates.
+        Err(kube::Error::Api(err)) if err.code == 404 => Ok(None),
+        Err(kube::Error::Discovery(
+            kube::error::DiscoveryError::MissingKind(_)
+            | kube::error::DiscoveryError::MissingApiGroup(_)
+            | kube::error::DiscoveryError::EmptyApiGroup(_),
+        )) => Ok(None),
+        Err(source) => Err(ApplyError::Discovery {
             api_version: reference.api_version.clone(),
             kind: reference.kind.clone(),
             source,
-        })?;
-
-    Ok(if reference.namespace.is_empty() {
-        kube::Api::all_with(client.clone(), &api_resource)
-    } else {
-        kube::Api::namespaced_with(client.clone(), &reference.namespace, &api_resource)
-    })
+        }),
+    }
 }
 
 pub async fn delete_object(
     client: &kube::Client,
     reference: &AppliedResourceRef,
 ) -> Result<(), ApplyError> {
-    let api = dynamic_api_for(client, reference).await?;
+    let Some(api) = dynamic_api_for(client, reference).await? else {
+        return Ok(());
+    };
 
     match api
         .delete(&reference.name, &kube::api::DeleteParams::default())
@@ -210,7 +224,21 @@ pub async fn delete_and_wait_for_removal(
 ) -> Result<(), ApplyError> {
     delete_object(client, reference).await?;
 
-    let api = dynamic_api_for(client, reference).await?;
+    if timeout.is_zero() {
+        // A zero timeout is the documented opt-out for "don't block waiting
+        // for removal" (see spec: cleanupTimeoutSeconds near 0). The delete
+        // was already issued above; there's no meaningful bounded poll to
+        // perform in a zero-length window, and tokio::time::timeout_at with
+        // an already-elapsed deadline can never let a real networked call
+        // complete, so treating this as a timeout failure would make the
+        // documented escape hatch permanently fail instead of "proceed
+        // immediately" as intended.
+        return Ok(());
+    }
+
+    let Some(api) = dynamic_api_for(client, reference).await? else {
+        return Ok(());
+    };
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {

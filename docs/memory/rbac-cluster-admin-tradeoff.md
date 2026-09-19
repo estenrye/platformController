@@ -19,6 +19,8 @@ Documented in-repo at `deploy/bootstrap.yaml` (comment) and in PR #2's descripti
 
 Running inventory of what each managed component actually needs, so a future scope-down task doesn't have to re-derive this from scratch. Update this table whenever a new component is added to the controller or a chart-version bump changes what it needs. Verbs are approximate (`get/list/watch/create/update/patch/delete` unless noted) — re-check exact verbs against the pinned chart version's rendered ClusterRole before actually cutting anything over, since chart bumps can add resources silently.
 
+**`delete` is now load-bearing, not just latent.** The cleanup-on-delete work (finalizer-driven teardown on `CniInstallation` delete) means `delete` is exercised end-to-end on every kind the controller applies — Namespace, CRDs, RBAC objects, the operator Deployment, and provider-managed custom resources — where previously only create/patch/update were actually exercised in practice (the original ClusterRole listed `delete` defensively, but nothing called it). This doesn't change what's granted here (still `cluster-admin`); it's a note for whoever scopes this down later that `delete` can't be dropped or narrowed to a subset of kinds without breaking cleanup.
+
 | apiGroup | Resources | Required by | Notes |
 |---|---|---|---|
 | `""` (core) | `namespaces`, `serviceaccounts`, `configmaps`, `secrets`, `services` | Controller itself | Original hand-rolled ClusterRole (pre-cluster-admin) already granted these |

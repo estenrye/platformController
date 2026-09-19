@@ -48,6 +48,7 @@ The operator must:
 | Name | Data Type     | Description | Validation Policy | Required |
 |------|---------------|-------------|------------------|----------|
 | provider | enum(string) | The CNI plugin to be used for networking within the Kubernetes cluster. | must be one of `["calico", "aws-vpc-cni", "oci-vcn-native", "azure-cni", "google-cni", "rspot-calico-iptables", "rspot-cillium", "rspot-byocni-calico"]` | true |
+| cleanupTimeoutSeconds | integer | How long cleanup waits for the CNI provider's own managed resources (e.g. Calico's `calico-node` DaemonSet) to disappear before the provider's operator itself is removed. Provider-agnostic: not nested under any per-provider binding. | must be a non-negative integer, in seconds; `0` skips waiting and proceeds after a single poll. | false, default `60` |
 | calico | CalicoBinding | The configuration specific to the Calico CNI plugin. | must conform to the CalicoBinding specification defined below. | false |
 | awsVpcCni | AwsVpcCniBinding | The configuration specific to the AWS VPC CNI plugin. | must conform to the AwsVpcCniBinding specification defined below. | false |
 | ociVcnNative | OciVcnNativeBinding | The configuration specific to the OCI VCN Native CNI plugin. | must conform to the OciVcnNativeBinding specification defined below. | false |

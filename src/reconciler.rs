@@ -88,6 +88,8 @@ pub enum ReconcileError {
     Apply(#[from] crate::apply::ApplyError),
     #[error("failed to update status: {0}")]
     Status(#[source] kube::Error),
+    #[error("not the leader; standing down")]
+    NotLeader,
 }
 
 pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
@@ -249,8 +251,14 @@ fn partition_for_cleanup(
 }
 
 pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
-    if let Some(action) = leader_gate(&ctx.is_leader) {
-        return Ok(action);
+    // Never return Ok from a standby's Cleanup dispatch: kube::runtime::finalizer
+    // treats any Ok here as "cleanup genuinely succeeded" and strips the finalizer
+    // regardless of which replica returned it. reconcile_with_finalizer already
+    // gates non-leaders out before entering the finalizer machinery at all, making
+    // this unreachable today — returning Err here (never Ok) means no future call
+    // site can reintroduce the exact race d2d87e3 fixed.
+    if !ctx.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ReconcileError::NotLeader);
     }
 
     let name = obj.name_any();

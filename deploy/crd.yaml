@@ -67,6 +67,17 @@ spec:
                 required:
                 - chartVersion
                 type: object
+              cleanupTimeoutSeconds:
+                default: 60
+                description: |-
+                  How long to wait, during cleanup, for the CNI provider's own managed
+                  resources (e.g. Calico's `calico-node` DaemonSet) to actually disappear
+                  before this controller removes the provider's operator itself. Not
+                  nested under `calico`: any future provider's cleanup would need the
+                  same kind of bounded wait.
+                format: uint32
+                minimum: 0.0
+                type: integer
               platformKind:
                 enum:
                 - talos-linux
