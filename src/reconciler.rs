@@ -15,6 +15,7 @@ pub const SINGLETON_NAME: &str = "default";
 
 pub struct Context {
     pub client: Client,
+    pub is_leader: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -41,6 +42,14 @@ pub fn validate(name: &str, spec: &CniInstallationSpec) -> Result<(), Validation
         return Err(ValidationError::UnsupportedProvider(spec.provider.clone()));
     }
     Ok(())
+}
+
+fn leader_gate(is_leader: &std::sync::atomic::AtomicBool) -> Option<Action> {
+    if is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+        None
+    } else {
+        Some(Action::requeue(Duration::from_secs(15)))
+    }
 }
 
 /// The tigera-operator chart renders no `Namespace` object, so the controller
@@ -82,6 +91,10 @@ pub enum ReconcileError {
 }
 
 pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
+    if let Some(action) = leader_gate(&ctx.is_leader) {
+        return Ok(action);
+    }
+
     let name = obj.name_any();
     let api: kube::Api<CniInstallation> = kube::Api::all(ctx.client.clone());
     let chart_version = obj.spec.calico.chart_version.clone();
@@ -266,5 +279,17 @@ mod tests {
         assert_eq!(reference.kind, "Namespace");
         assert_eq!(reference.name, "tigera-operator");
         assert_eq!(reference.namespace, "");
+    }
+
+    #[test]
+    fn leader_gate_returns_requeue_when_not_leader() {
+        let is_leader = std::sync::atomic::AtomicBool::new(false);
+        assert!(leader_gate(&is_leader).is_some());
+    }
+
+    #[test]
+    fn leader_gate_returns_none_when_leader() {
+        let is_leader = std::sync::atomic::AtomicBool::new(true);
+        assert!(leader_gate(&is_leader).is_none());
     }
 }
