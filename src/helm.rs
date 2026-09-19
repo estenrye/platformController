@@ -37,6 +37,14 @@ pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
     serde_json::json!({
         "installation": {
             "enabled": true,
+            // Talos's root filesystem is read-only, so the legacy FlexVolume
+            // driver's init container (which needs to mkdir under
+            // /usr/libexec/kubernetes) always crash-loops. FlexVolume is
+            // superseded by CSI (already deployed via csi-node-driver), and
+            // this controller only ever targets talos-linux today, so
+            // disabling it unconditionally is correct, not a platform-specific
+            // workaround bolted onto a shared default.
+            "flexVolumePath": "None",
             "calicoNetwork": calico_network,
         },
         "apiServer": {
@@ -145,6 +153,13 @@ mod tests {
             }],
             node_address_autodetection_v6_cidrs: vec!["fd97:45c2:b3a1:179::/64".to_string()],
         }
+    }
+
+    #[test]
+    fn disables_flex_volume_unconditionally() {
+        let values = build_values(&sample_spec());
+
+        assert_eq!(values["installation"]["flexVolumePath"], "None");
     }
 
     #[test]
