@@ -6,19 +6,30 @@ Apply in this order:
 kubectl apply -f deploy/crd.yaml
 kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
+kubectl apply -f examples/cni-installation.yaml
 ```
 
-`crd.yaml` must be applied — and Established — first. `bootstrap.yaml` contains a
-`CniInstallation` custom resource, and the API server rejects a custom resource
-whose kind is not yet registered (`no matches for kind "CniInstallation"`).
+`crd.yaml` must be applied — and Established — first. `examples/cni-installation.yaml`
+contains a `CniInstallation` custom resource, and the API server rejects a custom
+resource whose kind is not yet registered (`no matches for kind "CniInstallation"`).
 Registration is asynchronous: the CRD can exist while its API endpoint is not yet
-serving, so waiting on `condition=established` (rather than just applying the two
-files back to back) is what makes the second apply reliable.
+serving, so waiting on `condition=established` (rather than just applying the files
+back to back) is what makes that apply reliable.
 
-`bootstrap.yaml` uses `image: platform-controller:latest` with
-`imagePullPolicy: IfNotPresent`, so a locally built image is used as-is with no
-registry. Build it on every node (or push to a registry the cluster can reach)
-before applying:
+`bootstrap.yaml` installs the controller itself (namespace, RBAC, Deployment,
+PodDisruptionBudget) but does not include a `CniInstallation` — that's a separate
+configuration step, since it's specific to your cluster's platform/CNI/network
+plan. `examples/cni-installation.yaml` is a starting point for a self-hosted Talos
+Linux cluster running Calico; copy and adapt it (CIDR, encapsulation, BGP, etc.)
+to your own cluster rather than applying it as-is on anything but a test cluster.
+
+`bootstrap.yaml` uses `image: estenrye/platform-controller:latest`
+(`imagePullPolicy: IfNotPresent`), a published image on Docker Hub — most clusters
+with normal internet access can apply `bootstrap.yaml` as-is with no further steps.
+For an airgapped cluster, or one that otherwise can't reach Docker Hub, build the
+image locally and make it available via a registry the cluster can reach instead
+(see `tests/integration_talos.rs`'s header comment for a worked example using a
+local registry and Talos's `--registry-mirror`):
 
 ```sh
 docker build -t platform-controller:latest .

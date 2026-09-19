@@ -19,9 +19,19 @@ fn bootstrap_yaml_parses_into_expected_kinds_in_apply_order() {
             "ClusterRoleBinding",
             "Deployment",
             "PodDisruptionBudget",
-            "CniInstallation",
         ]
     );
+}
+
+#[test]
+fn example_cni_installation_yaml_defines_a_single_cni_installation() {
+    let content = std::fs::read_to_string("examples/cni-installation.yaml")
+        .expect("examples/cni-installation.yaml should exist");
+    let objects = parse_manifests(&content).expect("example should be valid YAML");
+
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].types.as_ref().unwrap().kind, "CniInstallation");
+    assert_eq!(objects[0].metadata.name.as_deref(), Some("default"));
 }
 
 #[test]

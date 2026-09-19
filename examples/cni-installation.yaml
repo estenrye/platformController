@@ -1,0 +1,23 @@
+# Sample CniInstallation for a self-hosted Talos Linux cluster running Calico.
+# Copy and adapt (CIDR, encapsulation, BGP, etc.) to your own cluster's network
+# plan, then apply after deploy/crd.yaml and deploy/bootstrap.yaml are in place:
+#
+#   kubectl apply -f examples/cni-installation.yaml
+apiVersion: platform.rye.ninja/v1alpha1
+kind: CniInstallation
+metadata:
+  name: default
+spec:
+  platformKind: talos-linux
+  provider: calico
+  calico:
+    chartVersion: v3.29.1
+    bgpEnabled: false
+    apiServerEnabled: false
+    ipPools:
+      - name: default
+        cidr: 10.244.0.0/16
+        encapsulation: VXLAN
+        natOutgoing: true
+        # Valid IPv4 blockSize range is 20-32; 26 is the operator's documented default.
+        blockSize: 26
