@@ -26,7 +26,7 @@ Running inventory of what each managed component actually needs, so a future sco
 | `apps` | `deployments`, `daemonsets` | Controller itself | Original ClusterRole |
 | `apps` | `statefulsets`, `deployments/finalizers` | `tigera-operator` chart | Found missing during final review |
 | `rbac.authorization.k8s.io` | `clusterroles`, `clusterrolebindings`, `roles`, `rolebindings` | Controller itself, to create the operator's own ClusterRole | Needs `escalate`/`bind` verbs too (privilege-escalation prevention) — this was the actual C1 defect, not just a missing resource type |
-| `apiextensions.k8s.io` | `customresourcedefinitions` | Controller itself | Applies the tigera-operator CRDs from the chart's `--include-crds` output |
+| `apiextensions.k8s.io` | `customresourcedefinitions` | Controller itself | Applies the tigera-operator CRDs from the chart's `--include-crds` output; also polls `get` on each applied CRD to wait for `Established` before continuing (added 2026-09-19, see [[wait-for-crd-established]]) |
 | `admissionregistration.k8s.io` | `validatingwebhookconfigurations` | Controller itself | Original ClusterRole |
 | `admissionregistration.k8s.io` | `mutatingwebhookconfigurations` | `tigera-operator` chart | Found missing during final review — original only granted *validating* |
 | `apiregistration.k8s.io` | `apiservices` | Controller itself | Original ClusterRole |

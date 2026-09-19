@@ -19,8 +19,12 @@ pub enum ApplyError {
         #[source]
         source: kube::Error,
     },
-    #[error("CRD {name} did not become Established within {timeout:?}")]
-    NotEstablished { name: String, timeout: Duration },
+    #[error("CRD {name} did not become Established within {timeout:?} (last observed: {detail})")]
+    NotEstablished {
+        name: String,
+        timeout: Duration,
+        detail: String,
+    },
 }
 
 pub fn resource_ref(obj: &DynamicObject) -> AppliedResourceRef {
@@ -45,6 +49,20 @@ fn is_established(crd: &CustomResourceDefinition) -> bool {
         .unwrap_or(false)
 }
 
+fn describe_conditions(crd: &CustomResourceDefinition) -> String {
+    crd.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .map(|conditions| {
+            conditions
+                .iter()
+                .map(|c| format!("{}={}", c.type_, c.status))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "no conditions reported".to_string())
+}
+
 pub async fn wait_for_crd_established(
     client: &kube::Client,
     name: &str,
@@ -52,11 +70,26 @@ pub async fn wait_for_crd_established(
 ) -> Result<(), ApplyError> {
     let api: kube::Api<CustomResourceDefinition> = kube::Api::all(client.clone());
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut detail = "no status observed".to_string();
 
     loop {
-        if let Ok(crd) = api.get(name).await {
-            if is_established(&crd) {
-                return Ok(());
+        match tokio::time::timeout_at(deadline, api.get(name)).await {
+            Ok(Ok(crd)) => {
+                if is_established(&crd) {
+                    return Ok(());
+                }
+                detail = describe_conditions(&crd);
+            }
+            Ok(Err(source)) => {
+                tracing::debug!(crd = %name, error = %source, "failed to fetch CRD while waiting for Established");
+                detail = format!("fetch error: {source}");
+            }
+            Err(_) => {
+                return Err(ApplyError::NotEstablished {
+                    name: name.to_string(),
+                    timeout,
+                    detail,
+                });
             }
         }
 
@@ -64,6 +97,7 @@ pub async fn wait_for_crd_established(
             return Err(ApplyError::NotEstablished {
                 name: name.to_string(),
                 timeout,
+                detail,
             });
         }
 
@@ -212,6 +246,18 @@ mod tests {
         assert_eq!(reference.kind, "Deployment");
         assert_eq!(reference.namespace, "tigera-operator");
         assert_eq!(reference.name, "tigera-operator");
+    }
+
+    #[test]
+    fn resource_ref_recognizes_custom_resource_definition_kind() {
+        let objects = crate::manifests::parse_manifests(
+            "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: installations.operator.tigera.io\n",
+        )
+        .expect("manifest should parse");
+
+        let reference = resource_ref(&objects[0]);
+
+        assert_eq!(reference.kind, "CustomResourceDefinition");
     }
 
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
