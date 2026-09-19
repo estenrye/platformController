@@ -15,6 +15,13 @@ pub struct CniInstallationSpec {
     pub platform_kind: PlatformKind,
     pub provider: CniProvider,
     pub calico: CalicoSpec,
+    /// How long to wait, during cleanup, for the CNI provider's own managed
+    /// resources (e.g. Calico's `calico-node` DaemonSet) to actually disappear
+    /// before this controller removes the provider's operator itself. Not
+    /// nested under `calico`: any future provider's cleanup would need the
+    /// same kind of bounded wait.
+    #[serde(default = "default_cleanup_timeout_seconds")]
+    pub cleanup_timeout_seconds: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
@@ -71,6 +78,10 @@ fn default_block_size() -> i32 {
 
 fn default_node_selector() -> String {
     "all()".to_string()
+}
+
+fn default_cleanup_timeout_seconds() -> u32 {
+    60
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
@@ -185,6 +196,37 @@ mod tests {
         assert!(pool.nat_outgoing);
         assert_eq!(pool.block_size, 26);
         assert_eq!(pool.node_selector, "all()");
+    }
+
+    #[test]
+    fn cleanup_timeout_seconds_defaults_when_omitted() {
+        let json = serde_json::json!({
+            "platformKind": "talos-linux",
+            "provider": "calico",
+            "calico": {
+                "chartVersion": "v3.29.1"
+            }
+        });
+
+        let spec: CniInstallationSpec = serde_json::from_value(json).expect("spec should deserialize");
+
+        assert_eq!(spec.cleanup_timeout_seconds, 60);
+    }
+
+    #[test]
+    fn cleanup_timeout_seconds_can_be_overridden() {
+        let json = serde_json::json!({
+            "platformKind": "talos-linux",
+            "provider": "calico",
+            "calico": {
+                "chartVersion": "v3.29.1"
+            },
+            "cleanupTimeoutSeconds": 5
+        });
+
+        let spec: CniInstallationSpec = serde_json::from_value(json).expect("spec should deserialize");
+
+        assert_eq!(spec.cleanup_timeout_seconds, 5);
     }
 
     #[test]

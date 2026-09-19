@@ -251,6 +251,7 @@ mod tests {
                 ip_pools: vec![],
                 node_address_autodetection_v6_cidrs: vec![],
             },
+            cleanup_timeout_seconds: 60,
         }
     }
 
