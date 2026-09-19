@@ -196,7 +196,11 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
-pub fn error_policy(_obj: Arc<CniInstallation>, _err: &ReconcileError, _ctx: Arc<Context>) -> Action {
+pub fn error_policy(
+    _obj: Arc<CniInstallation>,
+    _err: &kube::runtime::finalizer::Error<ReconcileError>,
+    _ctx: Arc<Context>,
+) -> Action {
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -286,6 +290,22 @@ pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Act
 
     tracing::info!(installation = %name, "cleanup complete");
     Ok(Action::await_change())
+}
+
+pub const FINALIZER_NAME: &str = "platform.rye.ninja/cleanup";
+
+pub async fn reconcile_with_finalizer(
+    obj: Arc<CniInstallation>,
+    ctx: Arc<Context>,
+) -> Result<Action, kube::runtime::finalizer::Error<ReconcileError>> {
+    let api: kube::Api<CniInstallation> = kube::Api::all(ctx.client.clone());
+    kube::runtime::finalizer(&api, FINALIZER_NAME, obj, |event| async move {
+        match event {
+            kube::runtime::finalizer::Event::Apply(obj) => reconcile(obj, ctx).await,
+            kube::runtime::finalizer::Event::Cleanup(obj) => cleanup(obj, ctx).await,
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
