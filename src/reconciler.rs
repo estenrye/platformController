@@ -298,6 +298,20 @@ pub async fn reconcile_with_finalizer(
     obj: Arc<CniInstallation>,
     ctx: Arc<Context>,
 ) -> Result<Action, kube::runtime::finalizer::Error<ReconcileError>> {
+    // A standby replica must never enter the finalizer state machine at all.
+    // `kube::runtime::finalizer` treats any `Ok` returned from the `Cleanup`
+    // event as "cleanup genuinely succeeded" and immediately strips the
+    // finalizer — it has no way to know the `Ok` came from a standby's
+    // leader_gate short-circuit rather than real work. Gating here, before
+    // the finalizer dispatch, means only the leader ever produces an `Ok`
+    // for either event, so only real completions ever affect finalizer
+    // state. (`reconcile`/`cleanup` each still call `leader_gate` too, as
+    // defense in depth — harmless since it can now only ever see `is_leader
+    // == true` by the time either is reached.)
+    if let Some(action) = leader_gate(&ctx.is_leader) {
+        return Ok(action);
+    }
+
     let api: kube::Api<CniInstallation> = kube::Api::all(ctx.client.clone());
     kube::runtime::finalizer(&api, FINALIZER_NAME, obj, |event| async move {
         match event {
