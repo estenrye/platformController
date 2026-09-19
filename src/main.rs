@@ -68,7 +68,12 @@ async fn main() -> anyhow::Result<()> {
         .default_backoff()
         .reflect(writer)
         .applied_objects()
-        .predicate_filter(predicates::generation.combine(deletion_requested), Default::default());
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
 
     let controller = Controller::for_stream(installations, reader)
         .run(reconcile_with_finalizer, error_policy, context)
