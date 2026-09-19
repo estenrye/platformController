@@ -235,6 +235,59 @@ async fn update_status(
     Ok(())
 }
 
+fn partition_for_cleanup(
+    resources: &[AppliedResourceRef],
+) -> (Vec<AppliedResourceRef>, Vec<AppliedResourceRef>) {
+    resources
+        .iter()
+        .cloned()
+        .partition(|resource| crate::manifests::rank_for_kind(&resource.kind) == crate::manifests::CUSTOM_RESOURCE_RANK)
+}
+
+pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
+    if let Some(action) = leader_gate(&ctx.is_leader) {
+        return Ok(action);
+    }
+
+    let name = obj.name_any();
+    let applied = obj
+        .status
+        .as_ref()
+        .map(|status| status.applied_resources.clone())
+        .unwrap_or_default();
+
+    if applied.is_empty() {
+        tracing::info!(installation = %name, "nothing to clean up");
+        return Ok(Action::await_change());
+    }
+
+    let (custom_resources, infra) = partition_for_cleanup(&applied);
+    let timeout = Duration::from_secs(u64::from(obj.spec.cleanup_timeout_seconds));
+
+    for reference in custom_resources.iter().rev() {
+        tracing::info!(
+            installation = %name,
+            kind = %reference.kind,
+            resource = %reference.name,
+            "deleting provider-managed resource and waiting for removal"
+        );
+        crate::apply::delete_and_wait_for_removal(&ctx.client, reference, timeout).await?;
+    }
+
+    for reference in infra.iter().rev() {
+        tracing::info!(
+            installation = %name,
+            kind = %reference.kind,
+            resource = %reference.name,
+            "deleting applied resource"
+        );
+        crate::apply::delete_object(&ctx.client, reference).await?;
+    }
+
+    tracing::info!(installation = %name, "cleanup complete");
+    Ok(Action::await_change())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +354,50 @@ mod tests {
     fn leader_gate_returns_none_when_leader() {
         let is_leader = std::sync::atomic::AtomicBool::new(true);
         assert!(leader_gate(&is_leader).is_none());
+    }
+
+    fn applied_resource(kind: &str, name: &str) -> AppliedResourceRef {
+        AppliedResourceRef {
+            api_version: "v1".to_string(),
+            kind: kind.to_string(),
+            namespace: String::new(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn partition_for_cleanup_separates_custom_resources_from_infra() {
+        let namespace = applied_resource("Namespace", "tigera-operator");
+        let crd = applied_resource("CustomResourceDefinition", "installations.operator.tigera.io");
+        let deployment = applied_resource("Deployment", "tigera-operator");
+        let installation = applied_resource("Installation", "default");
+
+        let (custom_resources, infra) = partition_for_cleanup(&[
+            namespace.clone(),
+            crd.clone(),
+            deployment.clone(),
+            installation.clone(),
+        ]);
+
+        assert_eq!(custom_resources, vec![installation]);
+        assert_eq!(infra, vec![namespace, crd, deployment]);
+    }
+
+    #[test]
+    fn partition_for_cleanup_handles_no_custom_resources() {
+        let namespace = applied_resource("Namespace", "tigera-operator");
+
+        let (custom_resources, infra) = partition_for_cleanup(&[namespace.clone()]);
+
+        assert!(custom_resources.is_empty());
+        assert_eq!(infra, vec![namespace]);
+    }
+
+    #[test]
+    fn partition_for_cleanup_handles_empty_input() {
+        let (custom_resources, infra) = partition_for_cleanup(&[]);
+
+        assert!(custom_resources.is_empty());
+        assert!(infra.is_empty());
     }
 }
