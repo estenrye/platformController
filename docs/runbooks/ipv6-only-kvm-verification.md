@@ -51,10 +51,12 @@ These two behaviors were unverifiable offline. Record the outcome in the PR.
 kubectl get ippools.crd.projectcalico.org
 # Expected: pods-v6, lb-internal-routed, lb-ingress-routed (and nothing else).
 
-# (b) No unknown-field warning for flexVolumePath on the v3.32.1 Installation CRD.
-kubectl -n platform-system logs deploy/platform-controller | grep -i "unknown field"
-# Expected: no output. If it warns about flexVolumePath, stop and drop that
-# key for chart versions that no longer define it.
+# (b) The v3.32.1 Installation CRD still defines flexVolumePath. The API server
+# prunes fields the schema does not define (any warning goes to the client in a
+# response header, not to the controller logs), so check the stored object.
+kubectl get installation default -o jsonpath='{.spec.flexVolumePath}'
+# Expected: None. Empty output means the CRD pruned the field: stop and drop
+# flexVolumePath for chart versions that no longer define it.
 ```
 
 ## 3. IPv6-only nodes
