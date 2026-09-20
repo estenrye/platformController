@@ -33,6 +33,7 @@ Running inventory of what each managed component actually needs, so a future sco
 | `admissionregistration.k8s.io` | `mutatingwebhookconfigurations` | `tigera-operator` chart | Found missing during final review — original only granted *validating* |
 | `apiregistration.k8s.io` | `apiservices` | Controller itself | Original ClusterRole |
 | `operator.tigera.io` | `*` (wildcard) incl. `*/status`, `*/finalizers` | `tigera-operator` chart | Operator's own CRs (`Installation`, `APIServer`, etc.) |
+| `crd.projectcalico.org` | `ippools`, `bgpconfigurations`, `bgppeers` (create/patch/delete, get/list via discovery) | Controller itself (added 2026-09-19, [[ipv6-only-calico-2026-09]]) | The controller now applies these directly: explicit pod `IPPool`s, LoadBalancer `IPPool`s, `BGPConfiguration`, `BGPPeer`. Also runs API discovery (`GET /apis/crd.projectcalico.org/v1`) to wait for the kind to be registered before applying. A scope-down that grants only create/patch will fail discovery silently as a timeout, not a 403. |
 | `crd.projectcalico.org`, `projectcalico.org` | incl. `tier.networkpolicies`, `tiers` | `tigera-operator` chart | Found missing during final review |
 | `networking.k8s.io` | `networkpolicies` | `tigera-operator` chart | Found missing during final review |
 | `scheduling.k8s.io` | `priorityclasses` | `tigera-operator` chart | Found missing during final review |
