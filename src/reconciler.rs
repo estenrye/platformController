@@ -29,6 +29,18 @@ pub enum ValidationError {
          singleton named \"default\""
     )]
     UnsupportedName(String),
+    #[error(transparent)]
+    Spec(#[from] crate::spec_validation::SpecError),
+}
+
+impl ValidationError {
+    /// The `status.conditions[].reason` reported for this rejection.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            ValidationError::Spec(err) => err.reason(),
+            _ => "Unsupported",
+        }
+    }
 }
 
 pub fn validate(name: &str, spec: &CniInstallationSpec) -> Result<(), ValidationError> {
@@ -41,6 +53,7 @@ pub fn validate(name: &str, spec: &CniInstallationSpec) -> Result<(), Validation
     if spec.provider != CniProvider::Calico {
         return Err(ValidationError::UnsupportedProvider(spec.provider.clone()));
     }
+    crate::spec_validation::validate_calico(&spec.calico)?;
     Ok(())
 }
 
@@ -116,7 +129,7 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
             obj.metadata.generation,
             &chart_version,
             &previous,
-            "Unsupported",
+            err.reason(),
             &err.to_string(),
         )
         .await?;
@@ -360,6 +373,31 @@ mod tests {
         let err = validate("second", &spec).expect_err("non-singleton names should be rejected");
 
         assert!(matches!(err, ValidationError::UnsupportedName(name) if name == "second"));
+    }
+
+    #[test]
+    fn validate_surfaces_spec_errors_with_their_own_reason() {
+        let mut spec = spec_with(PlatformKind::TalosLinux, CniProvider::Calico);
+        spec.calico.bgp = Some(crate::crd::BgpSpec {
+            as_number: 64514,
+            node_to_node_mesh_enabled: true,
+            log_severity_screen: crate::crd::LogSeverity::Info,
+            service_load_balancer_ips: vec![],
+            peers: vec![],
+        });
+
+        let err = validate("default", &spec).expect_err("bgp without bgpEnabled is invalid");
+
+        assert_eq!(err.reason(), "InvalidBgpConfig");
+    }
+
+    #[test]
+    fn pre_existing_validation_errors_keep_the_unsupported_reason() {
+        let spec = spec_with(PlatformKind::TalosLinux, CniProvider::Calico);
+
+        let err = validate("second", &spec).expect_err("non-singleton name is rejected");
+
+        assert_eq!(err.reason(), "Unsupported");
     }
 
     #[test]
