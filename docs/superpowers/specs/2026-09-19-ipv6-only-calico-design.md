@@ -18,7 +18,10 @@ CRs. It cannot express `BGPConfiguration`, `BGPPeer`, LoadBalancer-only
 
 ## Non-goals
 
-- Dual-stack. Mixed address families in one installation are rejected.
+- Dual-stack. Mixed address families in one installation are rejected for
+  now; dual-stack support is planned as its own future spec. Because address
+  family is inferred from the CIDRs (Section 1) and not from a flag, that spec
+  can relax the mixed-family check without an API break.
 - Other Calico kinds (`FelixConfiguration`, etc.) and any raw-manifest
   passthrough. New kinds get typed fields when needed.
 - Chart hardening carried in the Flux app: kube-linter/checkov annotations,
