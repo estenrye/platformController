@@ -341,10 +341,7 @@ mod tests {
             provider,
             calico: CalicoSpec {
                 chart_version: "v3.29.1".to_string(),
-                bgp_enabled: false,
-                api_server_enabled: false,
-                ip_pools: vec![],
-                node_address_autodetection_v6_cidrs: vec![],
+                ..Default::default()
             },
             cleanup_timeout_seconds: 60,
         }

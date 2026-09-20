@@ -14,7 +14,7 @@ pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
                 "cidr": pool.cidr,
                 "encapsulation": encapsulation_str(&pool.encapsulation),
                 "natOutgoing": bool_to_enum(pool.nat_outgoing),
-                "blockSize": pool.block_size,
+                "blockSize": pool.effective_block_size(),
                 "nodeSelector": pool.node_selector,
             })
         })
@@ -148,10 +148,11 @@ mod tests {
                 cidr: "fd97:45c2:b3a1:1100::/56".to_string(),
                 encapsulation: Encapsulation::None,
                 nat_outgoing: true,
-                block_size: 122,
+                block_size: Some(122),
                 node_selector: "all()".to_string(),
             }],
             node_address_autodetection_v6_cidrs: vec!["fd97:45c2:b3a1:179::/64".to_string()],
+            ..Default::default()
         }
     }
 
@@ -240,10 +241,7 @@ mod tests {
     async fn render_produces_deployment_manifest_for_tigera_operator() {
         let spec = crate::crd::CalicoSpec {
             chart_version: "v3.29.1".to_string(),
-            bgp_enabled: false,
-            api_server_enabled: false,
-            ip_pools: vec![],
-            node_address_autodetection_v6_cidrs: vec![],
+            ..Default::default()
         };
 
         let rendered = render(&spec).await.expect("helm template should succeed");
