@@ -78,8 +78,9 @@ spec:
 - **Retired pools stay declared with `disabled: true`.** Calico's pool CIDR is
   immutable, so renumbering is a new-pool swap, not an in-place edit.
 - **Chart repository** default changes to `https://docs.tigera.io/calico/charts`
-  (what the Flux app uses). No new field; `chartVersion` remains required and
-  examples move to v3.32.1. Native LoadBalancer IPAM requires Calico 3.30+.
+  (what the Flux app uses). No new field; `chartVersion` remains required.
+  The new IPv6 example uses v3.32.1; the existing IPv4 example is unchanged.
+  Native LoadBalancer IPAM requires Calico 3.30+.
 
 ### Addressing is entirely spec-driven
 
@@ -133,8 +134,9 @@ cleanup purposes.
 `Installation` when any `IPPool` already exists. The Flux app hit this at
 bring-up (every pod stuck with "no configured Calico pools") and declares its
 pod pool explicitly. The controller does the same, so ordering doesn't depend
-on operator timing. Pod pools are still passed in `Installation` too, so the
-operator's own validation sees them.
+on operator timing. Pod pools are still passed in `Installation` too, **under
+the same `name`**, so the operator adopts the one pool instead of creating a
+duplicate.
 
 **Chart v3.32.1 ships no CRDs.** Verified by rendering both charts with
 `--include-crds`: v3.29.1 emits 24 `CustomResourceDefinition`s (including every
