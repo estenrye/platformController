@@ -5,12 +5,19 @@ use crate::crd::{CalicoSpec, Encapsulation};
 /// creates this namespace explicitly.
 pub const TIGERA_OPERATOR_NAMESPACE: &str = "tigera-operator";
 
+/// The Helm repository the tigera-operator chart is fetched from.
+pub const CALICO_CHART_REPO: &str = "https://docs.tigera.io/calico/charts";
+
 pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
     let ip_pools: Vec<serde_json::Value> = calico
         .ip_pools
         .iter()
         .map(|pool| {
             serde_json::json!({
+                // The operator only adopts a pre-existing explicit IPPool
+                // (rendered by crate::calico) instead of creating a second one
+                // when both carry the same name.
+                "name": pool.name,
                 "cidr": pool.cidr,
                 "encapsulation": encapsulation_str(&pool.encapsulation),
                 "natOutgoing": bool_to_enum(pool.nat_outgoing),
@@ -87,7 +94,7 @@ pub fn build_render_args(chart_version: &str, values_path: &std::path::Path) -> 
         "template".to_string(),
         "calico".to_string(),
         "--repo".to_string(),
-        "https://projectcalico.docs.tigera.io/charts".to_string(),
+        CALICO_CHART_REPO.to_string(),
         "tigera-operator".to_string(),
         "--version".to_string(),
         chart_version.to_string(),
@@ -210,7 +217,7 @@ mod tests {
                 "template".to_string(),
                 "calico".to_string(),
                 "--repo".to_string(),
-                "https://projectcalico.docs.tigera.io/charts".to_string(),
+                "https://docs.tigera.io/calico/charts".to_string(),
                 "tigera-operator".to_string(),
                 "--version".to_string(),
                 "v3.29.1".to_string(),
@@ -234,6 +241,56 @@ mod tests {
         assert!(values["installation"]["calicoNetwork"]
             .get("nodeAddressAutodetectionV6")
             .is_none());
+    }
+
+    #[test]
+    fn passes_pool_names_so_the_operator_adopts_the_explicit_ip_pool() {
+        let values = build_values(&sample_spec());
+
+        assert_eq!(
+            values["installation"]["calicoNetwork"]["ipPools"][0]["name"],
+            "pods-v6"
+        );
+    }
+
+    #[test]
+    fn resolves_omitted_block_size_by_address_family() {
+        let mut spec = sample_spec();
+        spec.ip_pools[0].block_size = None;
+
+        let values = build_values(&spec);
+
+        assert_eq!(
+            values["installation"]["calicoNetwork"]["ipPools"][0]["blockSize"],
+            122
+        );
+    }
+
+    #[test]
+    fn ipv6_only_values_enable_no_ipv4() {
+        let values = build_values(&sample_spec());
+        let network = &values["installation"]["calicoNetwork"];
+
+        assert!(network.get("nodeAddressAutodetectionV4").is_none());
+        for pool in network["ipPools"].as_array().expect("ipPools is an array") {
+            assert!(pool["cidr"].as_str().unwrap().contains(':'), "pool must be IPv6: {pool}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn v3_32_1_chart_ships_no_crds() {
+        let spec = crate::crd::CalicoSpec {
+            chart_version: "v3.32.1".to_string(),
+            ..Default::default()
+        };
+
+        let rendered = render(&spec).await.expect("helm template should succeed");
+
+        // From 3.32 the operator creates every CRD at runtime; the reconciler's
+        // kind-availability wait depends on this.
+        assert!(!rendered.contains("kind: CustomResourceDefinition"));
+        assert!(rendered.contains("kind: Installation"));
     }
 
     #[tokio::test]
