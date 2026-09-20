@@ -105,7 +105,21 @@ pub enum ReconcileError {
     NotLeader,
 }
 
-pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
+async fn wait_for_object_kind(
+    client: &Client,
+    object: &DynamicObject,
+) -> Result<(), crate::apply::ApplyError> {
+    let types = object.types.clone().unwrap_or_default();
+    crate::apply::wait_for_kind_available(
+        client,
+        &types.api_version,
+        &types.kind,
+        crate::apply::KIND_AVAILABLE_TIMEOUT,
+    )
+    .await
+}
+
+pub async fn reconcile(obj:Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     if let Some(action) = leader_gate(&ctx.is_leader) {
         return Ok(action);
     }
@@ -169,7 +183,14 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
     );
     applied.push(namespace_ref);
 
+    // Phase 1: the chart's objects in rank order. Its custom resources
+    // (Installation, APIServer, ...) come last, and their CRDs may not exist
+    // yet: chart v3.29.x ships them, but v3.32.x leaves it to the running
+    // operator, so wait for each kind to be registered first.
     for object in &objects {
+        if crate::manifests::is_custom_resource(object) {
+            wait_for_object_kind(&ctx.client, object).await?;
+        }
         let reference = crate::apply::apply_object(&ctx.client, object, "platform-controller").await?;
         if reference.kind == "CustomResourceDefinition" {
             crate::apply::wait_for_crd_established(
@@ -181,6 +202,22 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
             tracing::debug!(crd = %reference.name, "CRD established");
         }
         applied.push(reference);
+    }
+
+    // Phases 2 and 3: Calico's own objects. Pod pools go first so IPAM never
+    // depends on operator timing; BGP configuration, peers and LoadBalancer
+    // pools only after they exist.
+    let calico_phases = [
+        crate::calico::pod_pool_objects(&obj.spec.calico),
+        crate::calico::routing_and_lb_objects(&obj.spec.calico),
+    ];
+    for phase in &calico_phases {
+        for object in phase {
+            wait_for_object_kind(&ctx.client, object).await?;
+            let reference =
+                crate::apply::apply_object(&ctx.client, object, "platform-controller").await?;
+            applied.push(reference);
+        }
     }
     tracing::info!(applied_count = applied.len(), "applied all objects");
 
@@ -458,6 +495,24 @@ mod tests {
 
         assert_eq!(custom_resources, vec![installation]);
         assert_eq!(infra, vec![namespace, crd, deployment]);
+    }
+
+    #[test]
+    fn calico_objects_are_cleaned_up_as_custom_resources_before_the_operator() {
+        let pool = applied_resource("IPPool", "pods-v6");
+        let bgp_configuration = applied_resource("BGPConfiguration", "default");
+        let peer = applied_resource("BGPPeer", "gateway");
+        let deployment = applied_resource("Deployment", "tigera-operator");
+
+        let (custom_resources, infra) = partition_for_cleanup(&[
+            deployment.clone(),
+            pool.clone(),
+            bgp_configuration.clone(),
+            peer.clone(),
+        ]);
+
+        assert_eq!(custom_resources, vec![pool, bgp_configuration, peer]);
+        assert_eq!(infra, vec![deployment]);
     }
 
     #[test]

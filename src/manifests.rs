@@ -60,6 +60,13 @@ pub fn apply_rank(obj: &DynamicObject) -> u8 {
     rank_for_kind(kind)
 }
 
+/// True for objects whose kind is defined by a CRD rather than built into the
+/// API server, i.e. objects that can only be applied once that CRD is
+/// registered. From Calico 3.32 the operator, not the chart, registers them.
+pub fn is_custom_resource(obj: &DynamicObject) -> bool {
+    apply_rank(obj) == CUSTOM_RESOURCE_RANK
+}
+
 pub fn sort_manifests(objects: &mut Vec<DynamicObject>) {
     objects.sort_by_key(apply_rank);
 }
@@ -133,5 +140,15 @@ metadata:
         assert_eq!(rank_for_kind("Installation"), CUSTOM_RESOURCE_RANK);
         assert_eq!(rank_for_kind("APIServer"), CUSTOM_RESOURCE_RANK);
         assert_eq!(CUSTOM_RESOURCE_RANK, 5);
+    }
+
+    #[test]
+    fn is_custom_resource_is_true_only_for_kinds_outside_the_builtin_ranks() {
+        let objects = parse_manifests(SAMPLE_MANIFESTS).expect("manifests should parse");
+
+        let flags: Vec<bool> = objects.iter().map(is_custom_resource).collect();
+
+        // Namespace, Deployment, CustomResourceDefinition, Installation
+        assert_eq!(flags, vec![false, false, false, true]);
     }
 }
