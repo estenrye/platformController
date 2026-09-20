@@ -72,6 +72,12 @@ pub struct CalicoIpPoolSpec {
     pub block_size: Option<i32>,
     #[serde(default = "default_node_selector")]
     pub node_selector: String,
+    /// Retired pools stay declared with `disabled: true`: Calico's pool CIDR is
+    /// immutable, so renumbering is a new-pool swap, not an in-place edit. A
+    /// disabled pool is rendered as a disabled `IPPool` but kept out of the
+    /// `Installation`, which would otherwise recreate it as enabled.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 impl CalicoIpPoolSpec {

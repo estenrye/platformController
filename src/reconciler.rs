@@ -38,7 +38,9 @@ impl ValidationError {
     pub fn reason(&self) -> &'static str {
         match self {
             ValidationError::Spec(err) => err.reason(),
-            _ => "Unsupported",
+            ValidationError::UnsupportedPlatform(_)
+            | ValidationError::UnsupportedProvider(_)
+            | ValidationError::UnsupportedName(_) => "Unsupported",
         }
     }
 }
@@ -119,7 +121,7 @@ async fn wait_for_object_kind(
     .await
 }
 
-pub async fn reconcile(obj:Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
+pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     if let Some(action) = leader_gate(&ctx.is_leader) {
         return Ok(action);
     }
@@ -300,6 +302,17 @@ fn partition_for_cleanup(
         .partition(|resource| crate::manifests::rank_for_kind(&resource.kind) == crate::manifests::CUSTOM_RESOURCE_RANK)
 }
 
+/// Whether cleanup must wait for a custom resource to actually disappear.
+///
+/// Objects in the Calico API group are deleted without waiting: while the
+/// `Installation` still exists, the tigera operator (Calico >= 3.28) owns the
+/// lifecycle of pools declared there and can recreate a deleted pod `IPPool`,
+/// so a removal wait would time out and wedge the finalizer. The wait is kept
+/// for everything else (Installation, APIServer, Goldmane, Whisker, ...).
+fn needs_removal_wait(reference: &AppliedResourceRef) -> bool {
+    reference.api_version != crate::calico::CALICO_API_VERSION
+}
+
 pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     // Never return Ok from a standby's Cleanup dispatch: kube::runtime::finalizer
     // treats any Ok here as "cleanup genuinely succeeded" and strips the finalizer
@@ -327,13 +340,23 @@ pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Act
     let timeout = Duration::from_secs(u64::from(obj.spec.cleanup_timeout_seconds));
 
     for reference in custom_resources.iter().rev() {
-        tracing::info!(
-            installation = %name,
-            kind = %reference.kind,
-            resource = %reference.name,
-            "deleting provider-managed resource and waiting for removal"
-        );
-        crate::apply::delete_and_wait_for_removal(&ctx.client, reference, timeout).await?;
+        if needs_removal_wait(reference) {
+            tracing::info!(
+                installation = %name,
+                kind = %reference.kind,
+                resource = %reference.name,
+                "deleting provider-managed resource and waiting for removal"
+            );
+            crate::apply::delete_and_wait_for_removal(&ctx.client, reference, timeout).await?;
+        } else {
+            tracing::info!(
+                installation = %name,
+                kind = %reference.kind,
+                resource = %reference.name,
+                "deleting Calico-group resource without waiting for removal"
+            );
+            crate::apply::delete_object(&ctx.client, reference).await?;
+        }
     }
 
     for reference in infra.iter().rev() {
@@ -513,6 +536,26 @@ mod tests {
 
         assert_eq!(custom_resources, vec![pool, bgp_configuration, peer]);
         assert_eq!(infra, vec![deployment]);
+    }
+
+    #[test]
+    fn calico_group_objects_are_deleted_without_waiting_for_removal() {
+        for kind in ["IPPool", "BGPConfiguration", "BGPPeer"] {
+            let reference = AppliedResourceRef {
+                api_version: crate::calico::CALICO_API_VERSION.to_string(),
+                ..applied_resource(kind, "x")
+            };
+            assert!(!needs_removal_wait(&reference), "{kind} must not be waited on");
+        }
+    }
+
+    #[test]
+    fn operator_owned_custom_resources_still_wait_for_removal() {
+        let installation = AppliedResourceRef {
+            api_version: "operator.tigera.io/v1".to_string(),
+            ..applied_resource("Installation", "default")
+        };
+        assert!(needs_removal_wait(&installation));
     }
 
     #[test]

@@ -60,9 +60,11 @@ pub fn apply_rank(obj: &DynamicObject) -> u8 {
     rank_for_kind(kind)
 }
 
-/// True for objects whose kind is defined by a CRD rather than built into the
-/// API server, i.e. objects that can only be applied once that CRD is
+/// True for every kind that is not in `rank_for_kind`'s built-in table, i.e.
+/// kinds assumed to be defined by a CRD and so applicable only once that CRD is
 /// registered. From Calico 3.32 the operator, not the chart, registers them.
+/// Built-in kinds that are simply absent from the table also match; the
+/// follow-up kind wait then succeeds on its first poll.
 pub fn is_custom_resource(obj: &DynamicObject) -> bool {
     apply_rank(obj) == CUSTOM_RESOURCE_RANK
 }

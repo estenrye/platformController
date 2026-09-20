@@ -90,6 +90,14 @@ spec:
                           type: integer
                         cidr:
                           type: string
+                        disabled:
+                          default: false
+                          description: |-
+                            Retired pools stay declared with `disabled: true`: Calico's pool CIDR is
+                            immutable, so renumbering is a new-pool swap, not an in-place edit. A
+                            disabled pool is rendered as a disabled `IPPool` but kept out of the
+                            `Installation`, which would otherwise recreate it as enabled.
+                          type: boolean
                         encapsulation:
                           default: None
                           enum:

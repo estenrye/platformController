@@ -12,6 +12,9 @@ pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
     let ip_pools: Vec<serde_json::Value> = calico
         .ip_pools
         .iter()
+        // A retired pool is still applied as a disabled IPPool by crate::calico,
+        // but must not be declared here: the operator would recreate it enabled.
+        .filter(|pool| !pool.disabled)
         .map(|pool| {
             serde_json::json!({
                 // The operator only adopts a pre-existing explicit IPPool
@@ -157,6 +160,7 @@ mod tests {
                 nat_outgoing: true,
                 block_size: Some(122),
                 node_selector: "all()".to_string(),
+                disabled: false,
             }],
             node_address_autodetection_v6_cidrs: vec!["fd97:45c2:b3a1:179::/64".to_string()],
             ..Default::default()
@@ -264,6 +268,28 @@ mod tests {
             values["installation"]["calicoNetwork"]["ipPools"][0]["blockSize"],
             122
         );
+    }
+
+    #[test]
+    fn omits_disabled_pools_from_the_installation_but_keeps_enabled_siblings() {
+        let mut spec = sample_spec();
+        let retired = CalicoIpPoolSpec {
+            name: "pods-retired".to_string(),
+            cidr: "fd00:db8:0:2200::/56".to_string(),
+            disabled: true,
+            ..spec.ip_pools[0].clone()
+        };
+        spec.ip_pools.push(retired);
+
+        let values = build_values(&spec);
+        let pools = values["installation"]["calicoNetwork"]["ipPools"]
+            .as_array()
+            .expect("ipPools is an array");
+
+        // The operator would recreate a disabled pool as enabled if it were
+        // declared on the Installation.
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0]["name"], "pods-v6");
     }
 
     #[test]

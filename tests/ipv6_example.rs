@@ -75,6 +75,7 @@ fn every_advertised_vip_range_is_backed_by_a_load_balancer_pool() {
     let calico = load().spec.calico;
     let bgp = calico.bgp.expect("the example configures BGP");
 
+    assert!(!bgp.service_load_balancer_ips.is_empty());
     for advertised in &bgp.service_load_balancer_ips {
         assert!(
             calico.load_balancer_pools.iter().any(|pool| &pool.cidr == advertised),

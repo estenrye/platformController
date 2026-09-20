@@ -155,6 +155,7 @@ mod tests {
             nat_outgoing: true,
             block_size: None,
             node_selector: "all()".to_string(),
+            disabled: false,
         }
     }
 

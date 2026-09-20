@@ -42,6 +42,7 @@ fn pod_pool_object(pool: &CalicoIpPoolSpec) -> DynamicObject {
             "ipipMode": ipip_mode,
             "vxlanMode": vxlan_mode,
             "allowedUses": ["Workload", "Tunnel"],
+            "disabled": pool.disabled,
         }),
     )
 }
@@ -115,6 +116,7 @@ mod tests {
                 nat_outgoing: true,
                 block_size: None,
                 node_selector: "all()".to_string(),
+                disabled: false,
             }],
             bgp: Some(BgpSpec {
                 as_number: 64514,
@@ -175,8 +177,19 @@ mod tests {
                 "ipipMode": "Never",
                 "vxlanMode": "Never",
                 "allowedUses": ["Workload", "Tunnel"],
+                "disabled": false,
             })
         );
+    }
+
+    #[test]
+    fn retired_pod_pool_renders_disabled_true() {
+        let mut retired = spec();
+        retired.ip_pools[0].disabled = true;
+
+        let objects = pod_pool_objects(&retired);
+
+        assert_eq!(objects[0].data["spec"]["disabled"], serde_json::json!(true));
     }
 
     #[test]
