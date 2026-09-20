@@ -161,9 +161,14 @@ existing `wait_for_crd_established` stays for chart-shipped CRDs.
 `status.appliedResources`, so removing a peer or pool from the spec prunes it.
 On delete, `partition_for_cleanup` already classifies unknown kinds as custom
 resources and deletes them (in reverse apply order) before the operator, so
-BGP/LB objects go first, then pod pools, then `Installation`. `IPPool`
-deletion while pods hold IPAM blocks is documented as known behavior; no
-special handling. On v3.32.x the CRDs are operator-created and are not tracked
+BGP/LB objects go first, then pod pools, then `Installation`. Objects in the
+Calico API group (`crd.projectcalico.org/v1`) are deleted without waiting for
+removal, because while the `Installation` still exists the tigera operator
+(Calico >= 3.28) owns the lifecycle of pools declared there and can recreate a
+deleted pod `IPPool`; a removal wait would then time out and wedge the
+finalizer. Everything else (`Installation`, `APIServer`, ...) keeps the
+bounded wait. `IPPool` deletion while pods hold IPAM blocks is documented as
+known behavior; no special handling. On v3.32.x the CRDs are operator-created and are not tracked
 by the controller, so they remain after cleanup (same as `helm uninstall`).
 
 ### Open verification items (live, in the runbook)

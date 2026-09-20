@@ -42,6 +42,11 @@ kubectl -n platform-system logs deploy/platform-controller -f
 A `KindNotAvailable` failure after 180s means the operator never registered
 the CRDs: check `kubectl -n tigera-operator logs deploy/tigera-operator`.
 
+`status.appliedResources` is only written after every phase succeeds. If a
+first install fails partway (for example `KindNotAvailable`) and the CR is then
+deleted, cleanup sees an empty ledger and may leave the `tigera-operator`
+namespace, its RBAC and its Deployment behind; remove them by hand.
+
 ## 2. Open verification items
 
 These two behaviors were unverifiable offline. Record the outcome in the PR.
@@ -50,6 +55,12 @@ These two behaviors were unverifiable offline. Record the outcome in the PR.
 # (a) Exactly one pool per declared name; no operator-created duplicate.
 kubectl get ippools.crd.projectcalico.org
 # Expected: pods-v6, lb-internal-routed, lb-ingress-routed (and nothing else).
+
+# (a2) LB pools are written directly to crd.projectcalico.org/v1 with only
+# cidr/allowedUses/nodeSelector/disabled (no ipipMode/vxlanMode/natOutgoing/
+# blockSize, unlike pod pools); confirm the stored object.
+kubectl get ippools.crd.projectcalico.org lb-internal-routed -o yaml
+# Expected: the pool is present with allowedUses [LoadBalancer].
 
 # (b) The v3.32.1 Installation CRD still defines flexVolumePath. The API server
 # prunes fields the schema does not define (any warning goes to the client in a
@@ -114,7 +125,11 @@ kubectl get ns tigera-operator 2>&1
 
 Expected: the delete completes (finalizer removed), Calico objects (BGP, LB
 pools, pod pools) are removed before the operator, and `tigera-operator` is
-gone. On chart v3.32.x the operator-created CRDs remain after cleanup (same as
+gone. The delete must complete without the finalizer hanging (Calico-group
+objects are deleted without waiting for removal), and afterwards
+`kubectl get ippools.crd.projectcalico.org` must show no leftover pools; if the
+operator recreated one, delete it manually and record it in the PR. On chart
+v3.32.x the operator-created CRDs remain after cleanup (same as
 `helm uninstall`); that is expected.
 
 ## Record
