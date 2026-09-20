@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod calico;
 pub mod cidr;
 pub mod crd;
 pub mod helm;
