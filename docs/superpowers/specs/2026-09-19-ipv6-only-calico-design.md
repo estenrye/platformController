@@ -108,50 +108,70 @@ cluster. Each rejection yields `phase: Failed` with a specific condition reason:
 - `bgp` is set only when `bgpEnabled: true`.
 - Pool and peer names are unique; `serviceLoadBalancerIPs` entries are CIDRs.
 - `nodeAddressAutodetectionV6Cidrs` is set only for an IPv6 installation.
+- `encapsulation: IPIP` is rejected on an IPv6 pool (Calico does not support
+  IPIP over IPv6).
 
 ## 3. Reconcile flow and ordering
 
 The controller builds the Calico objects (`crd.projectcalico.org/v1`) itself,
-as `DynamicObject`s from `spec.calico`, alongside the Helm render. Apply ranks
-extend the existing scheme in `src/manifests.rs`:
+as `DynamicObject`s from `spec.calico`, alongside the Helm render. Apply happens
+in explicit phases:
 
-| Rank | Objects | Notes |
+| Phase | Objects | Notes |
 |---|---|---|
-| 0 | `Namespace` | Labeled `pod-security.kubernetes.io/enforce: privileged`; the hostNetwork operator pod needs it. |
-| 1-4 | CRDs, RBAC, config, workloads | Unchanged (chart). |
-| 5 | `Installation`, `APIServer` | Unchanged. Pod pools still passed here so operator validation sees them. |
-| 6 | Pod `IPPool`s | Explicit, from `spec.calico.ipPools`: `allowedUses: [Workload, Tunnel]`, `ipipMode`/`vxlanMode` derived from `encapsulation`. |
-| 7 | `BGPConfiguration`, `BGPPeer`, LB `IPPool`s | Applied only after pod pools exist. |
+| 0 | `Namespace` | Unchanged. Already carries the `pod-security.kubernetes.io/*: privileged` labels the hostNetwork operator pod needs. |
+| 1 | Chart objects, in `rank_for_kind` order | Unchanged. Includes chart CRDs when the chart ships them (v3.29.x) and the chart's custom resources (`Installation`, `APIServer`, and on v3.32.x also `Goldmane`, `Whisker`) last. |
+| 2 | Pod `IPPool`s | Explicit, from `spec.calico.ipPools`: `allowedUses: [Workload, Tunnel]`, `ipipMode`/`vxlanMode` derived from `encapsulation`. |
+| 3 | `BGPConfiguration`, `BGPPeer`, LB `IPPool`s | Applied only after pod pools exist. |
+
+Phases 2 and 3 are explicit steps in `reconcile`, not `rank_for_kind` values,
+because pod pools and LB pools are the same kind (`IPPool`) at different
+phases. Every Calico object falls in the existing "custom resource" bucket for
+cleanup purposes.
 
 **Why explicit pod pools.** The operator skips creating pools from
 `Installation` when any `IPPool` already exists. The Flux app hit this at
 bring-up (every pod stuck with "no configured Calico pools") and declares its
 pod pool explicitly. The controller does the same, so ordering doesn't depend
-on operator timing.
+on operator timing. Pod pools are still passed in `Installation` too, so the
+operator's own validation sees them.
 
-**Gate between ranks 5 and 6.** The `crd.projectcalico.org` CRDs are created by
-the running operator, not applied by the controller, so the existing
-apply-then-wait cannot cover them. The controller polls until `ippools`,
-`bgpconfigurations` and `bgppeers` `.crd.projectcalico.org` are `Established`,
-bounded by a deadline. Per [[wait-for-crd-established]], every API call in the
-poll is wrapped in `tokio::time::timeout_at`, not only the loop. On timeout the
-reconcile fails with condition `CalicoCrdsNotReady` and retries via the normal
-`error_policy` backoff.
+**Chart v3.32.1 ships no CRDs.** Verified by rendering both charts with
+`--include-crds`: v3.29.1 emits 24 `CustomResourceDefinition`s (including every
+`crd.projectcalico.org` one); v3.32.1 emits none. From 3.32 the running
+operator creates all CRDs (`operator.tigera.io` and `crd.projectcalico.org`)
+at startup. The current flow applies `Installation` immediately after the
+operator `Deployment` and would fail discovery with `Missing Kind` on 3.32.
+
+**Generic kind-availability wait.** Before applying any object whose kind is
+not a built-in of the chart (every phase 1 custom resource, and every phase 2/3
+object), the controller polls API discovery until that `apiVersion/kind`
+resolves, bounded by a deadline. This covers both chart generations: instant
+when the CRD already exists (3.29.x, or a re-reconcile), and a real wait while
+the operator starts, pulls its image and registers CRDs (3.32.x). The deadline
+is 180s, since a first install on a CNI-less cluster includes an image pull.
+Per [[wait-for-crd-established]], every API call in the poll is wrapped in
+`tokio::time::timeout_at`, not only the loop. On timeout the reconcile fails
+with `KindNotAvailable` and retries via the normal `error_policy` backoff. The
+existing `wait_for_crd_established` stays for chart-shipped CRDs.
 
 **Prune and cleanup reuse existing mechanisms.** New objects are recorded in
 `status.appliedResources`, so removing a peer or pool from the spec prunes it.
 On delete, `partition_for_cleanup` already classifies unknown kinds as custom
-resources and deletes them before the operator, so ranks 6-7 go first.
-`IPPool` deletion while pods hold IPAM blocks is documented as known behavior;
-no special handling.
+resources and deletes them (in reverse apply order) before the operator, so
+BGP/LB objects go first, then pod pools, then `Installation`. `IPPool`
+deletion while pods hold IPAM blocks is documented as known behavior; no
+special handling. On v3.32.x the CRDs are operator-created and are not tracked
+by the controller, so they remain after cleanup (same as `helm uninstall`).
 
-### Open verification items (resolve during planning, against Calico 3.32.1)
+### Open verification items (live, in the runbook)
 
-1. Whether the operator or the chart installs the `crd.projectcalico.org`
-   CRDs. The Flux app applies `crd.projectcalico.org/v1` directly and works;
-   the gate's CRD list and timing depend on the mechanism.
-2. That `Installation.ipPools` plus an explicit `IPPool` with the same CIDR do
+1. That `Installation.ipPools` plus an explicit `IPPool` with the same CIDR do
    not conflict. The Flux app runs exactly this configuration.
+2. That the v3.32.1 `Installation` CRD accepts `flexVolumePath: None` without
+   an unknown-field warning (the chart itself also renders
+   `kubeletVolumePluginPath: None`). If it warns, drop `flexVolumePath` for
+   chart versions that no longer define it.
 
 ## 4. Example, tests, runbook
 
@@ -169,8 +189,10 @@ each block to its Calico object. The existing IPv4 example is unchanged.
 - Rank ordering: pod pools before LB/BGP objects; `Installation` values contain
   no IPv4 keys.
 - Validation table tests for every rejection in Section 2.
-- The CRD-poll gate, using the fake-client pattern of
-  `wait_for_crd_established`.
+- The kind-availability wait's pure classifier (which `kube::Error`s mean
+  "kind not registered yet"), shared with `dynamic_api_for`. As with
+  `wait_for_crd_established`, the polling loop itself is covered live, not by
+  a fake client.
 - `deploy/crd.yaml` regenerated via `crdgen` and checked for drift.
 
 **Live verification (acceptance gate):**
