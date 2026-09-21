@@ -21,12 +21,42 @@ The gateway's FRR config must accept the new cluster as a BGP neighbor:
 If another cluster already peers with this gateway, confirm the new AS number
 and every new prefix are distinct from the existing cluster's.
 
+The peering segment must actually exist on the gateway: a VLAN subinterface, a
+bridge, and the gateway's own address (the `peerIP`) on that bridge. Configuring
+FRR alone is not enough; without the address the node's neighbor entry for the
+peer stays `INCOMPLETE` and the BGP session sits in `Connect` ("No route to
+host").
+
+### Hypervisor prerequisites (OpenStack or similar)
+
+Virtual networks filter traffic per port, so on the node's port on the peering
+segment:
+
+- allow ingress (IPv6 ethertype) for every LoadBalancer service port you will
+  test, from the client networks. Only ports with a rule are reachable (the
+  VIP arrives on the service port, not a NodePort);
+- add every `loadBalancerPools` CIDR as an allowed address pair. Without it the
+  VIP is dropped in both directions, even when the port is open.
+
+The node needs a single NIC on the peering segment, or symmetric routing if it
+has two: a reply must leave the NIC the request arrived on. A second NIC with a
+lower-metric default route sends VIP replies out the wrong port, where they are
+dropped (source rules cannot fix this, because the reply is routed before the
+NAT rewrites its source to the VIP).
+
 ## 1. Install
+
+Run a controller image built from the branch under test. `deploy/bootstrap.yaml`
+points at `:latest`, which may predate the Calico phases; a controller that
+does not know them installs only the operator and creates no BGP peer or LB
+pools, and the operator then creates its own pool alongside yours. Set the
+image before applying the `CniInstallation`.
 
 ```bash
 kubectl apply -f deploy/crd.yaml
 kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
+kubectl -n platform-system set image deploy/platform-controller platform-controller=<your image>
 kubectl apply -f my-cni-installation-ipv6.yaml
 kubectl get cni default -w
 ```
@@ -54,7 +84,9 @@ These two behaviors were unverifiable offline. Record the outcome in the PR.
 ```bash
 # (a) Exactly one pool per declared name; no operator-created duplicate.
 kubectl get ippools.crd.projectcalico.org
-# Expected: pods-v6, lb-internal-routed, lb-ingress-routed (and nothing else).
+# Expected: pods-v6, lb-internal-routed, lb-ingress-routed (and nothing else),
+# on a clean install with the controller image already in place. A pool named
+# default-ipv6-ippool means the operator created one before the controller did.
 
 # (a2) LB pools are written directly to crd.projectcalico.org/v1 with only
 # cidr/allowedUses/nodeSelector/disabled (no ipipMode/vxlanMode/natOutgoing/
@@ -97,13 +129,18 @@ and that the gateway learns it:
 ```bash
 kubectl create deployment vip-test --image=nginx --port=80
 kubectl expose deployment vip-test --type=LoadBalancer --port=80
-kubectl get svc vip-test        # EXTERNAL-IP is inside lb-internal-routed
-vtysh -c 'show bgp ipv6 unicast <EXTERNAL-IP>/128'   # on the gateway
+kubectl get svc vip-test        # EXTERNAL-IP is inside one of your LB pools
+vtysh -c 'show bgp ipv6 unicast <EXTERNAL-IP>'       # on the gateway
 curl -g "http://[<EXTERNAL-IP>]/"                    # from a LAN client
 ```
 
-Expected: the VIP is allocated from your LB pool, present in the gateway's BGP
-table, and reachable. Clean up: `kubectl delete svc,deploy vip-test`.
+Expected: the VIP is allocated from one of your LB pools (either can be
+picked), covered by a route in the gateway's BGP table, and reachable. The
+gateway holds the advertised `/112` range, not a `/128`, so look the address up
+without a prefix length: a `<EXTERNAL-IP>/128` lookup reports "Network not in
+table". Test from the gateway and from a client on another network: if only
+the gateway works, suspect the return path (see step 0). Clean up:
+`kubectl delete svc,deploy vip-test`.
 
 ## 5. Pod egress is SNAT'd to the node address
 
@@ -123,14 +160,21 @@ kubectl get ippools.crd.projectcalico.org 2>&1
 kubectl get ns tigera-operator 2>&1
 ```
 
-Expected: the delete completes (finalizer removed), Calico objects (BGP, LB
-pools, pod pools) are removed before the operator, and `tigera-operator` is
-gone. The delete must complete without the finalizer hanging (Calico-group
-objects are deleted without waiting for removal), and afterwards
-`kubectl get ippools.crd.projectcalico.org` must show no leftover pools; if the
-operator recreated one, delete it manually and record it in the PR. On chart
+Expected: the delete completes on its own within about a minute (finalizer
+removed), with no manual `kubectl delete` of any operator resource, and
+`tigera-operator` and `calico-system` are gone. The controller deletes Calico
+objects (BGP, LB pools, pod pools) without waiting, deletes the operator's
+`APIServer`, `Goldmane`, `Whisker` and finally `Installation` (the
+`Installation` holds finalizers that wait for the others), waits for them, then
+deletes the Calico objects once more: the operator recreates a deleted pod pool
+while the `Installation` still exists, so the sweep removes it after. Afterwards
+`kubectl get ippools.crd.projectcalico.org` must show no pools. On chart
 v3.32.x the operator-created CRDs remain after cleanup (same as
 `helm uninstall`); that is expected.
+
+Cleanup does not touch CoreDNS. Its pods keep pod IPs that no longer route
+after Calico is removed; restart them (`kubectl -n kube-system rollout restart
+deploy/coredns`) once the next install is Ready.
 
 ## Record
 
