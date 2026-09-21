@@ -36,7 +36,7 @@ pub enum CniProvider {
     Calico,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CalicoSpec {
     pub chart_version: String,
@@ -48,6 +48,12 @@ pub struct CalicoSpec {
     pub ip_pools: Vec<CalicoIpPoolSpec>,
     #[serde(default)]
     pub node_address_autodetection_v6_cidrs: Vec<String>,
+    /// BGP configuration and peers. Requires `bgpEnabled: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bgp: Option<BgpSpec>,
+    /// LoadBalancer-only IP pools (native Calico LoadBalancer IPAM, Calico >= 3.30).
+    #[serde(default)]
+    pub load_balancer_pools: Vec<LoadBalancerPoolSpec>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -59,21 +65,88 @@ pub struct CalicoIpPoolSpec {
     pub encapsulation: Encapsulation,
     #[serde(default = "default_nat_outgoing")]
     pub nat_outgoing: bool,
-    #[serde(default = "default_block_size")]
-    pub block_size: i32,
+    /// Omitted means "use Calico's default for this pool's address family",
+    /// resolved at render time (26 for IPv4, 122 for IPv6) because a single
+    /// fixed serde default cannot be right for both families.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_size: Option<i32>,
     #[serde(default = "default_node_selector")]
     pub node_selector: String,
+    /// Retired pools stay declared with `disabled: true`: Calico's pool CIDR is
+    /// immutable, so renumbering is a new-pool swap, not an in-place edit. A
+    /// disabled pool is rendered as a disabled `IPPool` but kept out of the
+    /// `Installation`, which would otherwise recreate it as enabled.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+impl CalicoIpPoolSpec {
+    /// The block size to render: the explicit value, else the default for the
+    /// CIDR's family. An unparseable CIDR falls back to the IPv4 default;
+    /// `spec_validation` rejects such a spec before anything renders.
+    pub fn effective_block_size(&self) -> i32 {
+        self.block_size.unwrap_or_else(|| {
+            crate::cidr::parse(&self.cidr)
+                .map(|cidr| cidr.family())
+                .unwrap_or(crate::cidr::Family::V4)
+                .default_block_size()
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BgpSpec {
+    pub as_number: u32,
+    #[serde(default = "default_true")]
+    pub node_to_node_mesh_enabled: bool,
+    #[serde(default)]
+    pub log_severity_screen: LogSeverity,
+    /// CIDRs of LoadBalancer VIP pools to advertise to BGP peers.
+    #[serde(default, rename = "serviceLoadBalancerIPs")]
+    pub service_load_balancer_ips: Vec<String>,
+    #[serde(default)]
+    pub peers: Vec<BgpPeerSpec>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BgpPeerSpec {
+    pub name: String,
+    #[serde(rename = "peerIP")]
+    pub peer_ip: String,
+    pub as_number: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadBalancerPoolSpec {
+    pub name: String,
+    pub cidr: String,
+    #[serde(default = "default_node_selector")]
+    pub node_selector: String,
+    /// Retired pools stay declared with `disabled: true`: Calico's pool CIDR is
+    /// immutable, so renumbering is a new-pool swap, not an in-place edit.
+    #[serde(default)]
+    pub disabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+pub enum LogSeverity {
+    Debug,
+    #[default]
+    Info,
+    Warning,
+    Error,
+    Fatal,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_nat_outgoing() -> bool {
     true
-}
-
-/// Calico's own IPv4 default. The valid range is 20-32 for IPv4 CIDRs (116-128
-/// for IPv6), so an IPv6-shaped default such as 112 makes the operator reject
-/// the rendered `Installation` for the common IPv4 case.
-fn default_block_size() -> i32 {
-    26
 }
 
 fn default_node_selector() -> String {
@@ -175,7 +248,7 @@ mod tests {
         assert!(spec.calico.bgp_enabled);
         assert!(spec.calico.api_server_enabled);
         assert_eq!(spec.calico.ip_pools.len(), 1);
-        assert_eq!(spec.calico.ip_pools[0].block_size, 122);
+        assert_eq!(spec.calico.ip_pools[0].block_size, Some(122));
         assert_eq!(spec.calico.ip_pools[0].encapsulation, Encapsulation::None);
         assert_eq!(
             spec.calico.node_address_autodetection_v6_cidrs,
@@ -194,8 +267,85 @@ mod tests {
 
         assert_eq!(pool.encapsulation, Encapsulation::None);
         assert!(pool.nat_outgoing);
-        assert_eq!(pool.block_size, 26);
+        assert_eq!(pool.block_size, None);
+        assert_eq!(pool.effective_block_size(), 26);
         assert_eq!(pool.node_selector, "all()");
+    }
+
+    #[test]
+    fn effective_block_size_defaults_by_address_family() {
+        let v6: CalicoIpPoolSpec = serde_json::from_value(serde_json::json!({
+            "name": "pods-v6",
+            "cidr": "fd00:db8:0:1100::/56"
+        }))
+        .expect("pool should deserialize");
+        let explicit: CalicoIpPoolSpec = serde_json::from_value(serde_json::json!({
+            "name": "pods-v6",
+            "cidr": "fd00:db8:0:1100::/56",
+            "blockSize": 124
+        }))
+        .expect("pool should deserialize");
+
+        assert_eq!(v6.effective_block_size(), 122);
+        assert_eq!(explicit.effective_block_size(), 124);
+    }
+
+    #[test]
+    fn bgp_spec_defaults_apply_when_omitted() {
+        let bgp: BgpSpec = serde_json::from_value(serde_json::json!({ "asNumber": 64514 }))
+            .expect("bgp should deserialize");
+
+        assert_eq!(bgp.as_number, 64514);
+        assert!(bgp.node_to_node_mesh_enabled);
+        assert_eq!(bgp.log_severity_screen, LogSeverity::Info);
+        assert!(bgp.service_load_balancer_ips.is_empty());
+        assert!(bgp.peers.is_empty());
+    }
+
+    #[test]
+    fn load_balancer_pool_defaults_apply_when_omitted() {
+        let pool: LoadBalancerPoolSpec = serde_json::from_value(serde_json::json!({
+            "name": "lb-internal-routed",
+            "cidr": "fd00:db8:0:f00::/112"
+        }))
+        .expect("pool should deserialize");
+
+        assert_eq!(pool.node_selector, "all()");
+        assert!(!pool.disabled);
+    }
+
+    #[test]
+    fn calico_spec_without_bgp_or_load_balancer_pools_still_deserializes() {
+        let spec: CalicoSpec = serde_json::from_value(serde_json::json!({ "chartVersion": "v3.29.1" }))
+            .expect("existing specs must keep working");
+
+        assert!(spec.bgp.is_none());
+        assert!(spec.load_balancer_pools.is_empty());
+    }
+
+    #[test]
+    fn full_ipv6_spec_with_bgp_and_load_balancer_pools_deserializes() {
+        let spec: CalicoSpec = serde_json::from_value(serde_json::json!({
+            "chartVersion": "v3.32.1",
+            "bgpEnabled": true,
+            "bgp": {
+                "asNumber": 64514,
+                "logSeverityScreen": "Warning",
+                "serviceLoadBalancerIPs": ["fd00:db8:0:f00::/112"],
+                "peers": [{ "name": "gateway", "peerIP": "fd00:db8:0:179::1", "asNumber": 64512 }]
+            },
+            "loadBalancerPools": [
+                { "name": "lb-internal-routed", "cidr": "fd00:db8:0:f00::/112", "disabled": true }
+            ]
+        }))
+        .expect("spec should deserialize");
+
+        let bgp = spec.bgp.expect("bgp should be present");
+        assert_eq!(bgp.log_severity_screen, LogSeverity::Warning);
+        assert_eq!(bgp.peers[0].peer_ip, "fd00:db8:0:179::1");
+        assert_eq!(bgp.peers[0].as_number, 64512);
+        assert_eq!(spec.load_balancer_pools[0].name, "lb-internal-routed");
+        assert!(spec.load_balancer_pools[0].disabled);
     }
 
     #[test]

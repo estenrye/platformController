@@ -24,6 +24,53 @@ spec:
                   apiServerEnabled:
                     default: false
                     type: boolean
+                  bgp:
+                    description: 'BGP configuration and peers. Requires `bgpEnabled: true`.'
+                    nullable: true
+                    properties:
+                      asNumber:
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      logSeverityScreen:
+                        default: Info
+                        enum:
+                        - Debug
+                        - Info
+                        - Warning
+                        - Error
+                        - Fatal
+                        type: string
+                      nodeToNodeMeshEnabled:
+                        default: true
+                        type: boolean
+                      peers:
+                        default: []
+                        items:
+                          properties:
+                            asNumber:
+                              format: uint32
+                              minimum: 0.0
+                              type: integer
+                            name:
+                              type: string
+                            peerIP:
+                              type: string
+                          required:
+                          - asNumber
+                          - name
+                          - peerIP
+                          type: object
+                        type: array
+                      serviceLoadBalancerIPs:
+                        default: []
+                        description: CIDRs of LoadBalancer VIP pools to advertise to BGP peers.
+                        items:
+                          type: string
+                        type: array
+                    required:
+                    - asNumber
+                    type: object
                   bgpEnabled:
                     default: false
                     type: boolean
@@ -34,11 +81,23 @@ spec:
                     items:
                       properties:
                         blockSize:
-                          default: 26
+                          description: |-
+                            Omitted means "use Calico's default for this pool's address family",
+                            resolved at render time (26 for IPv4, 122 for IPv6) because a single
+                            fixed serde default cannot be right for both families.
                           format: int32
+                          nullable: true
                           type: integer
                         cidr:
                           type: string
+                        disabled:
+                          default: false
+                          description: |-
+                            Retired pools stay declared with `disabled: true`: Calico's pool CIDR is
+                            immutable, so renumbering is a new-pool swap, not an in-place edit. A
+                            disabled pool is rendered as a disabled `IPPool` but kept out of the
+                            `Installation`, which would otherwise recreate it as enabled.
+                          type: boolean
                         encapsulation:
                           default: None
                           enum:
@@ -51,6 +110,29 @@ spec:
                         natOutgoing:
                           default: true
                           type: boolean
+                        nodeSelector:
+                          default: all()
+                          type: string
+                      required:
+                      - cidr
+                      - name
+                      type: object
+                    type: array
+                  loadBalancerPools:
+                    default: []
+                    description: LoadBalancer-only IP pools (native Calico LoadBalancer IPAM, Calico >= 3.30).
+                    items:
+                      properties:
+                        cidr:
+                          type: string
+                        disabled:
+                          default: false
+                          description: |-
+                            Retired pools stay declared with `disabled: true`: Calico's pool CIDR is
+                            immutable, so renumbering is a new-pool swap, not an in-place edit.
+                          type: boolean
+                        name:
+                          type: string
                         nodeSelector:
                           default: all()
                           type: string

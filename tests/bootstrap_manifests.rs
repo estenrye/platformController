@@ -47,3 +47,17 @@ fn crd_yaml_defines_the_cniinstallation_resource() {
         Some("cniinstallations.platform.rye.ninja")
     );
 }
+
+#[test]
+fn crd_yaml_matches_the_generated_crd() {
+    use kube::CustomResourceExt;
+
+    let generated = serde_yaml::to_string(&platform_controller::crd::CniInstallation::crd())
+        .expect("CRD should serialize to YAML");
+    let on_disk = std::fs::read_to_string("deploy/crd.yaml").expect("deploy/crd.yaml should exist");
+
+    assert_eq!(
+        on_disk, generated,
+        "deploy/crd.yaml is stale; run `cargo run -q --bin crdgen > deploy/crd.yaml`"
+    );
+}

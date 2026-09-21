@@ -1,0 +1,69 @@
+# IPv6-only Calico on Talos, with BGP peering and LoadBalancer VIP pools.
+#
+# This is the CniInstallation equivalent of a hand-written tigera-operator
+# values file plus BGPConfiguration, BGPPeer and IPPool manifests. Every
+# address and the AS number below are PLACEHOLDERS: substitute your own before
+# applying, and make sure none of them overlap a cluster that is already
+# running against the same gateway.
+#
+#   placeholder              meaning
+#   AS 64514                 this cluster's BGP AS (must differ from any other
+#                            cluster peering with the same gateway)
+#   fd00:db8:0:1100::/56     pod pool (ULA, SNAT'd to the node address on egress)
+#   fd00:db8:0:179::/64      dedicated BGP peering segment; ::1 is the gateway
+#   fd00:db8:0:f00::/112     internal LoadBalancer VIP pool (routed, not on-link)
+#   2001:db8:0:27f::/112     ingress LoadBalancer VIP pool (documentation range)
+#
+# The gateway must accept this cluster's AS and peering /64 as a BGP neighbor
+# before nodes will establish sessions (see
+# docs/runbooks/ipv6-only-kvm-verification.md, step 0).
+#
+# No IPv4 pool and no IPv4 autodetection means the operator never enables IPv4.
+apiVersion: platform.rye.ninja/v1alpha1
+kind: CniInstallation
+metadata:
+  name: default
+spec:
+  platformKind: talos-linux
+  provider: calico
+  calico:
+    # Native LoadBalancer IPAM needs Calico 3.30 or later.
+    chartVersion: v3.32.1
+    bgpEnabled: true
+    apiServerEnabled: true
+
+    # Rendered as an explicit IPPool (allowedUses Workload+Tunnel) and also
+    # passed to the operator's Installation under the same name.
+    ipPools:
+      - name: pods-v6
+        cidr: fd00:db8:0:1100::/56
+        encapsulation: None # same L2 segment; the node mesh routes pods
+        natOutgoing: true
+        blockSize: 122 # optional: omitted resolves to 122 for IPv6
+
+    # Pick the node address on the BGP peering segment. Unambiguous because that
+    # /64 carries nothing else (no SLAAC GUA, no floating VIP).
+    nodeAddressAutodetectionV6Cidrs:
+      - fd00:db8:0:179::/64
+
+    # BGPConfiguration (named "default") plus one BGPPeer per entry.
+    bgp:
+      asNumber: 64514
+      nodeToNodeMeshEnabled: true
+      logSeverityScreen: Info
+      # Every range advertised here needs a matching loadBalancerPools entry.
+      serviceLoadBalancerIPs:
+        - fd00:db8:0:f00::/112
+        - 2001:db8:0:27f::/112
+      peers:
+        - name: gateway
+          peerIP: fd00:db8:0:179::1
+          asNumber: 64512
+
+    # LoadBalancer-only IPPools. Retired pools stay declared with
+    # disabled: true, because Calico's pool CIDR is immutable.
+    loadBalancerPools:
+      - name: lb-internal-routed
+        cidr: fd00:db8:0:f00::/112
+      - name: lb-ingress-routed
+        cidr: 2001:db8:0:27f::/112

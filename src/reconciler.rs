@@ -29,6 +29,20 @@ pub enum ValidationError {
          singleton named \"default\""
     )]
     UnsupportedName(String),
+    #[error(transparent)]
+    Spec(#[from] crate::spec_validation::SpecError),
+}
+
+impl ValidationError {
+    /// The `status.conditions[].reason` reported for this rejection.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            ValidationError::Spec(err) => err.reason(),
+            ValidationError::UnsupportedPlatform(_)
+            | ValidationError::UnsupportedProvider(_)
+            | ValidationError::UnsupportedName(_) => "Unsupported",
+        }
+    }
 }
 
 pub fn validate(name: &str, spec: &CniInstallationSpec) -> Result<(), ValidationError> {
@@ -41,6 +55,7 @@ pub fn validate(name: &str, spec: &CniInstallationSpec) -> Result<(), Validation
     if spec.provider != CniProvider::Calico {
         return Err(ValidationError::UnsupportedProvider(spec.provider.clone()));
     }
+    crate::spec_validation::validate_calico(&spec.calico)?;
     Ok(())
 }
 
@@ -92,6 +107,20 @@ pub enum ReconcileError {
     NotLeader,
 }
 
+async fn wait_for_object_kind(
+    client: &Client,
+    object: &DynamicObject,
+) -> Result<(), crate::apply::ApplyError> {
+    let types = object.types.clone().unwrap_or_default();
+    crate::apply::wait_for_kind_available(
+        client,
+        &types.api_version,
+        &types.kind,
+        crate::apply::KIND_AVAILABLE_TIMEOUT,
+    )
+    .await
+}
+
 pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     if let Some(action) = leader_gate(&ctx.is_leader) {
         return Ok(action);
@@ -116,7 +145,7 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
             obj.metadata.generation,
             &chart_version,
             &previous,
-            "Unsupported",
+            err.reason(),
             &err.to_string(),
         )
         .await?;
@@ -156,7 +185,14 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
     );
     applied.push(namespace_ref);
 
+    // Phase 1: the chart's objects in rank order. Its custom resources
+    // (Installation, APIServer, ...) come last, and their CRDs may not exist
+    // yet: chart v3.29.x ships them, but v3.32.x leaves it to the running
+    // operator, so wait for each kind to be registered first.
     for object in &objects {
+        if crate::manifests::is_custom_resource(object) {
+            wait_for_object_kind(&ctx.client, object).await?;
+        }
         let reference = crate::apply::apply_object(&ctx.client, object, "platform-controller").await?;
         if reference.kind == "CustomResourceDefinition" {
             crate::apply::wait_for_crd_established(
@@ -168,6 +204,22 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
             tracing::debug!(crd = %reference.name, "CRD established");
         }
         applied.push(reference);
+    }
+
+    // Phases 2 and 3: Calico's own objects. Pod pools go first so IPAM never
+    // depends on operator timing; BGP configuration, peers and LoadBalancer
+    // pools only after they exist.
+    let calico_phases = [
+        crate::calico::pod_pool_objects(&obj.spec.calico),
+        crate::calico::routing_and_lb_objects(&obj.spec.calico),
+    ];
+    for phase in &calico_phases {
+        for object in phase {
+            wait_for_object_kind(&ctx.client, object).await?;
+            let reference =
+                crate::apply::apply_object(&ctx.client, object, "platform-controller").await?;
+            applied.push(reference);
+        }
     }
     tracing::info!(applied_count = applied.len(), "applied all objects");
 
@@ -250,6 +302,47 @@ fn partition_for_cleanup(
         .partition(|resource| crate::manifests::rank_for_kind(&resource.kind) == crate::manifests::CUSTOM_RESOURCE_RANK)
 }
 
+/// The order in which cleanup deletes custom resources: the reverse of the
+/// ledger, except that the operator's `Installation` always goes last.
+///
+/// On chart v3.32.x the `Installation` carries finalizers that wait for the
+/// `APIServer` and `Goldmane` resources to be removed, so it can never finish
+/// terminating while they still exist.
+fn custom_resource_cleanup_order(custom_resources: &[AppliedResourceRef]) -> Vec<AppliedResourceRef> {
+    let (installations, others): (Vec<_>, Vec<_>) = custom_resources
+        .iter()
+        .rev()
+        .cloned()
+        .partition(|resource| resource.kind == "Installation");
+    others.into_iter().chain(installations).collect()
+}
+
+/// The Calico-group objects to delete once more after the operator's resources
+/// are gone.
+///
+/// While the `Installation` exists the operator can recreate a pod `IPPool`
+/// that was deleted, so the first delete may not stick. Deleting an object that
+/// no longer exists is a no-op, so this second pass is harmless when nothing
+/// was recreated.
+fn calico_group_sweep(order: &[AppliedResourceRef]) -> Vec<AppliedResourceRef> {
+    order
+        .iter()
+        .filter(|reference| !needs_removal_wait(reference))
+        .cloned()
+        .collect()
+}
+
+/// Whether cleanup must wait for a custom resource to actually disappear.
+///
+/// Objects in the Calico API group are deleted without waiting: while the
+/// `Installation` still exists, the tigera operator (Calico >= 3.28) owns the
+/// lifecycle of pools declared there and can recreate a deleted pod `IPPool`,
+/// so a removal wait would time out and wedge the finalizer. The wait is kept
+/// for everything else (Installation, APIServer, Goldmane, Whisker, ...).
+fn needs_removal_wait(reference: &AppliedResourceRef) -> bool {
+    reference.api_version != crate::calico::CALICO_API_VERSION
+}
+
 pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
     // Never return Ok from a standby's Cleanup dispatch: kube::runtime::finalizer
     // treats any Ok here as "cleanup genuinely succeeded" and strips the finalizer
@@ -276,14 +369,39 @@ pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Act
     let (custom_resources, infra) = partition_for_cleanup(&applied);
     let timeout = Duration::from_secs(u64::from(obj.spec.cleanup_timeout_seconds));
 
-    for reference in custom_resources.iter().rev() {
+    // Issue every delete before waiting on any of them: the operator's
+    // finalizers depend on each other, so waiting on one resource while another
+    // it depends on has not been asked to go away would never finish.
+    let order = custom_resource_cleanup_order(&custom_resources);
+    for reference in &order {
         tracing::info!(
             installation = %name,
             kind = %reference.kind,
             resource = %reference.name,
-            "deleting provider-managed resource and waiting for removal"
+            "deleting custom resource"
+        );
+        crate::apply::delete_object(&ctx.client, reference).await?;
+    }
+    // Calico-group objects are not waited on (see `needs_removal_wait`).
+    for reference in order.iter().filter(|reference| needs_removal_wait(reference)) {
+        tracing::info!(
+            installation = %name,
+            kind = %reference.kind,
+            resource = %reference.name,
+            "waiting for removal"
         );
         crate::apply::delete_and_wait_for_removal(&ctx.client, reference, timeout).await?;
+    }
+    // The Installation is gone (unless cleanupTimeoutSeconds is 0, which skips
+    // the waits above), so the operator can no longer recreate what it owned.
+    for reference in &calico_group_sweep(&order) {
+        tracing::info!(
+            installation = %name,
+            kind = %reference.kind,
+            resource = %reference.name,
+            "sweeping Calico-group resource the operator may have recreated"
+        );
+        crate::apply::delete_object(&ctx.client, reference).await?;
     }
 
     for reference in infra.iter().rev() {
@@ -341,10 +459,7 @@ mod tests {
             provider,
             calico: CalicoSpec {
                 chart_version: "v3.29.1".to_string(),
-                bgp_enabled: false,
-                api_server_enabled: false,
-                ip_pools: vec![],
-                node_address_autodetection_v6_cidrs: vec![],
+                ..Default::default()
             },
             cleanup_timeout_seconds: 60,
         }
@@ -363,6 +478,31 @@ mod tests {
         let err = validate("second", &spec).expect_err("non-singleton names should be rejected");
 
         assert!(matches!(err, ValidationError::UnsupportedName(name) if name == "second"));
+    }
+
+    #[test]
+    fn validate_surfaces_spec_errors_with_their_own_reason() {
+        let mut spec = spec_with(PlatformKind::TalosLinux, CniProvider::Calico);
+        spec.calico.bgp = Some(crate::crd::BgpSpec {
+            as_number: 64514,
+            node_to_node_mesh_enabled: true,
+            log_severity_screen: crate::crd::LogSeverity::Info,
+            service_load_balancer_ips: vec![],
+            peers: vec![],
+        });
+
+        let err = validate("default", &spec).expect_err("bgp without bgpEnabled is invalid");
+
+        assert_eq!(err.reason(), "InvalidBgpConfig");
+    }
+
+    #[test]
+    fn pre_existing_validation_errors_keep_the_unsupported_reason() {
+        let spec = spec_with(PlatformKind::TalosLinux, CniProvider::Calico);
+
+        let err = validate("second", &spec).expect_err("non-singleton name is rejected");
+
+        assert_eq!(err.reason(), "Unsupported");
     }
 
     #[test]
@@ -423,6 +563,133 @@ mod tests {
 
         assert_eq!(custom_resources, vec![installation]);
         assert_eq!(infra, vec![namespace, crd, deployment]);
+    }
+
+    #[test]
+    fn calico_objects_are_cleaned_up_as_custom_resources_before_the_operator() {
+        let pool = applied_resource("IPPool", "pods-v6");
+        let bgp_configuration = applied_resource("BGPConfiguration", "default");
+        let peer = applied_resource("BGPPeer", "gateway");
+        let deployment = applied_resource("Deployment", "tigera-operator");
+
+        let (custom_resources, infra) = partition_for_cleanup(&[
+            deployment.clone(),
+            pool.clone(),
+            bgp_configuration.clone(),
+            peer.clone(),
+        ]);
+
+        assert_eq!(custom_resources, vec![pool, bgp_configuration, peer]);
+        assert_eq!(infra, vec![deployment]);
+    }
+
+    #[test]
+    fn calico_group_objects_are_deleted_without_waiting_for_removal() {
+        for kind in ["IPPool", "BGPConfiguration", "BGPPeer"] {
+            let reference = AppliedResourceRef {
+                api_version: crate::calico::CALICO_API_VERSION.to_string(),
+                ..applied_resource(kind, "x")
+            };
+            assert!(!needs_removal_wait(&reference), "{kind} must not be waited on");
+        }
+    }
+
+    #[test]
+    fn operator_owned_custom_resources_still_wait_for_removal() {
+        let installation = AppliedResourceRef {
+            api_version: "operator.tigera.io/v1".to_string(),
+            ..applied_resource("Installation", "default")
+        };
+        assert!(needs_removal_wait(&installation));
+    }
+
+    fn operator_resource(kind: &str) -> AppliedResourceRef {
+        AppliedResourceRef {
+            api_version: "operator.tigera.io/v1".to_string(),
+            ..applied_resource(kind, "default")
+        }
+    }
+
+    #[test]
+    fn cleanup_deletes_the_installation_after_the_resources_its_finalizers_wait_on() {
+        // Ledger order as written by a real install: operator CRs sorted by
+        // kind, then the Calico-group objects. On v3.32.x the Installation
+        // holds apiserver-controller and goldmane-controller finalizers, so
+        // deleting it first (and waiting) deadlocks against them.
+        let ledger = vec![
+            operator_resource("APIServer"),
+            operator_resource("Goldmane"),
+            operator_resource("Installation"),
+            operator_resource("Whisker"),
+            applied_resource("IPPool", "pods-v6"),
+            applied_resource("BGPPeer", "gateway"),
+        ];
+
+        let order = custom_resource_cleanup_order(&ledger);
+
+        assert_eq!(
+            order,
+            vec![
+                applied_resource("BGPPeer", "gateway"),
+                applied_resource("IPPool", "pods-v6"),
+                operator_resource("Whisker"),
+                operator_resource("Goldmane"),
+                operator_resource("APIServer"),
+                operator_resource("Installation"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_order_of_a_ledger_without_an_installation_is_plain_reverse() {
+        let ledger = vec![applied_resource("IPPool", "a"), applied_resource("IPPool", "b")];
+
+        assert_eq!(
+            custom_resource_cleanup_order(&ledger),
+            vec![applied_resource("IPPool", "b"), applied_resource("IPPool", "a")]
+        );
+    }
+
+    fn calico_resource(kind: &str, name: &str) -> AppliedResourceRef {
+        AppliedResourceRef {
+            api_version: crate::calico::CALICO_API_VERSION.to_string(),
+            ..applied_resource(kind, name)
+        }
+    }
+
+    #[test]
+    fn sweep_deletes_calico_objects_again_after_the_operator_resources_are_gone() {
+        // While the Installation exists the operator recreates a deleted pod
+        // pool (observed on v3.32.1: pods-v6 came back about a second after
+        // cleanup deleted it), so the pool must be deleted again once the
+        // Installation has been removed.
+        let ledger = vec![
+            operator_resource("APIServer"),
+            operator_resource("Installation"),
+            calico_resource("IPPool", "pods-v6"),
+            calico_resource("BGPPeer", "gateway"),
+            calico_resource("IPPool", "lb-internal-routed"),
+        ];
+        let order = custom_resource_cleanup_order(&ledger);
+
+        assert_eq!(
+            calico_group_sweep(&order),
+            vec![
+                calico_resource("IPPool", "lb-internal-routed"),
+                calico_resource("BGPPeer", "gateway"),
+                calico_resource("IPPool", "pods-v6"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sweep_is_empty_when_only_operator_resources_were_applied() {
+        let order = custom_resource_cleanup_order(&[
+            operator_resource("APIServer"),
+            operator_resource("Installation"),
+        ]);
+
+        assert!(calico_group_sweep(&order).is_empty());
     }
 
     #[test]

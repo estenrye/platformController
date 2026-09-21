@@ -31,6 +31,15 @@ pub enum ApplyError {
         name: String,
         timeout: Duration,
     },
+    #[error(
+        "{api_version}/{kind} did not become available within {timeout:?} (last observed: {detail})"
+    )]
+    KindNotAvailable {
+        api_version: String,
+        kind: String,
+        timeout: Duration,
+        detail: String,
+    },
 }
 
 pub fn resource_ref(obj: &DynamicObject) -> AppliedResourceRef {
@@ -158,6 +167,81 @@ pub async fn apply_object(
     Ok(resource_ref(obj))
 }
 
+/// How long to wait for a custom resource's kind to be registered before
+/// giving up. A first install on a CNI-less cluster includes the operator's
+/// image pull and CRD registration, so this is deliberately generous.
+pub const KIND_AVAILABLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// True when API discovery failed because the kind's CRD (and so its whole API
+/// group/resource) is not registered, as opposed to a malformed reference or a
+/// transient network failure.
+pub fn is_missing_kind_error(err: &kube::Error) -> bool {
+    match err {
+        kube::Error::Api(status) => status.code == 404,
+        kube::Error::Discovery(
+            kube::error::DiscoveryError::MissingKind(_)
+            | kube::error::DiscoveryError::MissingApiGroup(_)
+            | kube::error::DiscoveryError::EmptyApiGroup(_),
+        ) => true,
+        _ => false,
+    }
+}
+
+/// Polls API discovery until `api_version`/`kind` resolves. From Calico 3.32
+/// the operator (not the chart) creates every CRD at startup, so the
+/// controller cannot apply a CRD and wait on it; it can only wait for the kind
+/// to appear. Every discovery call is wrapped in `timeout_at`: a wedged
+/// connection would otherwise defeat the deadline (see
+/// docs/memory/wait-for-crd-established.md).
+pub async fn wait_for_kind_available(
+    client: &kube::Client,
+    api_version: &str,
+    kind: &str,
+    timeout: Duration,
+) -> Result<(), ApplyError> {
+    let types = kube::api::TypeMeta {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+    };
+    let gvk = group_version_kind(&types);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut detail = "no attempt completed".to_string();
+
+    loop {
+        match tokio::time::timeout_at(deadline, kube::discovery::oneshot::pinned_kind(client, &gvk)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(err)) => {
+                detail = if is_missing_kind_error(&err) {
+                    "kind not registered yet".to_string()
+                } else {
+                    format!("discovery error: {err}")
+                };
+                tracing::debug!(api_version, kind, %detail, "waiting for kind to be registered");
+            }
+            Err(_) => {
+                return Err(ApplyError::KindNotAvailable {
+                    api_version: api_version.to_string(),
+                    kind: kind.to_string(),
+                    timeout,
+                    detail,
+                });
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApplyError::KindNotAvailable {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                timeout,
+                detail,
+            });
+        }
+
+        let next_poll = tokio::time::Instant::now() + Duration::from_secs(2);
+        tokio::time::sleep_until(next_poll.min(deadline)).await;
+    }
+}
+
 async fn dynamic_api_for(
     client: &kube::Client,
     reference: &AppliedResourceRef,
@@ -181,12 +265,7 @@ async fn dynamic_api_for(
         // deleted would permanently wedge on rediscovering it. Any other
         // discovery error (a malformed reference, transient network
         // failure, etc.) still propagates.
-        Err(kube::Error::Api(err)) if err.code == 404 => Ok(None),
-        Err(kube::Error::Discovery(
-            kube::error::DiscoveryError::MissingKind(_)
-            | kube::error::DiscoveryError::MissingApiGroup(_)
-            | kube::error::DiscoveryError::EmptyApiGroup(_),
-        )) => Ok(None),
+        Err(err) if is_missing_kind_error(&err) => Ok(None),
         Err(source) => Err(ApplyError::Discovery {
             api_version: reference.api_version.clone(),
             kind: reference.kind.clone(),
@@ -391,6 +470,37 @@ mod tests {
     fn established_condition_with_true_status_is_established() {
         let crd = crd_with_conditions(vec![condition("Established", "True")]);
         assert!(is_established(&crd));
+    }
+
+    #[test]
+    fn a_404_from_discovery_means_the_kind_is_not_registered() {
+        let err = kube::Error::Api(Box::new(kube::core::Status {
+            code: 404,
+            ..Default::default()
+        }));
+
+        assert!(is_missing_kind_error(&err));
+    }
+
+    #[test]
+    fn missing_kind_and_missing_group_discovery_errors_mean_not_registered() {
+        for err in [
+            kube::error::DiscoveryError::MissingKind("Installation".to_string()),
+            kube::error::DiscoveryError::MissingApiGroup("operator.tigera.io".to_string()),
+            kube::error::DiscoveryError::EmptyApiGroup("operator.tigera.io/v1".to_string()),
+        ] {
+            assert!(is_missing_kind_error(&kube::Error::Discovery(err)));
+        }
+    }
+
+    #[test]
+    fn other_api_errors_are_not_treated_as_missing_kind() {
+        let err = kube::Error::Api(Box::new(kube::core::Status {
+            code: 500,
+            ..Default::default()
+        }));
+
+        assert!(!is_missing_kind_error(&err));
     }
 
     #[test]
