@@ -302,6 +302,36 @@ fn partition_for_cleanup(
         .partition(|resource| crate::manifests::rank_for_kind(&resource.kind) == crate::manifests::CUSTOM_RESOURCE_RANK)
 }
 
+/// The order in which cleanup deletes custom resources: the reverse of the
+/// ledger, except that the operator's `Installation` always goes last.
+///
+/// On chart v3.32.x the `Installation` carries finalizers that wait for the
+/// `APIServer` and `Goldmane` resources to be removed, so it can never finish
+/// terminating while they still exist.
+fn custom_resource_cleanup_order(custom_resources: &[AppliedResourceRef]) -> Vec<AppliedResourceRef> {
+    let (installations, others): (Vec<_>, Vec<_>) = custom_resources
+        .iter()
+        .rev()
+        .cloned()
+        .partition(|resource| resource.kind == "Installation");
+    others.into_iter().chain(installations).collect()
+}
+
+/// The Calico-group objects to delete once more after the operator's resources
+/// are gone.
+///
+/// While the `Installation` exists the operator can recreate a pod `IPPool`
+/// that was deleted, so the first delete may not stick. Deleting an object that
+/// no longer exists is a no-op, so this second pass is harmless when nothing
+/// was recreated.
+fn calico_group_sweep(order: &[AppliedResourceRef]) -> Vec<AppliedResourceRef> {
+    order
+        .iter()
+        .filter(|reference| !needs_removal_wait(reference))
+        .cloned()
+        .collect()
+}
+
 /// Whether cleanup must wait for a custom resource to actually disappear.
 ///
 /// Objects in the Calico API group are deleted without waiting: while the
@@ -339,24 +369,39 @@ pub async fn cleanup(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Act
     let (custom_resources, infra) = partition_for_cleanup(&applied);
     let timeout = Duration::from_secs(u64::from(obj.spec.cleanup_timeout_seconds));
 
-    for reference in custom_resources.iter().rev() {
-        if needs_removal_wait(reference) {
-            tracing::info!(
-                installation = %name,
-                kind = %reference.kind,
-                resource = %reference.name,
-                "deleting provider-managed resource and waiting for removal"
-            );
-            crate::apply::delete_and_wait_for_removal(&ctx.client, reference, timeout).await?;
-        } else {
-            tracing::info!(
-                installation = %name,
-                kind = %reference.kind,
-                resource = %reference.name,
-                "deleting Calico-group resource without waiting for removal"
-            );
-            crate::apply::delete_object(&ctx.client, reference).await?;
-        }
+    // Issue every delete before waiting on any of them: the operator's
+    // finalizers depend on each other, so waiting on one resource while another
+    // it depends on has not been asked to go away would never finish.
+    let order = custom_resource_cleanup_order(&custom_resources);
+    for reference in &order {
+        tracing::info!(
+            installation = %name,
+            kind = %reference.kind,
+            resource = %reference.name,
+            "deleting custom resource"
+        );
+        crate::apply::delete_object(&ctx.client, reference).await?;
+    }
+    // Calico-group objects are not waited on (see `needs_removal_wait`).
+    for reference in order.iter().filter(|reference| needs_removal_wait(reference)) {
+        tracing::info!(
+            installation = %name,
+            kind = %reference.kind,
+            resource = %reference.name,
+            "waiting for removal"
+        );
+        crate::apply::delete_and_wait_for_removal(&ctx.client, reference, timeout).await?;
+    }
+    // The Installation is gone (unless cleanupTimeoutSeconds is 0, which skips
+    // the waits above), so the operator can no longer recreate what it owned.
+    for reference in &calico_group_sweep(&order) {
+        tracing::info!(
+            installation = %name,
+            kind = %reference.kind,
+            resource = %reference.name,
+            "sweeping Calico-group resource the operator may have recreated"
+        );
+        crate::apply::delete_object(&ctx.client, reference).await?;
     }
 
     for reference in infra.iter().rev() {
@@ -556,6 +601,95 @@ mod tests {
             ..applied_resource("Installation", "default")
         };
         assert!(needs_removal_wait(&installation));
+    }
+
+    fn operator_resource(kind: &str) -> AppliedResourceRef {
+        AppliedResourceRef {
+            api_version: "operator.tigera.io/v1".to_string(),
+            ..applied_resource(kind, "default")
+        }
+    }
+
+    #[test]
+    fn cleanup_deletes_the_installation_after_the_resources_its_finalizers_wait_on() {
+        // Ledger order as written by a real install: operator CRs sorted by
+        // kind, then the Calico-group objects. On v3.32.x the Installation
+        // holds apiserver-controller and goldmane-controller finalizers, so
+        // deleting it first (and waiting) deadlocks against them.
+        let ledger = vec![
+            operator_resource("APIServer"),
+            operator_resource("Goldmane"),
+            operator_resource("Installation"),
+            operator_resource("Whisker"),
+            applied_resource("IPPool", "pods-v6"),
+            applied_resource("BGPPeer", "gateway"),
+        ];
+
+        let order = custom_resource_cleanup_order(&ledger);
+
+        assert_eq!(
+            order,
+            vec![
+                applied_resource("BGPPeer", "gateway"),
+                applied_resource("IPPool", "pods-v6"),
+                operator_resource("Whisker"),
+                operator_resource("Goldmane"),
+                operator_resource("APIServer"),
+                operator_resource("Installation"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_order_of_a_ledger_without_an_installation_is_plain_reverse() {
+        let ledger = vec![applied_resource("IPPool", "a"), applied_resource("IPPool", "b")];
+
+        assert_eq!(
+            custom_resource_cleanup_order(&ledger),
+            vec![applied_resource("IPPool", "b"), applied_resource("IPPool", "a")]
+        );
+    }
+
+    fn calico_resource(kind: &str, name: &str) -> AppliedResourceRef {
+        AppliedResourceRef {
+            api_version: crate::calico::CALICO_API_VERSION.to_string(),
+            ..applied_resource(kind, name)
+        }
+    }
+
+    #[test]
+    fn sweep_deletes_calico_objects_again_after_the_operator_resources_are_gone() {
+        // While the Installation exists the operator recreates a deleted pod
+        // pool (observed on v3.32.1: pods-v6 came back about a second after
+        // cleanup deleted it), so the pool must be deleted again once the
+        // Installation has been removed.
+        let ledger = vec![
+            operator_resource("APIServer"),
+            operator_resource("Installation"),
+            calico_resource("IPPool", "pods-v6"),
+            calico_resource("BGPPeer", "gateway"),
+            calico_resource("IPPool", "lb-internal-routed"),
+        ];
+        let order = custom_resource_cleanup_order(&ledger);
+
+        assert_eq!(
+            calico_group_sweep(&order),
+            vec![
+                calico_resource("IPPool", "lb-internal-routed"),
+                calico_resource("BGPPeer", "gateway"),
+                calico_resource("IPPool", "pods-v6"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sweep_is_empty_when_only_operator_resources_were_applied() {
+        let order = custom_resource_cleanup_order(&[
+            operator_resource("APIServer"),
+            operator_resource("Installation"),
+        ]);
+
+        assert!(calico_group_sweep(&order).is_empty());
     }
 
     #[test]
