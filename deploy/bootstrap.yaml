@@ -65,8 +65,6 @@ spec:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
-      nodeSelector:
-        node-role.kubernetes.io/control-plane: ""
       # Preferred, not required: a small dev/test cluster may only have one or
       # two control-plane nodes, and a hard requirement could leave a replica
       # permanently unschedulable.
