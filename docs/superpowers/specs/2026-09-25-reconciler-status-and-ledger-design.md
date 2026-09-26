@@ -1,6 +1,6 @@
 # Durable Ledger and Failure Status for the Reconcilers
 
-Status: Draft, awaiting review
+Status: Approved for planning
 Date: 2026-09-25
 
 ## Purpose
@@ -105,8 +105,8 @@ Unchanged. It already deletes everything in the ledger in reverse order; the led
 
 This edits the CNI reconcile path that was live-verified after several cleanup fixes. Mitigations: the change is additive around the existing apply sequence (a checkpoint before it, a wrapper after it); cleanup and prune code are untouched; every existing test is a regression gate; the CNI live check is part of acceptance. If the CNI change proves contentious, the `PullThroughCache` half can ship alone and the two reconcilers will differ only in this behaviour until the CNI half lands.
 
-## Open questions for the reviewer
+## Decisions
 
-1. **Ship both at once, or `PullThroughCache` first?** Recommended: both, to keep the two reconcilers aligned.
-2. **Should a transient failure flip a `Ready` resource to `Failed`?** Recommended: yes (accurate and self-healing). The alternative keeps `phase: Ready` and only sets `Applied=False`, which reads as contradictory.
-3. **Reason vocabulary** (`RenderFailed`, `InvalidManifest`, `ApplyFailed`, `Applying`): acceptable, or should it follow an existing convention elsewhere in your platform?
+1. **Both reconcilers ship together**, to keep `CniInstallation` and `PullThroughCache` aligned.
+2. **A transient failure flips a `Ready` resource to `Failed`** until the next successful reconcile.
+3. **Reason vocabulary accepted:** `RenderFailed`, `InvalidManifest`, `ApplyFailed`, `Applying`.
