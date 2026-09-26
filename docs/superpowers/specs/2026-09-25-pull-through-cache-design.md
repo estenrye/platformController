@@ -18,6 +18,7 @@ The API is shaped so that other cache backends can be added as further `provider
 - Applying Talos machine config from the controller. The controller speaks only the Kubernetes API; node configuration is a documented prerequisite (below). Owning node config would need Talos API credentials, a Talos gRPC client and an `os:admin`-class trust boundary, and can trigger reboots. That is its own project.
 - A health-derived status condition. `Ready` means "manifests applied", exactly as it does for `CniInstallation` today.
 - An airgapped chart source. The controller fetches the Spegel chart from `ghcr.io`, so it needs that egress.
+- Running Spegel before the CNI (host-network mode), so it could serve Calico's own images. Considered and dropped. Spegel `0.7.4` is only usable after the CNI is up: the chart exposes no `hostNetwork` value and hard-codes `--bootstrap-kind=dns` against a cluster-DNS name (CoreDNS cannot run before a CNI). Making it work would mean patching the rendered DaemonSet after rendering (host networking, plus the HTTP bootstrapper pointed at a chosen node), and even then only nodes after the first would benefit, with the cache lost on every cluster rebuild. Apply `PullThroughCache` after `CniInstallation` is `Ready`.
 - Refactoring the CNI reconciler into a shared component framework. Revisit when a third component shows what is genuinely shared.
 
 ## Node prerequisite (documented, not automated)

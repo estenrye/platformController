@@ -2029,6 +2029,7 @@ metadata:
 - `registries` maps to `spegel.mirroredRegistries`, whose default `[]` means **every registry**, so omitting it mirrors private registries too. An explicitly empty list is rejected as ambiguous.
 - Spegel's DaemonSet publishes on `hostPort` 30020, so it needs the CNI up first (Calico provides hostPort). The reconciler applies without waiting for that.
 - Node cleanup on delete is a **post-delete Helm hook** (`templates/post-delete-hook.yaml`), and the controller renders with `--no-hooks` (required: rendered hooks would run as live objects at install), so it does not run on delete.
+- Running before the CNI (host-network mode) was considered and **dropped**: the chart has no `hostNetwork` value and hard-codes `--bootstrap-kind=dns` against cluster DNS, so it needs a post-render DaemonSet patch plus the HTTP bootstrapper; only nodes after the first would benefit and the cache dies with the cluster. Apply `PullThroughCache` after the CNI is `Ready`.
 - The Talos node prerequisite (`/etc/cri/conf.d/20-customization.part` with `discard_unpacked_layers = false`) cannot be applied by the controller and cannot be verified by it; `Ready` means manifests applied only.
 
 **Live-verified [date]:** [peer-to-peer serving: the signal observed (log line / metric name) and that node B was served by node A]. [After delete: containerd DID / DID NOT fail open to upstream; leftover mirror config under /etc/cri/conf.d/hosts was / was not present.] [Any environment prerequisite discovered.]
