@@ -37,7 +37,7 @@
 //
 //   kubectl apply -f deploy/crd.yaml
 //   kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.platform.rye.ninja
-//   sed 's|image: estenrye/platform-controller:latest|image: registry.local:5005/platform-controller:latest|' \
+//   sed 's|image: estenrye/platform-controller:[^[:space:]]*|image: registry.local:5005/platform-controller:latest|' \
 //     deploy/bootstrap.yaml | kubectl apply -f -
 //   kubectl apply -f examples/cni-installation.yaml
 //   # wait for both replicas to be Running, then:
