@@ -46,7 +46,8 @@ cargo run --bin crdgen > deploy/crd.yaml
 
 `examples/pull-through-cache.yaml` is a `PullThroughCache` that installs
 [Spegel](https://spegel.dev), a peer-to-peer image mirror, on Talos. Apply it
-**after** the CNI is up (Spegel publishes its registry on a `hostPort`), and only
+**after** the CNI is `Ready` (the chart runs Spegel on the pod network and
+discovers peers through cluster DNS), and only
 after doing the one-time Talos machine-config change described in
 `docs/runbooks/pull-through-cache-verification.md` (step 0); the controller cannot
 make that change for you.

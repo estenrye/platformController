@@ -34,6 +34,7 @@ machine:
   files:
     - path: /etc/cri/conf.d/20-customization.part
       op: create
+      permissions: 0o644
       content: |
         [plugins."io.containerd.cri.v1.images"]
           discard_unpacked_layers = false
@@ -72,6 +73,7 @@ Validation, rejected with `phase: Failed` and a `reason`, like the CNI path:
 - the name is not `default`
 - `platformKind` or `provider` is unsupported
 - `chartVersion` is empty
+- `chartVersion` has leading or trailing whitespace (it is passed verbatim to `helm --version`)
 - a `registries` entry is not a registry URL (`http://` or `https://`, then a host and an optional numeric port, with no path, query or fragment); a bare hostname is rejected because Spegel rejects it
 - `registries` is present but empty (ambiguous; omit the field to mirror every registry)
 - `helmValues` is not a JSON object
@@ -84,7 +86,7 @@ Same shape as the CNI loop:
 
 1. Leader gate, then validate; write `Failed` status on rejection.
 2. Render the Spegel chart. `helm::render` is generalized to take a chart source, namespace and values. Spegel is published as an OCI artifact (`oci://ghcr.io/spegel-org/helm-charts/spegel`) while Calico uses `--repo`, so the render-argument builder must produce both invocation forms.
-   For OCI charts `helm template` also prints `Pulled:` and `Digest:` progress lines to stdout ahead of the manifests; `render_chart` strips them, since otherwise they parse as a bogus first manifest. `--no-hooks` and `--include-crds` stay on.
+   `--no-hooks` and `--include-crds` stay on. For OCI charts `helm template` also prints `Pulled:` and `Digest:` progress lines to stdout ahead of the manifests; `render_chart` strips them, since otherwise they parse as a bogus first manifest.
 3. Synthesize and apply a `spegel` namespace labelled `pod-security.kubernetes.io/{enforce,audit,warn}: privileged`. Spegel mounts the containerd socket and host paths, which Talos's default `baseline` policy rejects.
 4. Parse, sort and apply the rendered objects in rank order (the existing wait-for-kind handling covers any chart custom resources), then prune anything no longer rendered against `status.appliedResources`.
 5. Write `Ready` status; requeue at 300s.
@@ -111,7 +113,7 @@ The finalizer deletes applied resources in reverse ledger order (the namespace g
 ### Deployment and docs
 
 - `deploy/crd.yaml` regenerated with both CRDs; `deploy/README.md` waits for `established` on both before applying `bootstrap.yaml` or any custom resource.
-- `bootstrap.yaml` needs no RBAC change (cluster-admin). The RBAC ledger memory gains a Spegel row.
+- `bootstrap.yaml` needs no RBAC change (cluster-admin). The RBAC ledger memory gains rows.
 - `examples/pull-through-cache.yaml`: a Talos starting point.
 - `docs/runbooks/pull-through-cache-verification.md`: the machine-config prerequisite, and the live check (pull an image on one node, confirm a second node fetches it from its peer).
 - A `docs/memory/` entry and index line, per CLAUDE.md.
@@ -132,7 +134,7 @@ Live-verified on 2026-09-25 (single control-plane node, Talos v1.14.0, Kubernete
 - Delete: the finalizer cleared and all applied resources and the `spegel` namespace were gone within ~10s.
 - Fail-open after delete without the post-delete hook: observed, with the caveats in the cleanup section.
 
-Confirmed against a real render of chart `0.7.4`: the value names `spegel.mirroredRegistries` and `spegel.containerdRegistryConfigPath` (re-check when the chart version is bumped), and the DaemonSet publishes its registry on `hostPort` 30020, which needs a CNI with hostPort support (Calico provides it). The chart runs Spegel on the pod network and discovers peers through cluster DNS (`--bootstrap-kind=dns`), so it is only usable after the CNI is up; the controller applies the manifests without waiting for that.
+Confirmed against a real render of chart `0.7.4`: the value names `spegel.mirroredRegistries` and `spegel.containerdRegistryConfigPath` (re-check when the chart version is bumped), and the DaemonSet publishes its registry on `hostPort` 30020 (Calico provides hostPort support). The chart runs Spegel on the pod network and discovers peers through cluster DNS (`--bootstrap-kind=dns`), so it needs the CNI (pod network) and cluster DNS up first; the controller applies the manifests without waiting for that.
 
 Still unverified:
 

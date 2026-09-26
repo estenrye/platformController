@@ -6,7 +6,11 @@ a working CNI (`CniInstallation` at `Ready`). Step 2 (peer-to-peer serving) need
 `registry` container logs `routing table is empty after bootstrapping`, the
 startup probe returns 500 and the container restarts. Steps 1 and 3 were run on
 one node (see "Findings to record"). The Talos-in-Docker recipe in
-`tests/integration_talos.rs` works for steps 0-3; use it with `--workers 2`.
+`tests/integration_talos.rs` creates the cluster with `--workers 1` and one
+`--config-patch` (the CNI-none patch). For this runbook, use `--workers 2` and add
+a second `--config-patch @spegel-talos-patch.yaml` at cluster creation so step 0
+is applied at creation (on a running cluster use `talosctl patch machineconfig`
+instead, as in step 0).
 
 `spec.spegel.registries` entries are registry URLs (`https://docker.io`); Spegel
 rejects bare hostnames.
@@ -109,15 +113,36 @@ kubectl wait --for=condition=Ready pod/after-delete --timeout=120s
     pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/warn=privileged
   helm template spegel oci://ghcr.io/spegel-org/helm-charts/spegel --version 0.7.4 \
     --namespace spegel --set spegel.containerdRegistryConfigPath=/etc/cri/conf.d/hosts \
-    --show-only templates/post-delete-hook.yaml | kubectl apply -f -
+    --show-only templates/post-delete-hook.yaml \
+    | grep -v -e '^Pulled: ' -e '^Digest: ' | kubectl apply -f -
   kubectl -n spegel wait --for=jsonpath='{.status.phase}'=Succeeded pod/spegel-cleanup-wait --timeout=180s
   kubectl delete ns spegel
   ```
 
+  The `grep -v` drops the `Pulled:` and `Digest:` lines that `helm template` prints
+  to stdout for an `oci://` chart, which `kubectl apply` would otherwise choke on.
+
   `spegel-cleanup-wait` is the chart's own completion signal: it exits once every
   `spegel-cleanup` DaemonSet pod has cleaned its node.
 
+## When something goes wrong
+
+- Non-validation failures (helm render, apply, prune) are only visible in the
+  controller's logs, not in the resource's status. The most likely cause of an
+  empty `.status` is a wrong `chartVersion`: the OCI tag has no `v` prefix
+  (`0.7.4`, not `v0.7.4`).
+- If a FIRST install fails partway and the `PullThroughCache` is deleted before it
+  ever reached `Ready`, its ledger is empty, so cleanup removes nothing and the
+  `spegel` namespace (and any applied objects) are left behind. Remove them with
+  `kubectl delete ns spegel`.
+
+Both are a known gap shared with `CniInstallation`, to be fixed for both
+reconcilers together.
+
 ## Findings to record
+
+The recorded live run did NOT apply step 0 (the Talos prerequisite) and did not run
+the `talosctl ls` leftover-config check.
 
 Steps 1 and 3 have been run on one IPv6-only node and recorded in
 `docs/memory/pull-through-cache-2026-09.md`. Step 2 is still to do on at least two
