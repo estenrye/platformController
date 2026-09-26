@@ -35,8 +35,8 @@ pub struct SpegelSpec {
     pub chart_version: String,
     /// Upstream registries to mirror as URLs, e.g. `https://docker.io` (scheme
     /// `http` or `https`, host, optional numeric port, no path, no trailing
-    /// slash). Omitted means the chart default, which mirrors every registry. An
-    /// empty list is rejected as ambiguous.
+    /// slash; IPv6 literals are not supported). Omitted means the chart default,
+    /// which mirrors every registry. An empty list is rejected as ambiguous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registries: Option<Vec<String>>,
     /// Free-form values merged into the chart's values. Typed fields and the
@@ -72,6 +72,8 @@ pub struct PullThroughCacheStatus {
 pub enum CacheSpecError {
     #[error("spec.spegel.chartVersion must not be empty")]
     EmptyChartVersion,
+    #[error("spec.spegel.chartVersion {0:?} has leading or trailing whitespace")]
+    ChartVersionHasWhitespace(String),
     #[error("spec.spegel.registries is empty; omit the field to mirror every registry")]
     EmptyRegistries,
     #[error(
@@ -87,7 +89,9 @@ impl CacheSpecError {
     /// The `status.conditions[].reason` reported for this rejection.
     pub fn reason(&self) -> &'static str {
         match self {
-            CacheSpecError::EmptyChartVersion => "InvalidChartVersion",
+            CacheSpecError::EmptyChartVersion | CacheSpecError::ChartVersionHasWhitespace(_) => {
+                "InvalidChartVersion"
+            }
             CacheSpecError::EmptyRegistries | CacheSpecError::InvalidRegistry(_) => {
                 "InvalidRegistry"
             }
@@ -132,6 +136,11 @@ fn is_host_and_optional_port(entry: &str) -> bool {
 pub fn validate_spegel(spegel: &SpegelSpec) -> Result<(), CacheSpecError> {
     if spegel.chart_version.trim().is_empty() {
         return Err(CacheSpecError::EmptyChartVersion);
+    }
+    if spegel.chart_version.trim() != spegel.chart_version {
+        return Err(CacheSpecError::ChartVersionHasWhitespace(
+            spegel.chart_version.clone(),
+        ));
     }
     if let Some(registries) = &spegel.registries {
         if registries.is_empty() {
@@ -271,6 +280,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_chart_versions_with_leading_or_trailing_whitespace() {
+        for bad in [" 0.7.4", "0.7.4 ", "0.7.4\n"] {
+            let spec = SpegelSpec {
+                chart_version: bad.to_string(),
+                ..spegel()
+            };
+
+            let err = validate_spegel(&spec)
+                .expect_err(&format!("{bad:?} should be rejected as a chart version"));
+
+            assert_eq!(err, CacheSpecError::ChartVersionHasWhitespace(bad.to_string()));
+            assert_eq!(err.reason(), "InvalidChartVersion");
+        }
+    }
+
+    #[test]
+    fn accepts_a_clean_chart_version() {
+        let spec = SpegelSpec {
+            chart_version: "0.7.4".to_string(),
+            ..spegel()
+        };
+
+        assert_eq!(validate_spegel(&spec), Ok(()));
+    }
+
+    #[test]
     fn rejects_an_explicitly_empty_registries_list() {
         let spec = SpegelSpec {
             registries: Some(vec![]),
@@ -314,6 +349,10 @@ mod tests {
             "https://[fd00::1]:5000",
             "https://docker io",
             "https://docker.io?x=1",
+            "HTTPS://docker.io",
+            "https://user@docker.io",
+            "https://docker.io:5000:1",
+            "https://docker.io\t",
             "",
         ] {
             let spec = SpegelSpec {

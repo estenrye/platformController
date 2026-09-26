@@ -289,8 +289,8 @@ spec:
                     description: |-
                       Upstream registries to mirror as URLs, e.g. `https://docker.io` (scheme
                       `http` or `https`, host, optional numeric port, no path, no trailing
-                      slash). Omitted means the chart default, which mirrors every registry. An
-                      empty list is rejected as ambiguous.
+                      slash; IPv6 literals are not supported). Omitted means the chart default,
+                      which mirrors every registry. An empty list is rejected as ambiguous.
                     items:
                       type: string
                     nullable: true
