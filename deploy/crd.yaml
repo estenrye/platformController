@@ -287,9 +287,10 @@ spec:
                     x-kubernetes-preserve-unknown-fields: true
                   registries:
                     description: |-
-                      Upstream registries to mirror, as bare hostnames (optionally `host:port`).
-                      Omitted means the chart default, which mirrors every registry. An empty
-                      list is rejected as ambiguous.
+                      Upstream registries to mirror as URLs, e.g. `https://docker.io` (scheme
+                      `http` or `https`, host, optional numeric port, no path, no trailing
+                      slash). Omitted means the chart default, which mirrors every registry. An
+                      empty list is rejected as ambiguous.
                     items:
                       type: string
                     nullable: true

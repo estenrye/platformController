@@ -33,9 +33,10 @@ pub enum CacheProvider {
 #[serde(rename_all = "camelCase")]
 pub struct SpegelSpec {
     pub chart_version: String,
-    /// Upstream registries to mirror, as bare hostnames (optionally `host:port`).
-    /// Omitted means the chart default, which mirrors every registry. An empty
-    /// list is rejected as ambiguous.
+    /// Upstream registries to mirror as URLs, e.g. `https://docker.io` (scheme
+    /// `http` or `https`, host, optional numeric port, no path, no trailing
+    /// slash). Omitted means the chart default, which mirrors every registry. An
+    /// empty list is rejected as ambiguous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registries: Option<Vec<String>>,
     /// Free-form values merged into the chart's values. Typed fields and the
@@ -74,8 +75,8 @@ pub enum CacheSpecError {
     #[error("spec.spegel.registries is empty; omit the field to mirror every registry")]
     EmptyRegistries,
     #[error(
-        "registries entry {0:?} is not a bare hostname, optionally with a numeric :port \
-         (no scheme, path or IPv6 literal)"
+        "registries entry {0:?} is not a registry URL: expected http:// or https:// followed \
+         by a host and optional numeric :port, with no path (for example https://docker.io)"
     )]
     InvalidRegistry(String),
     #[error("spec.spegel.helmValues must be a JSON object")]
@@ -95,8 +96,20 @@ impl CacheSpecError {
     }
 }
 
-/// A bare hostname with an optional numeric port: `docker.io`, `localhost:5000`.
-fn is_bare_registry_host(entry: &str) -> bool {
+/// A registry URL: `http://` or `https://` followed by a host and an optional
+/// numeric port, with no path, query or fragment: `https://docker.io`.
+fn is_registry_url(entry: &str) -> bool {
+    let Some(authority) = entry
+        .strip_prefix("https://")
+        .or_else(|| entry.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    !authority.contains(['/', '?', '#']) && is_host_and_optional_port(authority)
+}
+
+/// A hostname with an optional numeric port: `docker.io`, `localhost:5000`.
+fn is_host_and_optional_port(entry: &str) -> bool {
     let host = match entry.rsplit_once(':') {
         Some((host, port)) => {
             if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
@@ -124,7 +137,7 @@ pub fn validate_spegel(spegel: &SpegelSpec) -> Result<(), CacheSpecError> {
         if registries.is_empty() {
             return Err(CacheSpecError::EmptyRegistries);
         }
-        if let Some(bad) = registries.iter().find(|entry| !is_bare_registry_host(entry)) {
+        if let Some(bad) = registries.iter().find(|entry| !is_registry_url(entry)) {
             return Err(CacheSpecError::InvalidRegistry(bad.clone()));
         }
     }
@@ -209,7 +222,7 @@ mod tests {
             "provider": "spegel",
             "spegel": {
                 "chartVersion": "v0.0.0-test",
-                "registries": ["docker.io", "ghcr.io"],
+                "registries": ["https://docker.io", "https://ghcr.io"],
                 "helmValues": { "resources": { "limits": { "memory": "128Mi" } } }
             }
         }))
@@ -217,7 +230,10 @@ mod tests {
 
         assert_eq!(
             spec.spegel.registries,
-            Some(vec!["docker.io".to_string(), "ghcr.io".to_string()])
+            Some(vec![
+                "https://docker.io".to_string(),
+                "https://ghcr.io".to_string()
+            ])
         );
         assert_eq!(
             spec.spegel.helm_values.unwrap()["resources"]["limits"]["memory"],
@@ -268,13 +284,13 @@ mod tests {
     }
 
     #[test]
-    fn accepts_bare_hostnames_with_optional_ports() {
+    fn accepts_registry_urls_with_optional_ports() {
         let spec = SpegelSpec {
             registries: Some(vec![
-                "docker.io".to_string(),
-                "registry.k8s.io".to_string(),
-                "localhost:5000".to_string(),
-                "my-registry.example.com:8443".to_string(),
+                "https://docker.io".to_string(),
+                "https://registry.k8s.io".to_string(),
+                "http://localhost:5000".to_string(),
+                "https://my-registry.example.com:8443".to_string(),
             ]),
             ..spegel()
         };
@@ -283,20 +299,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_registries_that_are_not_bare_hostnames() {
+    fn rejects_registries_that_are_not_registry_urls() {
         for bad in [
-            "https://docker.io",
-            "docker.io/library",
-            "docker.io:",
-            "docker.io:port",
+            "docker.io",
+            "docker.io:5000",
+            "ftp://docker.io",
+            "https://docker.io/library",
+            "https://docker.io/",
+            "https://",
+            "https://docker.io:",
+            "https://docker.io:port",
+            "https://-docker.io",
+            "https://docker.io.",
+            "https://[fd00::1]:5000",
+            "https://docker io",
+            "https://docker.io?x=1",
             "",
-            "-docker.io",
-            "docker.io.",
-            "[fd00::1]:5000",
-            "docker io",
         ] {
             let spec = SpegelSpec {
-                registries: Some(vec!["ghcr.io".to_string(), bad.to_string()]),
+                registries: Some(vec!["https://ghcr.io".to_string(), bad.to_string()]),
                 ..spegel()
             };
 
@@ -341,7 +362,10 @@ mod tests {
     #[test]
     fn registries_map_to_mirrored_registries() {
         let spec = SpegelSpec {
-            registries: Some(vec!["docker.io".to_string(), "ghcr.io".to_string()]),
+            registries: Some(vec![
+                "https://docker.io".to_string(),
+                "https://ghcr.io".to_string(),
+            ]),
             ..spegel()
         };
 
@@ -349,7 +373,7 @@ mod tests {
 
         assert_eq!(
             values["spegel"]["mirroredRegistries"],
-            serde_json::json!(["docker.io", "ghcr.io"])
+            serde_json::json!(["https://docker.io", "https://ghcr.io"])
         );
     }
 
@@ -376,11 +400,11 @@ mod tests {
     #[test]
     fn typed_fields_win_over_conflicting_helm_values() {
         let spec = SpegelSpec {
-            registries: Some(vec!["ghcr.io".to_string()]),
+            registries: Some(vec!["https://ghcr.io".to_string()]),
             helm_values: Some(serde_json::json!({
                 "spegel": {
                     "containerdRegistryConfigPath": "/somewhere/else",
-                    "mirroredRegistries": ["docker.io"]
+                    "mirroredRegistries": ["https://docker.io"]
                 }
             })),
             ..spegel()
@@ -394,7 +418,7 @@ mod tests {
         );
         assert_eq!(
             values["spegel"]["mirroredRegistries"],
-            serde_json::json!(["ghcr.io"])
+            serde_json::json!(["https://ghcr.io"])
         );
     }
 
@@ -402,7 +426,7 @@ mod tests {
     fn helm_values_passthrough_survives_when_registries_are_omitted() {
         let spec = SpegelSpec {
             helm_values: Some(serde_json::json!({
-                "spegel": { "mirroredRegistries": ["quay.io"] }
+                "spegel": { "mirroredRegistries": ["https://quay.io"] }
             })),
             ..spegel()
         };
@@ -411,7 +435,7 @@ mod tests {
 
         assert_eq!(
             values["spegel"]["mirroredRegistries"],
-            serde_json::json!(["quay.io"])
+            serde_json::json!(["https://quay.io"])
         );
     }
 

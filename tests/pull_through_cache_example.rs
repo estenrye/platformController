@@ -33,7 +33,17 @@ fn example_names_its_registries_explicitly() {
     let spegel = load().spec.spegel;
 
     let registries = spegel.registries.expect("the example sets registries explicitly");
-    assert!(registries.contains(&"docker.io".to_string()));
+    assert!(registries.contains(&"https://docker.io".to_string()));
+}
+
+#[test]
+fn example_registries_are_urls() {
+    // Spegel rejects bare hostnames in --mirrored-registries.
+    let registries = load().spec.spegel.registries.expect("the example sets registries explicitly");
+
+    for entry in &registries {
+        assert!(entry.starts_with("https://"), "{entry}");
+    }
 }
 
 #[test]

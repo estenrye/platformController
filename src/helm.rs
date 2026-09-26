@@ -420,7 +420,10 @@ mod tests {
     async fn spegel_chart_renders_parseable_manifests_with_our_values() {
         let spegel = crate::pull_through_cache::SpegelSpec {
             chart_version: "0.7.4".to_string(),
-            registries: Some(vec!["docker.io".to_string(), "ghcr.io".to_string()]),
+            registries: Some(vec![
+                "https://docker.io".to_string(),
+                "https://ghcr.io".to_string(),
+            ]),
             ..Default::default()
         };
         let values = crate::pull_through_cache::build_values(&spegel);
@@ -442,6 +445,8 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"DaemonSet"), "{kinds:?}");
         assert!(rendered.contains("--containerd-registry-config-path=/etc/cri/conf.d/hosts"));
+        // Spegel requires URLs; the entries reach the DaemonSet args unchanged.
+        assert!(rendered.contains("- \"https://docker.io\""), "{rendered}");
         // --no-hooks: the post-delete cleanup hook must not be rendered as live objects.
         assert!(!rendered.contains("helm.sh/hook"));
     }
