@@ -24,7 +24,7 @@ plan. `examples/cni-installation.yaml` is a starting point for a self-hosted Tal
 Linux cluster running Calico; copy and adapt it (CIDR, encapsulation, BGP, etc.)
 to your own cluster rather than applying it as-is on anything but a test cluster.
 
-`bootstrap.yaml` uses `image: estenrye/platform-controller:0.1.1`
+`bootstrap.yaml` uses `image: estenrye/platform-controller:0.1.2`
 (`imagePullPolicy: IfNotPresent`), a published image on Docker Hub — most clusters
 with normal internet access can apply `bootstrap.yaml` as-is with no further steps.
 For an airgapped cluster, or one that otherwise can't reach Docker Hub, build the
