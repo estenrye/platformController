@@ -83,9 +83,25 @@ kubectl wait --for=condition=Ready pod/after-delete --timeout=120s
   local mirror is gone. Leftover mirror config is harmless; record that.
 - **Pull hangs or fails:** it does not. The spec's open item is real and cleanup
   needs a node-cleanup step. Stop and revisit the spec before merging. As a
-  manual workaround, apply only the hook objects:
-  `helm template spegel oci://ghcr.io/spegel-org/helm-charts/spegel --version 0.7.4 --namespace spegel --show-only templates/post-delete-hook.yaml | kubectl apply -f -`,
-  wait for the `spegel-cleanup` DaemonSet to finish, then delete them.
+  manual workaround, run only the hook objects. Step 3 already deleted the
+  `spegel` namespace, so recreate it first with the privileged pod-security
+  labels (the hostPath cleanup DaemonSet is rejected without them), and pass the
+  Talos config path (the chart default is `/etc/containerd/certs.d`, which would
+  clean the wrong directory):
+
+  ```sh
+  kubectl create ns spegel
+  kubectl label ns spegel pod-security.kubernetes.io/enforce=privileged \
+    pod-security.kubernetes.io/audit=privileged pod-security.kubernetes.io/warn=privileged
+  helm template spegel oci://ghcr.io/spegel-org/helm-charts/spegel --version 0.7.4 \
+    --namespace spegel --set spegel.containerdRegistryConfigPath=/etc/cri/conf.d/hosts \
+    --show-only templates/post-delete-hook.yaml | kubectl apply -f -
+  kubectl -n spegel wait --for=jsonpath='{.status.phase}'=Succeeded pod/spegel-cleanup-wait --timeout=180s
+  kubectl delete ns spegel
+  ```
+
+  `spegel-cleanup-wait` is the chart's own completion signal: it exits once every
+  `spegel-cleanup` DaemonSet pod has cleaned its node.
 
 ## Findings to record
 
