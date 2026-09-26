@@ -417,6 +417,37 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn spegel_chart_renders_parseable_manifests_with_our_values() {
+        let spegel = crate::pull_through_cache::SpegelSpec {
+            chart_version: "0.7.4".to_string(),
+            registries: Some(vec!["docker.io".to_string(), "ghcr.io".to_string()]),
+            ..Default::default()
+        };
+        let values = crate::pull_through_cache::build_values(&spegel);
+
+        let rendered = render_chart(&SPEGEL_CHART, &spegel.chart_version, &values)
+            .await
+            .expect("helm template should succeed");
+        let objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
+
+        // Every document must be a real Kubernetes object; the OCI `Pulled:` lines
+        // would otherwise parse as one with no apiVersion/kind.
+        for object in &objects {
+            let types = object.types.as_ref().expect("every rendered object has a type");
+            assert!(!types.kind.is_empty(), "{object:?}");
+        }
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|o| o.types.as_ref().unwrap().kind.as_str())
+            .collect();
+        assert!(kinds.contains(&"DaemonSet"), "{kinds:?}");
+        assert!(rendered.contains("--containerd-registry-config-path=/etc/cri/conf.d/hosts"));
+        // --no-hooks: the post-delete cleanup hook must not be rendered as live objects.
+        assert!(!rendered.contains("helm.sh/hook"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
     async fn v3_32_1_chart_ships_no_crds() {
         let spec = crate::crd::CalicoSpec {
             chart_version: "v3.32.1".to_string(),

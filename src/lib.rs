@@ -5,5 +5,6 @@ pub mod crd;
 pub mod helm;
 pub mod leader;
 pub mod manifests;
+pub mod pull_through_cache;
 pub mod reconciler;
 pub mod spec_validation;
