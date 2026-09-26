@@ -28,9 +28,8 @@ spec:
   platformKind: talos-linux
   provider: spegel
   spegel:
-    # The OCI chart tag: NO "v" prefix, unlike the GitHub release tag. If the
-    # resource's .status stays empty, check the controller logs (a `v` prefix on
-    # the chart tag is the usual cause).
+    # The OCI chart tag: NO "v" prefix, unlike the GitHub release tag. If .status
+    # shows Failed / RenderFailed, a `v` prefix on the chart tag is the usual cause.
     chartVersion: "0.7.4"
     # Omitting `registries` would mirror EVERY registry, private ones included.
     # An explicit list restricts mirroring to exactly these. Entries are URLs

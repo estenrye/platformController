@@ -127,17 +127,19 @@ kubectl wait --for=condition=Ready pod/after-delete --timeout=120s
 
 ## When something goes wrong
 
-- Non-validation failures (helm render, apply, prune) are only visible in the
-  controller's logs, not in the resource's status. The most likely cause of an
-  empty `.status` is a wrong `chartVersion`: the OCI tag has no `v` prefix
-  (`0.7.4`, not `v0.7.4`).
-- If a FIRST install fails partway and the `PullThroughCache` is deleted before it
-  ever reached `Ready`, its ledger is empty, so cleanup removes nothing and the
-  `spegel` namespace (and any applied objects) are left behind. Remove them with
-  `kubectl delete ns spegel`.
+Failures appear on the resource, not only in the controller's logs:
 
-Both are a known gap shared with `CniInstallation`, to be fixed for both
-reconcilers together.
+- `kubectl get ptc default -o jsonpath='{.status.phase}{"\n"}{.status.conditions[0].reason}{"\n"}{.status.conditions[0].message}{"\n"}'`
+  shows `Failed` with a reason (`InvalidRegistry`, `InvalidChartVersion` and the
+  other validation reasons; `RenderFailed` when helm cannot render the chart,
+  e.g. a `v` prefix on the chart tag; `InvalidManifest`; `ApplyFailed` when the
+  API server or a wait rejects an object) and the error text.
+- The ledger (`status.appliedResources`) is saved before anything is applied, so
+  deleting the resource after a failed first install still removes everything
+  that was created, including the `spegel` namespace. No manual
+  `kubectl delete ns spegel` is needed.
+- A resource that was `Ready` and hits a transient failure shows `Failed` until
+  the next successful reconcile (retried every 30 seconds).
 
 ## Findings to record
 
