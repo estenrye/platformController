@@ -5,11 +5,12 @@ Apply in this order:
 ```sh
 kubectl apply -f deploy/crd.yaml
 kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.platform.rye.ninja
+kubectl wait --for=condition=established --timeout=60s crd/pullthroughcaches.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```
 
-`crd.yaml` must be applied — and Established — first. `examples/cni-installation.yaml`
+`crd.yaml` (both CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
 contains a `CniInstallation` custom resource, and the API server rejects a custom
 resource whose kind is not yet registered (`no matches for kind "CniInstallation"`).
 Registration is asynchronous: the CRD can exist while its API endpoint is not yet
@@ -40,3 +41,20 @@ Regenerate `crd.yaml` after any change to the CRD types:
 ```sh
 cargo run --bin crdgen > deploy/crd.yaml
 ```
+
+## Pull-through image cache (optional)
+
+`examples/pull-through-cache.yaml` is a `PullThroughCache` that installs
+[Spegel](https://spegel.dev), a peer-to-peer image mirror, on Talos. Apply it
+**after** the CNI is up (Spegel publishes its registry on a `hostPort`), and only
+after doing the one-time Talos machine-config change described in
+`docs/runbooks/pull-through-cache-verification.md` (step 0); the controller cannot
+make that change for you.
+
+Omitting `spec.spegel.registries` mirrors every registry, private ones included.
+`spec.spegel.chartVersion` is the OCI chart tag and has no `v` prefix (`0.7.4`).
+
+**Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
+both CRDs to be Established) *before* rolling the controller image. A controller
+that starts without the `PullThroughCache` CRD logs watch errors for it and
+retries with backoff; it still reconciles `CniInstallation` normally.
