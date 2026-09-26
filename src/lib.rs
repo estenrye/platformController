@@ -1,3 +1,4 @@
+pub mod cache_reconciler;
 pub mod apply;
 pub mod calico;
 pub mod cidr;

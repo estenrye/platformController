@@ -59,7 +59,7 @@ pub fn validate(name: &str, spec: &CniInstallationSpec) -> Result<(), Validation
     Ok(())
 }
 
-fn leader_gate(is_leader: &std::sync::atomic::AtomicBool) -> Option<Action> {
+pub fn leader_gate(is_leader: &std::sync::atomic::AtomicBool) -> Option<Action> {
     if is_leader.load(std::sync::atomic::Ordering::Relaxed) {
         None
     } else {
@@ -107,7 +107,7 @@ pub enum ReconcileError {
     NotLeader,
 }
 
-async fn wait_for_object_kind(
+pub async fn wait_for_object_kind(
     client: &Client,
     object: &DynamicObject,
 ) -> Result<(), crate::apply::ApplyError> {
