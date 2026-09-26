@@ -107,6 +107,25 @@ pub enum ReconcileError {
     NotLeader,
 }
 
+impl ReconcileError {
+    /// The `status.conditions[].reason` to report for a failed reconcile, or
+    /// `None` when this error must not overwrite status: `Validation` already
+    /// wrote its own, a failed `Status` write cannot be reported through
+    /// status, and a standby (`NotLeader`) must never write status.
+    ///
+    /// Exhaustive on purpose: a new variant forces a decision here.
+    pub fn failure_reason(&self) -> Option<&'static str> {
+        match self {
+            ReconcileError::Helm(_) => Some("RenderFailed"),
+            ReconcileError::Manifest(_) => Some("InvalidManifest"),
+            ReconcileError::Apply(_) => Some("ApplyFailed"),
+            ReconcileError::Validation(_) | ReconcileError::Status(_) | ReconcileError::NotLeader => {
+                None
+            }
+        }
+    }
+}
+
 pub async fn wait_for_object_kind(
     client: &Client,
     object: &DynamicObject,
@@ -121,7 +140,59 @@ pub async fn wait_for_object_kind(
     .await
 }
 
+/// Runs one reconcile. A failure after validation is written to `status` (with
+/// a reason and the ledger of everything that may exist) before the original
+/// error is returned, so `error_policy` and the log behave as before.
 pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<Action, ReconcileError> {
+    let mut progress = crate::ledger::ReconcileProgress::default();
+    let result = reconcile_inner(obj.clone(), ctx.clone(), &mut progress).await;
+    if let Err(err) = &result
+        && let Some(reason) = err.failure_reason()
+    {
+        record_failure(&obj, &ctx, &progress, reason, &err.to_string()).await;
+    }
+    result
+}
+
+/// Best effort: a failed status write is logged and never replaces the
+/// reconcile's own error.
+async fn record_failure(
+    obj: &CniInstallation,
+    ctx: &Context,
+    progress: &crate::ledger::ReconcileProgress,
+    reason: &str,
+    message: &str,
+) {
+    let name = obj.name_any();
+    let api: kube::Api<CniInstallation> = kube::Api::all(ctx.client.clone());
+    let previous = obj
+        .status
+        .as_ref()
+        .map(|status| status.applied_resources.clone())
+        .unwrap_or_default();
+    let ledger = crate::ledger::failure_ledger(&previous, progress.desired.as_deref());
+
+    if let Err(err) = update_status(
+        &api,
+        &name,
+        Phase::Failed,
+        obj.metadata.generation,
+        &obj.spec.calico.chart_version,
+        &ledger,
+        reason,
+        message,
+    )
+    .await
+    {
+        tracing::warn!(installation = %name, error = %err, "failed to record failure status");
+    }
+}
+
+async fn reconcile_inner(
+    obj: Arc<CniInstallation>,
+    ctx: Arc<Context>,
+    progress: &mut crate::ledger::ReconcileProgress,
+) -> Result<Action, ReconcileError> {
     if let Some(action) = leader_gate(&ctx.is_leader) {
         return Ok(action);
     }
@@ -171,6 +242,39 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
         object_count = objects.len(),
         "parsed and sorted rendered manifests"
     );
+
+    // Everything this reconcile will apply is known now, in apply order:
+    // the target namespace, the chart's objects, then Calico's own two phases.
+    // Persist it before the first apply so a failure, a crash or a leader
+    // change can never leave an applied object out of the ledger cleanup acts
+    // on. Steady-state resyncs add nothing, so they write nothing.
+    let mut desired = vec![crate::apply::resource_ref(&tigera_operator_namespace_object())];
+    desired.extend(objects.iter().map(crate::apply::resource_ref));
+    desired.extend(
+        crate::calico::pod_pool_objects(&obj.spec.calico)
+            .iter()
+            .map(crate::apply::resource_ref),
+    );
+    desired.extend(
+        crate::calico::routing_and_lb_objects(&obj.spec.calico)
+            .iter()
+            .map(crate::apply::resource_ref),
+    );
+    progress.desired = Some(desired.clone());
+    if let Some(ledger) = crate::ledger::checkpoint_ledger(&previous, &desired) {
+        tracing::info!(entries = ledger.len(), "checkpointing ledger before applying");
+        update_status(
+            &api,
+            &name,
+            Phase::Installing,
+            obj.metadata.generation,
+            &chart_version,
+            &ledger,
+            "Applying",
+            "applying manifests",
+        )
+        .await?;
+    }
 
     let mut applied = Vec::new();
 
@@ -234,6 +338,10 @@ pub async fn reconcile(obj: Arc<CniInstallation>, ctx: Arc<Context>) -> Result<A
         tracing::debug!("nothing to prune");
     }
 
+    debug_assert!(
+        applied.iter().all(|reference| desired.contains(reference)),
+        "applied an object that was not in the checkpointed ledger"
+    );
     tracing::info!(installation = %name, phase = ?Phase::Ready, "updating status");
     update_status(
         &api,
@@ -708,5 +816,45 @@ mod tests {
 
         assert!(custom_resources.is_empty());
         assert!(infra.is_empty());
+    }
+
+    #[test]
+    fn cni_helm_errors_report_render_failed() {
+        let err = ReconcileError::Helm(crate::helm::HelmError::WriteValues(
+            std::io::Error::other("boom"),
+        ));
+
+        assert_eq!(err.failure_reason(), Some("RenderFailed"));
+    }
+
+    #[test]
+    fn cni_manifest_errors_report_invalid_manifest() {
+        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let err = ReconcileError::Manifest(crate::manifests::ManifestError::Json {
+            index: 0,
+            source,
+        });
+
+        assert_eq!(err.failure_reason(), Some("InvalidManifest"));
+    }
+
+    #[test]
+    fn cni_apply_errors_report_apply_failed() {
+        let err = ReconcileError::Apply(crate::apply::ApplyError::NotDeleted {
+            kind: "Installation".to_string(),
+            name: "default".to_string(),
+            timeout: Duration::from_secs(1),
+        });
+
+        assert_eq!(err.failure_reason(), Some("ApplyFailed"));
+    }
+
+    #[test]
+    fn cni_validation_and_leadership_errors_do_not_overwrite_status() {
+        let validation =
+            ReconcileError::Validation(ValidationError::UnsupportedName("second".to_string()));
+
+        assert_eq!(validation.failure_reason(), None);
+        assert_eq!(ReconcileError::NotLeader.failure_reason(), None);
     }
 }
