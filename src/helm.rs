@@ -8,6 +8,43 @@ pub const TIGERA_OPERATOR_NAMESPACE: &str = "tigera-operator";
 /// The Helm repository the tigera-operator chart is fetched from.
 pub const CALICO_CHART_REPO: &str = "https://docs.tigera.io/calico/charts";
 
+/// Namespace the Spegel chart's namespaced objects belong in. Like
+/// tigera-operator, the chart renders no `Namespace` object of its own.
+pub const SPEGEL_NAMESPACE: &str = "spegel";
+
+/// Where a Helm chart is fetched from. The two forms invoke `helm template`
+/// differently.
+pub enum ChartSource {
+    /// `helm template <release> --repo <url> <chart>`
+    Repo { url: &'static str, chart: &'static str },
+    /// `helm template <release> <reference>`, where the reference is `oci://...`
+    Oci { reference: &'static str },
+}
+
+/// Everything about a chart except its version and values.
+pub struct ChartRef {
+    pub release: &'static str,
+    pub source: ChartSource,
+    pub namespace: &'static str,
+}
+
+pub const CALICO_CHART: ChartRef = ChartRef {
+    release: "calico",
+    source: ChartSource::Repo {
+        url: CALICO_CHART_REPO,
+        chart: "tigera-operator",
+    },
+    namespace: TIGERA_OPERATOR_NAMESPACE,
+};
+
+pub const SPEGEL_CHART: ChartRef = ChartRef {
+    release: "spegel",
+    source: ChartSource::Oci {
+        reference: "oci://ghcr.io/spegel-org/helm-charts/spegel",
+    },
+    namespace: SPEGEL_NAMESPACE,
+};
+
 pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
     let ip_pools: Vec<serde_json::Value> = calico
         .ip_pools
@@ -92,33 +129,43 @@ pub enum HelmError {
     },
 }
 
-pub fn build_render_args(chart_version: &str, values_path: &std::path::Path) -> Vec<String> {
-    vec![
-        "template".to_string(),
-        "calico".to_string(),
-        "--repo".to_string(),
-        CALICO_CHART_REPO.to_string(),
-        "tigera-operator".to_string(),
+pub fn render_args(chart: &ChartRef, chart_version: &str, values_path: &std::path::Path) -> Vec<String> {
+    let mut args = vec!["template".to_string(), chart.release.to_string()];
+    match &chart.source {
+        ChartSource::Repo { url, chart: name } => {
+            args.extend(["--repo".to_string(), url.to_string(), name.to_string()]);
+        }
+        ChartSource::Oci { reference } => args.push(reference.to_string()),
+    }
+    args.extend([
         "--version".to_string(),
         chart_version.to_string(),
         "--values".to_string(),
         values_path.display().to_string(),
         "--include-crds".to_string(),
-        // Without --no-hooks the chart emits its pre-delete uninstall Job
-        // (tigera-operator-uninstall), which this controller would then apply as
-        // a live object -- immediately tearing Calico back down.
+        // Without --no-hooks the chart emits its hook Jobs (e.g. the
+        // tigera-operator-uninstall Job), which this controller would then
+        // apply as live objects -- immediately tearing the component back down.
         "--no-hooks".to_string(),
         // Without an explicit namespace, helm resolves .Release.Namespace from
         // ambient kubeconfig context, so namespaced objects land in the wrong
-        // namespace (or "default") instead of tigera-operator.
+        // namespace (or "default") instead of the chart's own namespace.
         "--namespace".to_string(),
-        TIGERA_OPERATOR_NAMESPACE.to_string(),
-    ]
+        chart.namespace.to_string(),
+    ]);
+    args
 }
 
-pub async fn render(calico: &CalicoSpec) -> Result<String, HelmError> {
-    let values = build_values(calico);
-    let yaml = serde_yaml::to_string(&values).expect("serde_json::Value always serializes to YAML");
+pub fn build_render_args(chart_version: &str, values_path: &std::path::Path) -> Vec<String> {
+    render_args(&CALICO_CHART, chart_version, values_path)
+}
+
+pub async fn render_chart(
+    chart: &ChartRef,
+    chart_version: &str,
+    values: &serde_json::Value,
+) -> Result<String, HelmError> {
+    let yaml = serde_yaml::to_string(values).expect("serde_json::Value always serializes to YAML");
 
     let mut file = tempfile::NamedTempFile::new().map_err(HelmError::WriteValues)?;
     {
@@ -126,7 +173,7 @@ pub async fn render(calico: &CalicoSpec) -> Result<String, HelmError> {
         file.write_all(yaml.as_bytes()).map_err(HelmError::WriteValues)?;
     }
 
-    let args = build_render_args(&calico.chart_version, file.path());
+    let args = render_args(chart, chart_version, file.path());
     let output = tokio::process::Command::new("helm")
         .args(&args)
         .output()
@@ -140,7 +187,28 @@ pub async fn render(calico: &CalicoSpec) -> Result<String, HelmError> {
         });
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(strip_oci_pull_preamble(&String::from_utf8_lossy(&output.stdout)).to_string())
+}
+
+/// `helm template` on an `oci://` chart prints `Pulled:` and `Digest:` progress
+/// lines to stdout ahead of the manifests. Left in place they parse as a
+/// bogus first manifest with no `apiVersion`/`kind`, so drop them. Repo charts
+/// print no such lines and pass through unchanged.
+fn strip_oci_pull_preamble(output: &str) -> &str {
+    let mut rest = output;
+    while let Some(line_end) = rest.find('\n') {
+        let line = &rest[..line_end];
+        if line.starts_with("Pulled: ") || line.starts_with("Digest: ") {
+            rest = &rest[line_end + 1..];
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+pub async fn render(calico: &CalicoSpec) -> Result<String, HelmError> {
+    render_chart(&CALICO_CHART, &calico.chart_version, &build_values(calico)).await
 }
 
 #[cfg(test)]
@@ -233,6 +301,50 @@ mod tests {
                 "tigera-operator".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn oci_render_args_pass_the_reference_without_a_repo_flag() {
+        let path = std::path::Path::new("/tmp/values.yaml");
+        let args = render_args(&SPEGEL_CHART, "v0.0.0-test", path);
+
+        assert_eq!(
+            args,
+            vec![
+                "template".to_string(),
+                "spegel".to_string(),
+                "oci://ghcr.io/spegel-org/helm-charts/spegel".to_string(),
+                "--version".to_string(),
+                "v0.0.0-test".to_string(),
+                "--values".to_string(),
+                "/tmp/values.yaml".to_string(),
+                "--include-crds".to_string(),
+                "--no-hooks".to_string(),
+                "--namespace".to_string(),
+                "spegel".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn strips_the_oci_pull_progress_lines_before_the_first_manifest() {
+        let output = "Pulled: ghcr.io/spegel-org/helm-charts/spegel:0.7.4\n\
+                      Digest: sha256:abc\n\
+                      ---\n\
+                      # Source: spegel/templates/rbac.yaml\n\
+                      kind: ServiceAccount\n";
+
+        assert_eq!(
+            strip_oci_pull_preamble(output),
+            "---\n# Source: spegel/templates/rbac.yaml\nkind: ServiceAccount\n"
+        );
+    }
+
+    #[test]
+    fn leaves_repo_chart_output_untouched() {
+        let output = "---\n# Source: tigera-operator/templates/x.yaml\nkind: Deployment\n";
+
+        assert_eq!(strip_oci_pull_preamble(output), output);
     }
 
     #[test]
