@@ -1,0 +1,37 @@
+# Sample PullThroughCache for a self-hosted Talos Linux cluster: a Spegel
+# peer-to-peer image mirror. Once one node has pulled an image, the other nodes
+# fetch its layers from that peer instead of the upstream registry.
+#
+# BEFORE applying this, every node needs a one-time Talos machine-config change
+# the controller cannot make for you (see
+# docs/runbooks/pull-through-cache-verification.md, step 0):
+#
+#   machine:
+#     files:
+#       - path: /etc/cri/conf.d/20-customization.part
+#         op: create
+#         content: |
+#           [plugins."io.containerd.cri.v1.images"]
+#             discard_unpacked_layers = false
+#
+# Spegel publishes its registry on a hostPort, so apply this after the CNI is up
+# (a CniInstallation that has reached Ready).
+#
+#   kubectl apply -f examples/pull-through-cache.yaml
+apiVersion: platform.rye.ninja/v1alpha1
+kind: PullThroughCache
+metadata:
+  name: default
+spec:
+  platformKind: talos-linux
+  provider: spegel
+  spegel:
+    # The OCI chart tag: NO "v" prefix, unlike the GitHub release tag.
+    chartVersion: "0.7.4"
+    # Omitting `registries` would mirror EVERY registry, private ones included.
+    # An explicit list restricts mirroring to exactly these.
+    registries:
+      - docker.io
+      - ghcr.io
+      - quay.io
+      - registry.k8s.io
