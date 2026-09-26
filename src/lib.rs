@@ -2,6 +2,7 @@ pub mod apply;
 pub mod calico;
 pub mod cidr;
 pub mod crd;
+pub mod crds;
 pub mod helm;
 pub mod leader;
 pub mod manifests;

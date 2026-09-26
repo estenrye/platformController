@@ -35,25 +35,31 @@ fn example_cni_installation_yaml_defines_a_single_cni_installation() {
 }
 
 #[test]
-fn crd_yaml_defines_the_cniinstallation_resource() {
+fn crd_yaml_defines_both_platform_resources() {
     let content = std::fs::read_to_string("deploy/crd.yaml")
-        .expect("deploy/crd.yaml should exist; run `cargo run --bin crdgen > deploy/crd.yaml`");
+        .expect("deploy/crd.yaml should exist; run `cargo run -q --bin crdgen > deploy/crd.yaml`");
     let objects = parse_manifests(&content).expect("crd.yaml should be valid YAML");
 
-    assert_eq!(objects.len(), 1);
-    assert_eq!(objects[0].types.as_ref().unwrap().kind, "CustomResourceDefinition");
+    let names: Vec<String> = objects
+        .iter()
+        .map(|o| {
+            assert_eq!(o.types.as_ref().unwrap().kind, "CustomResourceDefinition");
+            o.metadata.name.clone().unwrap()
+        })
+        .collect();
+
     assert_eq!(
-        objects[0].metadata.name.as_deref(),
-        Some("cniinstallations.platform.rye.ninja")
+        names,
+        vec![
+            "cniinstallations.platform.rye.ninja",
+            "pullthroughcaches.platform.rye.ninja",
+        ]
     );
 }
 
 #[test]
-fn crd_yaml_matches_the_generated_crd() {
-    use kube::CustomResourceExt;
-
-    let generated = serde_yaml::to_string(&platform_controller::crd::CniInstallation::crd())
-        .expect("CRD should serialize to YAML");
+fn crd_yaml_matches_the_generated_crds() {
+    let generated = platform_controller::crds::generated_yaml();
     let on_disk = std::fs::read_to_string("deploy/crd.yaml").expect("deploy/crd.yaml should exist");
 
     assert_eq!(
