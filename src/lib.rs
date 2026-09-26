@@ -6,6 +6,7 @@ pub mod crd;
 pub mod crds;
 pub mod helm;
 pub mod leader;
+pub mod ledger;
 pub mod manifests;
 pub mod pull_through_cache;
 pub mod reconciler;
