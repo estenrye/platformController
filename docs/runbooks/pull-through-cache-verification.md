@@ -1,9 +1,15 @@
 # Verifying the Spegel pull-through cache on Talos
 
 Manual acceptance for the `PullThroughCache` resource. Needs a Talos cluster with
-at least two nodes and a working CNI (`CniInstallation` at `Ready`). The
-Talos-in-Docker recipe in `tests/integration_talos.rs` works for steps 0-3; use
-it with `--workers 2`.
+a working CNI (`CniInstallation` at `Ready`). Step 2 (peer-to-peer serving) needs
+**at least two nodes**: on a single node Spegel never becomes Ready, because its
+`registry` container logs `routing table is empty after bootstrapping`, the
+startup probe returns 500 and the container restarts. Steps 1 and 3 were run on
+one node (see "Findings to record"). The Talos-in-Docker recipe in
+`tests/integration_talos.rs` works for steps 0-3; use it with `--workers 2`.
+
+`spec.spegel.registries` entries are registry URLs (`https://docker.io`); Spegel
+rejects bare hostnames.
 
 ## 0. Node prerequisite (once per node, before applying the CR)
 
@@ -40,6 +46,11 @@ kubectl -n spegel get ds,pods -o wide                          # one pod per nod
 
 `Ready` means the manifests were applied, not that Spegel is healthy on every
 node; the DaemonSet's pods are the real signal.
+
+On a single node the pod is not Ready: the `configuration` init container
+succeeds (with URL registries) and the `registry` container restarts, logging
+`routing table is empty after bootstrapping`. That is expected without peers; with
+two or more nodes, check that the pods become Ready (not yet verified).
 
 ## 2. Peer-to-peer serving
 
@@ -79,11 +90,14 @@ kubectl run after-delete --image=<uncached image> --restart=Never
 kubectl wait --for=condition=Ready pod/after-delete --timeout=120s
 ```
 
-- **Pull succeeds:** containerd fails open to the upstream registry when the
-  local mirror is gone. Leftover mirror config is harmless; record that.
-- **Pull hangs or fails:** it does not. The spec's open item is real and cleanup
-  needs a node-cleanup step. Stop and revisit the spec before merging. As a
-  manual workaround, run only the hook objects. Step 3 already deleted the
+- **Pull succeeds (observed on a single node, 2026-09-25):** containerd falls
+  back to the upstream registry. There the pull of `registry.k8s.io/pause:3.8`
+  took ~1.5s with the post-delete hook not run. Caveats: the mirror never served
+  content, and leftover mirror config on the node was not inspected. Repeat it on
+  a multi-node cluster where the mirror was serving before you rely on it.
+- **Pull hangs or fails:** only if a multi-node run shows it (not observed so
+  far). Then cleanup needs a node-cleanup step: stop and revisit the spec before
+  merging. As a manual workaround, run only the hook objects. Step 3 already deleted the
   `spegel` namespace, so recreate it first with the privileged pod-security
   labels (the hostPath cleanup DaemonSet is rejected without them), and pass the
   Talos config path (the chart default is `/etc/containerd/certs.d`, which would
@@ -105,5 +119,7 @@ kubectl wait --for=condition=Ready pod/after-delete --timeout=120s
 
 ## Findings to record
 
-After running this, write the outcomes of steps 2 and 3 (the peer-serving signal,
-and fail-open yes/no) into `docs/memory/pull-through-cache-2026-09.md`.
+Steps 1 and 3 have been run on one IPv6-only node and recorded in
+`docs/memory/pull-through-cache-2026-09.md`. Step 2 is still to do on at least two
+nodes: write the peer-serving signal there, and whether fail-open holds when the
+mirror was serving.

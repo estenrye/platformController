@@ -21,6 +21,10 @@ The API is shaped so that other cache backends can be added as further `provider
 - Running Spegel before the CNI (host-network mode), so it could serve Calico's own images. Considered and dropped. Spegel `0.7.4` is only usable after the CNI is up: the chart exposes no `hostNetwork` value and hard-codes `--bootstrap-kind=dns` against a cluster-DNS name (CoreDNS cannot run before a CNI). Making it work would mean patching the rendered DaemonSet after rendering (host networking, plus the HTTP bootstrapper pointed at a chosen node), and even then only nodes after the first would benefit, with the cache lost on every cluster rebuild. Apply `PullThroughCache` after `CniInstallation` is `Ready`.
 - Refactoring the CNI reconciler into a shared component framework. Revisit when a third component shows what is genuinely shared.
 
+## Known limits
+
+- Spegel does not become Ready on a single node: with no peers its `registry` container logs `routing table is empty after bootstrapping`, the startup probe returns 500 and the container restarts. Peer-to-peer serving needs at least two nodes.
+
 ## Node prerequisite (documented, not automated)
 
 Spegel on Talos needs a one-time machine-config change that this controller cannot make. Per Spegel's Talos documentation, every node needs:
@@ -53,11 +57,11 @@ spec:
   provider: spegel            # enum; "external" and "aws-ecr" come later
   spegel:
     chartVersion: "<pinned>"  # required, no default, same as Calico
-    registries: [docker.io, ghcr.io]   # optional
+    registries: [https://docker.io, https://ghcr.io]   # optional, URLs
     helmValues: {}                     # optional free-form passthrough
 ```
 
-- `registries` maps to the chart's `spegel.mirroredRegistries`. **Omitting it leaves the chart default, `[]`, which means every registry is mirrored** (private registries included). Setting it restricts mirroring to exactly those registries. The example manifest sets it explicitly so the choice is visible.
+- `registries` maps to the chart's `spegel.mirroredRegistries`. **Omitting it leaves the chart default, `[]`, which means every registry is mirrored** (private registries included). Setting it restricts mirroring to exactly those registries. Entries are registry **URLs**: `http` or `https` scheme, a host, an optional numeric port, no path (`https://docker.io`). A bare hostname such as `docker.io` is rejected, because Spegel itself rejects it: its `configuration` init container exits 1 with `invalid registry url scheme must be http or https: docker.io` (found in live verification). The example manifest sets it explicitly so the choice is visible.
 - `helmValues` is merged first; typed fields and the controller's own Talos setting are overlaid afterwards, so a passthrough can never silently contradict a typed field.
 - For `talos-linux` the controller always sets `spegel.containerdRegistryConfigPath` to `/etc/cri/conf.d/hosts`, the same kind of unconditional platform-implied value as Calico's `flexVolumePath: None`.
 - `chartVersion` is the OCI chart tag, which has **no `v` prefix** (`0.7.4`); the GitHub release tag `v0.7.4` does not exist as a chart tag on `ghcr.io`.
@@ -68,7 +72,7 @@ Validation, rejected with `phase: Failed` and a `reason`, like the CNI path:
 - the name is not `default`
 - `platformKind` or `provider` is unsupported
 - `chartVersion` is empty
-- a `registries` entry is not a bare hostname (no scheme, no path, non-empty)
+- a `registries` entry is not a registry URL (`http://` or `https://`, then a host and an optional numeric port, with no path, query or fragment); a bare hostname is rejected because Spegel rejects it
 - `registries` is present but empty (ambiguous; omit the field to mirror every registry)
 - `helmValues` is not a JSON object
 
@@ -89,7 +93,7 @@ Same shape as the CNI loop:
 
 The finalizer deletes applied resources in reverse ledger order (the namespace goes last). There are no removal waits.
 
-**Open item.** Spegel removes the mirror config it wrote on each node via a post-delete Helm hook (confirmed in chart `0.7.4`: `templates/post-delete-hook.yaml` renders a `spegel-cleanup` DaemonSet, a `spegel-cleanup-wait` Pod and a `spegel-cleanup` Service). Rendering with `--no-hooks` is required (a rendered hook Job would be applied as a live object and run at install), so that hook will not run on delete. After the DaemonSet is gone, nodes keep their Spegel-written mirror config. Whether containerd then fails open to the upstream registry, or stalls pulls against a dead local mirror, must be established on a live cluster before implementation is considered done. If it does not fail open, cleanup needs an explicit node-cleanup step (or a controller-run equivalent of the hook) and this section changes.
+**Resolved item (live-verified on one node, with caveats).** Spegel removes the mirror config it wrote on each node via a post-delete Helm hook (confirmed in chart `0.7.4`: `templates/post-delete-hook.yaml` renders a `spegel-cleanup` DaemonSet, a `spegel-cleanup-wait` Pod and a `spegel-cleanup` Service). Rendering with `--no-hooks` is required (a rendered hook Job would be applied as a live object and run at install), so that hook does not run on delete. Live result (2026-09-25, single-node Talos cluster): after delete the finalizer cleared and all applied resources and the `spegel` namespace were gone within ~10s, and with the hook not run, pulling an image not on the node (`registry.k8s.io/pause:3.8`) from a mirrored registry succeeded in ~1.5s, as did a pull while the DaemonSet existed. So containerd fell back to upstream. Caveats: single node; whether Spegel's mirror config files remained on the node was not inspected (no Talos API access); the mirror never served content, so this does not show behaviour against a mirror that was serving. If a later multi-node run shows stalled pulls, cleanup needs an explicit node-cleanup step (or a controller-run equivalent of the hook) and this section changes.
 
 ### Wiring
 
@@ -117,13 +121,22 @@ The finalizer deletes applied resources in reverse ledger order (the namespace g
 - **Unit:** spec deserialization and defaults; each validation rejection; values builder (typed fields win over `helmValues`, Talos config path always set, omitted `registries` leaves `mirroredRegistries` unset); render-argument builder for both the OCI and `--repo` forms.
 - **Example:** the example manifest parses and validates, in the style of `tests/ipv6_example.rs`.
 - **Integration (ignored, Talos-in-Docker, in the style of `tests/integration_talos.rs`):** apply the CR, assert the Spegel DaemonSet appears, delete the CR, assert the applied resources are gone. It does not try to prove peer-to-peer serving.
-- **Live verification (manual, runbook):** peer-to-peer serving across two nodes, and the delete/fail-open behaviour from the open item above.
+- **Live verification (manual, runbook):** peer-to-peer serving across two nodes, and the delete/fail-open behaviour from the resolved item above (observed once on a single node).
 
-## Unverified details to confirm during implementation
+## Verification status
 
-These come from Spegel's public docs and chart values, read while writing this spec, not from a running cluster:
+Live-verified on 2026-09-25 (single control-plane node, Talos v1.14.0, Kubernetes v1.37.0, containerd 2.3.4, IPv6-only, controller run locally against the cluster; the Talos machine-config prerequisite was NOT applied because no Talos API credentials were used):
 
-- The chart value names `spegel.mirroredRegistries` and `spegel.containerdRegistryConfigPath` were confirmed against a real render of chart `0.7.4`; re-check them when the chart version is bumped.
+- Apply: reconcile reached `Ready` in ~10s; the OCI chart rendered 5 objects (no stray `Pulled:` document) and 6 were applied including the namespace; the DaemonSet was admitted in the privileged namespace and the pod received a pod IP from Calico.
+- `registries` must be URLs (see the API section). With URL registries passed through `helmValues.spegel.mirroredRegistries` (typed `registries` unset) the `configuration` init container succeeded, which also showed that the `helmValues` passthrough reaches the DaemonSet.
+- Delete: the finalizer cleared and all applied resources and the `spegel` namespace were gone within ~10s.
+- Fail-open after delete without the post-delete hook: observed, with the caveats in the cleanup section.
+
+Confirmed against a real render of chart `0.7.4`: the value names `spegel.mirroredRegistries` and `spegel.containerdRegistryConfigPath` (re-check when the chart version is bumped), and the DaemonSet publishes its registry on `hostPort` 30020, which needs a CNI with hostPort support (Calico provides it). The chart runs Spegel on the pod network and discovers peers through cluster DNS (`--bootstrap-kind=dns`), so it is only usable after the CNI is up; the controller applies the manifests without waiting for that.
+
+Still unverified:
+
+- Peer-to-peer serving. It needs at least two nodes (Spegel never became Ready on the single node) and the Talos machine-config prerequisite.
 - That the Talos machine-config patch above is sufficient on the Talos version in use.
-- Spegel's DaemonSet publishes its registry on `hostPort` 30020 (confirmed in the rendered chart `0.7.4`), which needs a CNI with hostPort support (Calico provides it). It only becomes usable after the CNI is up; the controller applies the manifests without waiting for that.
-- The post-delete fail-open behaviour described above.
+- IPv6 mirror-target correctness: the DaemonSet passes `--mirror-targets http://$(NODE_IP):30020` and on an IPv6-only cluster `NODE_IP` is an IPv6 address, so the URL is unbracketed. The init container still exited 0, but whether the resulting mirror config is correct on IPv6 was not verified.
+- Whether Spegel's mirror config files remain on nodes after delete.

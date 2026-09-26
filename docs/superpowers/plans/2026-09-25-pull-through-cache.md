@@ -10,6 +10,8 @@
 
 **Spec:** [docs/superpowers/specs/2026-09-25-pull-through-cache-design.md](../specs/2026-09-25-pull-through-cache-design.md)
 
+> **Correction found in live verification (Task 9):** `registries` entries are registry URLs (`https://docker.io`), not bare hostnames; Spegel rejects bare hostnames. Code blocks below that use bare hostnames are superseded by the committed code and by the spec.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section. Values are copied from the spec, plus facts confirmed against the real chart while writing this plan.
