@@ -3,7 +3,9 @@ use kube::runtime::{predicates, reflector, watcher, Controller, Predicate, Watch
 use kube::{Api, Client, Resource};
 use platform_controller::crd::CniInstallation;
 use platform_controller::leader;
+use platform_controller::pull_through_cache::PullThroughCache;
 use platform_controller::reconciler::{error_policy, reconcile_with_finalizer, Context};
+use platform_controller::cache_reconciler;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
@@ -17,7 +19,7 @@ const LEASE_NAME: &str = "platform-controller-leader";
 /// (verified against `kube-runtime` 4.2.0's own source). Combined below with
 /// `predicates::generation` so both spec changes and deletion requests pass
 /// through the filter, while status-only self-writes still don't.
-fn deletion_requested(obj: &CniInstallation) -> Option<u64> {
+fn deletion_requested<K: Resource>(obj: &K) -> Option<u64> {
     obj.meta().deletion_timestamp.is_some().then_some(1)
 }
 
@@ -76,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         );
 
     let controller = Controller::for_stream(installations, reader)
-        .run(reconcile_with_finalizer, error_policy, context)
+        .run(reconcile_with_finalizer, error_policy, context.clone())
         .for_each(|result| async move {
             match result {
                 Ok(action) => tracing::debug!(?action, "reconciled"),
@@ -84,10 +86,40 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+    // The pull-through cache gets its own watcher, store and Controller, but the
+    // same status-write/deletion predicate filter (see above) and the same
+    // Context, so both loops share one leader lease.
+    let cache_api: Api<PullThroughCache> = Api::all(client.clone());
+    let (cache_reader, cache_writer) = reflector::store();
+    let caches = watcher(cache_api, watcher::Config::default())
+        .default_backoff()
+        .reflect(cache_writer)
+        .applied_objects()
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
+
+    let cache_controller = Controller::for_stream(caches, cache_reader)
+        .run(
+            cache_reconciler::reconcile_with_finalizer,
+            cache_reconciler::error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok(action) => tracing::debug!(?action, "reconciled pull-through cache"),
+                Err(err) => tracing::error!(error = %err, "pull-through cache reconcile failed"),
+            }
+        });
+
     let mut sigterm = signal(SignalKind::terminate())?;
 
     tokio::select! {
         _ = controller => {}
+        _ = cache_controller => {}
         // `leader::run` loops forever, so this branch only resolves if it
         // panicked. Exit non-zero and let Kubernetes restart the pod rather than
         // limp on with a permanently stale `is_leader` flag.
@@ -155,5 +187,25 @@ mod tests {
         .expect("installation should deserialize");
 
         assert_eq!(deletion_requested(&installation), Some(1));
+    }
+
+    #[test]
+    fn deletion_requested_works_for_the_pull_through_cache_kind_too() {
+        let cache: PullThroughCache = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "PullThroughCache",
+            "metadata": {
+                "name": "default",
+                "deletionTimestamp": "2026-09-25T00:00:00Z"
+            },
+            "spec": {
+                "platformKind": "talos-linux",
+                "provider": "spegel",
+                "spegel": { "chartVersion": "0.7.4" }
+            }
+        }))
+        .expect("cache should deserialize");
+
+        assert_eq!(deletion_requested(&cache), Some(1));
     }
 }
