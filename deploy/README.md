@@ -59,3 +59,18 @@ Omitting `spec.spegel.registries` mirrors every registry, private ones included.
 both CRDs to be Established) *before* rolling the controller image. A controller
 that starts without the `PullThroughCache` CRD logs watch errors for it and
 retries with backoff; it still reconciles `CniInstallation` normally.
+
+## Calico node address autodetection
+
+`spec.calico.nodeAddressAutodetectionV6Method` selects how Calico detects each
+node's IPv6 address: `cidrs` (the default) uses `nodeAddressAutodetectionV6Cidrs`,
+and `kubernetesInternalIP` uses each node's Kubernetes InternalIP. Use the latter
+when the peering `/64` carries other addresses (SLAAC addresses, a floating VIP),
+which makes CIDR autodetection ambiguous. The two settings cannot be combined.
+
+**Upgrading:** apply the new `deploy/crd.yaml` *before* rolling the controller
+image; otherwise the API server silently prunes the unknown field from a manifest
+that uses it. **Switching an existing cluster** from `cidrs` to
+`kubernetesInternalIP` changes each node's address in Calico: `calico-node`
+restarts and BGP sessions re-establish from the new addresses, so make sure your
+BGP peers accept them first.

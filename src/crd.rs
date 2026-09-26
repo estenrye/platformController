@@ -46,14 +46,37 @@ pub struct CalicoSpec {
     pub api_server_enabled: bool,
     #[serde(default)]
     pub ip_pools: Vec<CalicoIpPoolSpec>,
+    /// IPv6 CIDRs whose addresses Calico may use as a node's address. Only
+    /// used with the `cidrs` method; the `/64` you list must carry nothing
+    /// else (no SLAAC addresses, no floating VIP), or Calico can pick the wrong
+    /// address.
     #[serde(default)]
     pub node_address_autodetection_v6_cidrs: Vec<String>,
+    /// How Calico detects a node's IPv6 address. `cidrs` (the default) uses
+    /// `nodeAddressAutodetectionV6Cidrs`; `kubernetesInternalIP` uses each
+    /// node's Kubernetes InternalIP and cannot be combined with a CIDR list.
+    #[serde(default)]
+    pub node_address_autodetection_v6_method: NodeAddressAutodetectionMethod,
     /// BGP configuration and peers. Requires `bgpEnabled: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bgp: Option<BgpSpec>,
     /// LoadBalancer-only IP pools (native Calico LoadBalancer IPAM, Calico >= 3.30).
     #[serde(default)]
     pub load_balancer_pools: Vec<LoadBalancerPoolSpec>,
+}
+
+/// How Calico detects a node's IPv6 address (the operator's
+/// `nodeAddressAutodetectionV6`). Calico accepts only one method at a time.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+pub enum NodeAddressAutodetectionMethod {
+    /// Use an address inside `nodeAddressAutodetectionV6Cidrs` (or none, when
+    /// the list is empty).
+    #[default]
+    #[serde(rename = "cidrs")]
+    Cidrs,
+    /// Use the node's Kubernetes InternalIP (`kubernetes: NodeInternalIP`).
+    #[serde(rename = "kubernetesInternalIP")]
+    KubernetesInternalIp,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -443,5 +466,40 @@ mod tests {
             status_properties.get("conditions").is_some(),
             "status.properties should include 'conditions'"
         );
+    }
+
+    #[test]
+    fn node_address_autodetection_method_defaults_to_cidrs() {
+        let spec: CalicoSpec = serde_json::from_value(serde_json::json!({ "chartVersion": "v3.29.1" }))
+            .expect("existing specs must keep working");
+
+        assert_eq!(
+            spec.node_address_autodetection_v6_method,
+            NodeAddressAutodetectionMethod::Cidrs
+        );
+    }
+
+    #[test]
+    fn node_address_autodetection_method_accepts_kubernetes_internal_ip() {
+        let spec: CalicoSpec = serde_json::from_value(serde_json::json!({
+            "chartVersion": "v3.32.1",
+            "nodeAddressAutodetectionV6Method": "kubernetesInternalIP"
+        }))
+        .expect("kubernetesInternalIP should deserialize");
+
+        assert_eq!(
+            spec.node_address_autodetection_v6_method,
+            NodeAddressAutodetectionMethod::KubernetesInternalIp
+        );
+    }
+
+    #[test]
+    fn unknown_node_address_autodetection_methods_are_rejected() {
+        let result = serde_json::from_value::<CalicoSpec>(serde_json::json!({
+            "chartVersion": "v3.32.1",
+            "nodeAddressAutodetectionV6Method": "firstFound"
+        }));
+
+        assert!(result.is_err());
     }
 }

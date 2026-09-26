@@ -78,6 +78,7 @@ The operator must:
 | blockSize | integer | The size of the IP blocks within the IP pool. | must be a positive integer. | false | `112` |
 | nodeSelector | string | The node selector for the IP pool. | must be a valid Kubernetes label selector. | false | `"all()"` |
 | nodeAddressAutodetectionV6Cidrs | string[] | The list of IPv6 CIDRs for node address autodetection. | must be a list of valid IPv6 CIDR notations. | false | `[]` |
+| nodeAddressAutodetectionV6Method | enum(string) | How Calico detects a node's IPv6 address: from `nodeAddressAutodetectionV6Cidrs`, or from the node's Kubernetes InternalIP. | must be one of `cidrs`, `kubernetesInternalIP`; `kubernetesInternalIP` cannot be combined with a non-empty `nodeAddressAutodetectionV6Cidrs`. | false | `cidrs` |
 
 
 ## Component Spec

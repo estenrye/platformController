@@ -41,8 +41,12 @@ spec:
         natOutgoing: true
         blockSize: 122 # optional: omitted resolves to 122 for IPv6
 
-    # Pick the node address on the BGP peering segment. Unambiguous because that
-    # /64 carries nothing else (no SLAAC GUA, no floating VIP).
+    # Pick the node address on the BGP peering segment. Unambiguous ONLY because
+    # that /64 carries nothing else (no SLAAC GUA, no floating VIP). If yours
+    # does (Calico can then pick the VIP or a SLAAC address as the node IP),
+    # remove this list and set `nodeAddressAutodetectionV6Method:
+    # kubernetesInternalIP` instead: Calico then uses each node's Kubernetes
+    # InternalIP. The two cannot be combined.
     nodeAddressAutodetectionV6Cidrs:
       - fd00:db8:0:179::/64
 

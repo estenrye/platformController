@@ -1,4 +1,4 @@
-use crate::crd::{CalicoSpec, Encapsulation};
+use crate::crd::{CalicoSpec, Encapsulation, NodeAddressAutodetectionMethod};
 
 /// Namespace the tigera-operator chart's namespaced objects belong in. The chart
 /// itself renders no `Namespace` object, so the controller both renders into and
@@ -74,11 +74,20 @@ pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
 
     // The operator rejects `nodeAddressAutodetectionV6: {cidrs: []}` (an
     // autodetection method with no method selected), so omit the key entirely
-    // when no CIDRs are configured.
-    if !calico.node_address_autodetection_v6_cidrs.is_empty() {
-        calico_network["nodeAddressAutodetectionV6"] = serde_json::json!({
-            "cidrs": calico.node_address_autodetection_v6_cidrs,
-        });
+    // when no method is configured. Calico accepts only one method at a time;
+    // `spec_validation` rejects a CIDR list alongside `kubernetesInternalIP`.
+    match calico.node_address_autodetection_v6_method {
+        NodeAddressAutodetectionMethod::KubernetesInternalIp => {
+            calico_network["nodeAddressAutodetectionV6"] =
+                serde_json::json!({ "kubernetes": "NodeInternalIP" });
+        }
+        NodeAddressAutodetectionMethod::Cidrs => {
+            if !calico.node_address_autodetection_v6_cidrs.is_empty() {
+                calico_network["nodeAddressAutodetectionV6"] = serde_json::json!({
+                    "cidrs": calico.node_address_autodetection_v6_cidrs,
+                });
+            }
+        }
     }
 
     serde_json::json!({
@@ -357,6 +366,31 @@ mod tests {
         assert!(values["installation"]["calicoNetwork"]
             .get("nodeAddressAutodetectionV6")
             .is_none());
+    }
+
+    #[test]
+    fn kubernetes_internal_ip_renders_the_operators_kubernetes_method() {
+        let mut spec = sample_spec();
+        spec.node_address_autodetection_v6_cidrs = vec![];
+        spec.node_address_autodetection_v6_method =
+            crate::crd::NodeAddressAutodetectionMethod::KubernetesInternalIp;
+
+        let values = build_values(&spec);
+
+        assert_eq!(
+            values["installation"]["calicoNetwork"]["nodeAddressAutodetectionV6"],
+            serde_json::json!({ "kubernetes": "NodeInternalIP" })
+        );
+    }
+
+    #[test]
+    fn the_default_method_still_renders_the_cidrs() {
+        let values = build_values(&sample_spec());
+
+        assert_eq!(
+            values["installation"]["calicoNetwork"]["nodeAddressAutodetectionV6"],
+            serde_json::json!({ "cidrs": ["fd97:45c2:b3a1:179::/64"] })
+        );
     }
 
     #[test]

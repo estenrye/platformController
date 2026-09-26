@@ -1,5 +1,5 @@
 use crate::cidr::{self, Family};
-use crate::crd::{CalicoSpec, Encapsulation};
+use crate::crd::{CalicoSpec, Encapsulation, NodeAddressAutodetectionMethod};
 use std::collections::HashSet;
 use std::net::IpAddr;
 
@@ -33,6 +33,11 @@ pub enum SpecError {
     AutodetectionNotIpv6(String),
     #[error("ipPool {0:?}: IPIP encapsulation is not supported on IPv6 pools")]
     IpipOnIpv6(String),
+    #[error(
+        "nodeAddressAutodetectionV6Method kubernetesInternalIP cannot be combined with \
+         nodeAddressAutodetectionV6Cidrs: Calico accepts only one autodetection method"
+    )]
+    AutodetectionMethodConflict,
 }
 
 impl SpecError {
@@ -47,6 +52,7 @@ impl SpecError {
             SpecError::BgpRequiresBgpEnabled => "InvalidBgpConfig",
             SpecError::DuplicateName { .. } => "DuplicateName",
             SpecError::IpipOnIpv6(_) => "InvalidEncapsulation",
+            SpecError::AutodetectionMethodConflict => "InvalidAutodetection",
         }
     }
 }
@@ -125,6 +131,12 @@ pub fn validate_calico(calico: &CalicoSpec) -> Result<(), SpecError> {
         }
     }
 
+    if calico.node_address_autodetection_v6_method == NodeAddressAutodetectionMethod::KubernetesInternalIp
+        && !calico.node_address_autodetection_v6_cidrs.is_empty()
+    {
+        return Err(SpecError::AutodetectionMethodConflict);
+    }
+
     for entry in &calico.node_address_autodetection_v6_cidrs {
         if cidr::parse(entry)?.family() != Family::V6 {
             return Err(SpecError::AutodetectionNotIpv6(entry.clone()));
@@ -189,6 +201,7 @@ mod tests {
             api_server_enabled: true,
             ip_pools: vec![pool("pods-v6", "fd00:db8:0:1100::/56")],
             node_address_autodetection_v6_cidrs: vec!["fd00:db8:0:179::/64".to_string()],
+            node_address_autodetection_v6_method: Default::default(),
             bgp: Some(bgp()),
             load_balancer_pools: vec![lb_pool("lb-internal-routed", "fd00:db8:0:f00::/112")],
         }
@@ -361,5 +374,27 @@ mod tests {
         };
 
         assert_eq!(validate_calico(&spec), Err(SpecError::MixedAddressFamilies));
+    }
+
+    #[test]
+    fn kubernetes_internal_ip_conflicts_with_autodetection_cidrs() {
+        let mut spec = valid_ipv6();
+        spec.node_address_autodetection_v6_method =
+            crate::crd::NodeAddressAutodetectionMethod::KubernetesInternalIp;
+
+        let err = validate_calico(&spec).expect_err("Calico takes one autodetection method");
+
+        assert_eq!(err, SpecError::AutodetectionMethodConflict);
+        assert_eq!(err.reason(), "InvalidAutodetection");
+    }
+
+    #[test]
+    fn kubernetes_internal_ip_without_cidrs_is_valid() {
+        let mut spec = valid_ipv6();
+        spec.node_address_autodetection_v6_method =
+            crate::crd::NodeAddressAutodetectionMethod::KubernetesInternalIp;
+        spec.node_address_autodetection_v6_cidrs = vec![];
+
+        assert_eq!(validate_calico(&spec), Ok(()));
     }
 }

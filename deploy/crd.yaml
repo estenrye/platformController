@@ -143,9 +143,24 @@ spec:
                     type: array
                   nodeAddressAutodetectionV6Cidrs:
                     default: []
+                    description: |-
+                      IPv6 CIDRs whose addresses Calico may use as a node's address. Only
+                      used with the `cidrs` method; the `/64` you list must carry nothing
+                      else (no SLAAC addresses, no floating VIP), or Calico can pick the wrong
+                      address.
                     items:
                       type: string
                     type: array
+                  nodeAddressAutodetectionV6Method:
+                    default: cidrs
+                    description: |-
+                      How Calico detects a node's IPv6 address. `cidrs` (the default) uses
+                      `nodeAddressAutodetectionV6Cidrs`; `kubernetesInternalIP` uses each
+                      node's Kubernetes InternalIP and cannot be combined with a CIDR list.
+                    enum:
+                    - cidrs
+                    - kubernetesInternalIP
+                    type: string
                 required:
                 - chartVersion
                 type: object
