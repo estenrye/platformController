@@ -86,9 +86,80 @@ pub enum CacheReconcileError {
     NotLeader,
 }
 
+impl CacheReconcileError {
+    /// The `status.conditions[].reason` to report for a failed reconcile, or
+    /// `None` when this error must not overwrite status: `Validation` already
+    /// wrote its own, a failed `Status` write cannot be reported through
+    /// status, and a standby (`NotLeader`) must never write status.
+    ///
+    /// Exhaustive on purpose: a new variant forces a decision here.
+    pub fn failure_reason(&self) -> Option<&'static str> {
+        match self {
+            CacheReconcileError::Helm(_) => Some("RenderFailed"),
+            CacheReconcileError::Manifest(_) => Some("InvalidManifest"),
+            CacheReconcileError::Apply(_) => Some("ApplyFailed"),
+            CacheReconcileError::Validation(_)
+            | CacheReconcileError::Status(_)
+            | CacheReconcileError::NotLeader => None,
+        }
+    }
+}
+
+/// Runs one reconcile. A failure after validation is written to `status` (with
+/// a reason and the ledger of everything that may exist) before the original
+/// error is returned, so `error_policy` and the log behave as before.
 pub async fn reconcile(
     obj: Arc<PullThroughCache>,
     ctx: Arc<Context>,
+) -> Result<Action, CacheReconcileError> {
+    let mut progress = crate::ledger::ReconcileProgress::default();
+    let result = reconcile_inner(obj.clone(), ctx.clone(), &mut progress).await;
+    if let Err(err) = &result
+        && let Some(reason) = err.failure_reason()
+    {
+        record_failure(&obj, &ctx, &progress, reason, &err.to_string()).await;
+    }
+    result
+}
+
+/// Best effort: a failed status write is logged and never replaces the
+/// reconcile's own error.
+async fn record_failure(
+    obj: &PullThroughCache,
+    ctx: &Context,
+    progress: &crate::ledger::ReconcileProgress,
+    reason: &str,
+    message: &str,
+) {
+    let name = obj.name_any();
+    let api: kube::Api<PullThroughCache> = kube::Api::all(ctx.client.clone());
+    let previous = obj
+        .status
+        .as_ref()
+        .map(|status| status.applied_resources.clone())
+        .unwrap_or_default();
+    let ledger = crate::ledger::failure_ledger(&previous, progress.desired.as_deref());
+
+    if let Err(err) = update_status(
+        &api,
+        &name,
+        Phase::Failed,
+        obj.metadata.generation,
+        &obj.spec.spegel.chart_version,
+        &ledger,
+        reason,
+        message,
+    )
+    .await
+    {
+        tracing::warn!(cache = %name, error = %err, "failed to record failure status");
+    }
+}
+
+async fn reconcile_inner(
+    obj: Arc<PullThroughCache>,
+    ctx: Arc<Context>,
+    progress: &mut crate::ledger::ReconcileProgress,
 ) -> Result<Action, CacheReconcileError> {
     if let Some(action) = leader_gate(&ctx.is_leader) {
         return Ok(action);
@@ -142,6 +213,28 @@ pub async fn reconcile(
         "parsed and sorted rendered manifests"
     );
 
+    // Everything this reconcile will apply is known now. Persist it before the
+    // first apply so a failure, a crash or a leader change can never leave an
+    // applied object out of the ledger cleanup acts on. Steady-state resyncs
+    // add nothing, so they write nothing.
+    let mut desired = vec![crate::apply::resource_ref(&spegel_namespace_object())];
+    desired.extend(objects.iter().map(crate::apply::resource_ref));
+    progress.desired = Some(desired.clone());
+    if let Some(ledger) = crate::ledger::checkpoint_ledger(&previous, &desired) {
+        tracing::info!(entries = ledger.len(), "checkpointing ledger before applying");
+        update_status(
+            &api,
+            &name,
+            Phase::Installing,
+            obj.metadata.generation,
+            &chart_version,
+            &ledger,
+            "Applying",
+            "applying manifests",
+        )
+        .await?;
+    }
+
     let mut applied = Vec::new();
 
     // The chart has no Namespace object of its own; create the target namespace
@@ -178,6 +271,10 @@ pub async fn reconcile(
         tracing::info!(pruned_count, "pruned resources no longer rendered");
     }
 
+    debug_assert!(
+        applied.iter().all(|reference| desired.contains(reference)),
+        "applied an object that was not in the checkpointed ledger"
+    );
     tracing::info!(cache = %name, phase = ?Phase::Ready, "updating status");
     update_status(
         &api,
@@ -364,5 +461,48 @@ mod tests {
         assert_eq!(reference.kind, "Namespace");
         assert_eq!(reference.name, "spegel");
         assert_eq!(reference.namespace, "");
+    }
+
+    #[test]
+    fn helm_errors_report_render_failed() {
+        let err = CacheReconcileError::Helm(crate::helm::HelmError::WriteValues(
+            std::io::Error::other("boom"),
+        ));
+
+        assert_eq!(err.failure_reason(), Some("RenderFailed"));
+    }
+
+    #[test]
+    fn manifest_errors_report_invalid_manifest() {
+        let source = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let err = CacheReconcileError::Manifest(crate::manifests::ManifestError::Json {
+            index: 0,
+            source,
+        });
+
+        assert_eq!(err.failure_reason(), Some("InvalidManifest"));
+    }
+
+    #[test]
+    fn apply_errors_report_apply_failed() {
+        let err = CacheReconcileError::Apply(crate::apply::ApplyError::NotDeleted {
+            kind: "Namespace".to_string(),
+            name: "spegel".to_string(),
+            timeout: std::time::Duration::from_secs(1),
+        });
+
+        assert_eq!(err.failure_reason(), Some("ApplyFailed"));
+    }
+
+    #[test]
+    fn validation_and_leadership_errors_do_not_overwrite_status() {
+        // Validation already writes its own Failed status; a standby must never
+        // write status at all.
+        let validation = CacheReconcileError::Validation(ValidationError::UnsupportedName(
+            "second".to_string(),
+        ));
+
+        assert_eq!(validation.failure_reason(), None);
+        assert_eq!(CacheReconcileError::NotLeader.failure_reason(), None);
     }
 }
