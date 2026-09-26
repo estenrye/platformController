@@ -72,10 +72,7 @@ kubectl -n platform-system logs deploy/platform-controller -f
 A `KindNotAvailable` failure after 180s means the operator never registered
 the CRDs: check `kubectl -n tigera-operator logs deploy/tigera-operator`.
 
-`status.appliedResources` is only written after every phase succeeds. If a
-first install fails partway (for example `KindNotAvailable`) and the CR is then
-deleted, cleanup sees an empty ledger and may leave the `tigera-operator`
-namespace, its RBAC and its Deployment behind; remove them by hand.
+`status.appliedResources` is checkpointed before anything is applied (see docs/superpowers/specs/2026-09-25-reconciler-status-and-ledger-design.md), so a first install that fails partway (for example `KindNotAvailable`) and is then deleted is cleaned up like any other install. A failure after validation also appears on the resource: `kubectl get cni default -o jsonpath='{.status.phase}{" "}{.status.conditions[0].reason}{"\n"}'` shows `Failed` with `RenderFailed`, `InvalidManifest` or `ApplyFailed`. Note: this behavior is implemented but not yet live-verified; record the outcome here after the acceptance run.
 
 ## 2. Open verification items
 
