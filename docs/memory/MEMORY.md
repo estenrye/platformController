@@ -2,3 +2,4 @@
 - [Calico-Talos MVP status](calico-talos-mvp-2026-09.md) — first vertical slice of goals.md's vision, PR #2 open, worktree calico-talos-mvp
 - [Wait for CRD Established](wait-for-crd-established.md) — fixed CRD-registration race; every networked poll here must use tokio::time::timeout_at, not a bare await
 - [IPv6-only Calico slice](ipv6-only-calico-2026-09.md) — typed bgp/loadBalancerPools; chart v3.32.1 ships no CRDs so reconcile waits for kinds; pools need matching names; live-verified, cleanup order and pool sweep
+- [PullThroughCache (Spegel) slice](pull-through-cache-2026-09.md) — second CRD beside CniInstallation; OCI chart tag has no v, helm prints Pulled:/Digest: to stdout, omitted registries mirrors everything, post-delete hook not run under --no-hooks
