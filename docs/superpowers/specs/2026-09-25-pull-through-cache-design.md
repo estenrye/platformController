@@ -138,7 +138,7 @@ Confirmed against a real render of chart `0.7.4`: the value names `spegel.mirror
 
 Still unverified:
 
-- Peer-to-peer serving. It needs at least two nodes (Spegel never became Ready on the single node) and the Talos machine-config prerequisite.
+- Peer-to-peer serving beyond one image on one pair of nodes: verified once on a six-node cluster (see the memory entry `pull-through-cache-2026-09`), with the equivalent manual DaemonSet patch for the IPv6 bug below.
 - That the Talos machine-config patch above is sufficient on the Talos version in use.
-- IPv6 mirror-target correctness: the DaemonSet passes `--mirror-targets http://$(NODE_IP):30020` and on an IPv6-only cluster `NODE_IP` is an IPv6 address, so the URL is unbracketed. The init container still exited 0, but whether the resulting mirror config is correct on IPv6 was not verified.
+- The controller-side IPv6 fix (`drop_unbracketed_node_ip_mirror_targets`) running against a cluster. It is covered by unit tests and a real-chart test; the underlying bug is verified: Spegel brackets only the first `--mirror-targets` value, so chart 0.7.x's second (NodePort) target makes containerd reject the registry's whole `hosts.toml` on IPv6 nodes.
 - Whether Spegel's mirror config files remain on nodes after delete.

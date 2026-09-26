@@ -158,6 +158,76 @@ pub fn validate_spegel(spegel: &SpegelSpec) -> Result<(), CacheSpecError> {
     Ok(())
 }
 
+/// The chart builds mirror targets from the node's IP, e.g. `http://$(NODE_IP):30021`.
+const NODE_IP_TARGET_PREFIX: &str = "http://$(NODE_IP):";
+
+/// Removes every chart-generated `$(NODE_IP)` mirror target that follows the
+/// first one, from each container of each `DaemonSet`; returns how many.
+///
+/// Spegel brackets only the *first* `--mirror-targets` value for IPv6
+/// (`EncapsulateIPv6Host(args.MirrorTargets[0])`, `main.go`). Chart 0.7.x passes a
+/// hostPort target and then a NodePort target, so on an IPv6 node the second is
+/// written unbracketed (`http://fd00::227:30021`). containerd cannot parse it and
+/// rejects the registry's whole `hosts.toml`, so the mirror is never used. The
+/// NodePort target is only a fallback for the hostPort one. Chart 0.8.x emits a
+/// single target, which is first and therefore bracketed, so it is left alone, as
+/// are literal targets from `spegel.additionalMirrorTargets`.
+pub fn drop_unbracketed_node_ip_mirror_targets(objects: &mut [kube::api::DynamicObject]) -> usize {
+    let mut removed = 0;
+    for object in objects.iter_mut() {
+        if object.types.as_ref().map(|types| types.kind.as_str()) != Some("DaemonSet") {
+            continue;
+        }
+        for section in ["initContainers", "containers"] {
+            let Some(containers) = object
+                .data
+                .pointer_mut(&format!("/spec/template/spec/{section}"))
+                .and_then(|value| value.as_array_mut())
+            else {
+                continue;
+            };
+            for container in containers {
+                if let Some(args) = container.get_mut("args").and_then(|value| value.as_array_mut()) {
+                    removed += drop_extra_node_ip_targets(args);
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Within the values following `--mirror-targets` (up to the next flag), removes
+/// every `$(NODE_IP)` target except the first value.
+fn drop_extra_node_ip_targets(args: &mut Vec<serde_json::Value>) -> usize {
+    let Some(flag) = args
+        .iter()
+        .position(|arg| arg.as_str() == Some("--mirror-targets"))
+    else {
+        return 0;
+    };
+    let first_value = flag + 1;
+    let mut end = args[first_value..]
+        .iter()
+        .position(|arg| arg.as_str().is_some_and(|value| value.starts_with("--")))
+        .map_or(args.len(), |offset| first_value + offset);
+
+    let mut removed = 0;
+    let mut index = first_value + 1;
+    while index < end {
+        if args[index]
+            .as_str()
+            .is_some_and(|value| value.starts_with(NODE_IP_TARGET_PREFIX))
+        {
+            args.remove(index);
+            end -= 1;
+            removed += 1;
+        } else {
+            index += 1;
+        }
+    }
+    removed
+}
+
 /// Recursively merges `overlay` into `base`; on a conflict the overlay wins.
 fn merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
     match (base, overlay) {
@@ -497,6 +567,137 @@ mod tests {
         assert!(
             yaml.contains("x-kubernetes-preserve-unknown-fields: true"),
             "helmValues must be a structural, unknown-field-preserving object:\n{yaml}"
+        );
+    }
+
+    fn daemon_set(args: serde_json::Value) -> kube::api::DynamicObject {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "spegel", "namespace": "spegel" },
+            "spec": { "template": { "spec": {
+                "initContainers": [{ "name": "configuration", "args": args }],
+                "containers": [{ "name": "registry", "args": ["registry", "--registry-addr=:5000"] }]
+            }}}
+        }))
+        .expect("DaemonSet fixture should deserialize")
+    }
+
+    fn init_args(object: &kube::api::DynamicObject) -> Vec<String> {
+        object.data["spec"]["template"]["spec"]["initContainers"][0]["args"]
+            .as_array()
+            .expect("args is an array")
+            .iter()
+            .map(|a| a.as_str().expect("args are strings").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn drops_the_node_port_target_that_follows_the_first_one() {
+        // Chart 0.7.x: a hostPort target, then a NodePort target. Spegel brackets
+        // only the first, so on IPv6 the second makes containerd reject the whole
+        // hosts.toml.
+        let mut objects = vec![daemon_set(serde_json::json!([
+            "configuration",
+            "--mirror-targets",
+            "http://$(NODE_IP):30020",
+            "http://$(NODE_IP):30021",
+            "--resolve-tags=true"
+        ]))];
+
+        let removed = drop_unbracketed_node_ip_mirror_targets(&mut objects);
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            init_args(&objects[0]),
+            vec![
+                "configuration",
+                "--mirror-targets",
+                "http://$(NODE_IP):30020",
+                "--resolve-tags=true"
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_a_sole_node_ip_target() {
+        // Chart 0.8.x: the NodePort target is the only one, so Spegel brackets it.
+        let args = serde_json::json!([
+            "configuration",
+            "--mirror-targets",
+            "http://$(NODE_IP):30021",
+            "--resolve-tags=true"
+        ]);
+        let mut objects = vec![daemon_set(args)];
+
+        assert_eq!(drop_unbracketed_node_ip_mirror_targets(&mut objects), 0);
+        assert_eq!(init_args(&objects[0]).len(), 4);
+    }
+
+    #[test]
+    fn keeps_additional_literal_mirror_targets() {
+        let mut objects = vec![daemon_set(serde_json::json!([
+            "--mirror-targets",
+            "http://$(NODE_IP):30020",
+            "http://$(NODE_IP):30021",
+            "https://mirror.example.com:5000"
+        ]))];
+
+        assert_eq!(drop_unbracketed_node_ip_mirror_targets(&mut objects), 1);
+        assert_eq!(
+            init_args(&objects[0]),
+            vec![
+                "--mirror-targets",
+                "http://$(NODE_IP):30020",
+                "https://mirror.example.com:5000"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_touches_the_mirror_targets_list() {
+        // A later flag's value that happens to look like a target is not ours.
+        let mut objects = vec![daemon_set(serde_json::json!([
+            "--mirror-targets",
+            "http://$(NODE_IP):30020",
+            "--other",
+            "http://$(NODE_IP):9999"
+        ]))];
+
+        assert_eq!(drop_unbracketed_node_ip_mirror_targets(&mut objects), 0);
+        assert_eq!(init_args(&objects[0]).len(), 4);
+    }
+
+    #[test]
+    fn leaves_other_objects_and_containers_without_the_flag_alone() {
+        let service: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "spegel-registry" },
+            "spec": { "ports": [{ "nodePort": 30021 }] }
+        }))
+        .expect("Service fixture should deserialize");
+        let mut objects = vec![service.clone(), daemon_set(serde_json::json!(["registry"]))];
+
+        assert_eq!(drop_unbracketed_node_ip_mirror_targets(&mut objects), 0);
+        assert_eq!(objects[0].data, service.data);
+        assert_eq!(init_args(&objects[1]), vec!["registry"]);
+    }
+
+    #[test]
+    fn applies_to_every_container_carrying_the_flag() {
+        let mut object = daemon_set(serde_json::json!(["configuration"]));
+        object.data["spec"]["template"]["spec"]["containers"][0]["args"] = serde_json::json!([
+            "--mirror-targets",
+            "http://$(NODE_IP):30020",
+            "http://$(NODE_IP):30021"
+        ]);
+        let mut objects = vec![object];
+
+        assert_eq!(drop_unbracketed_node_ip_mirror_targets(&mut objects), 1);
+        assert_eq!(
+            objects[0].data["spec"]["template"]["spec"]["containers"][0]["args"],
+            serde_json::json!(["--mirror-targets", "http://$(NODE_IP):30020"])
         );
     }
 }

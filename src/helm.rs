@@ -487,6 +487,37 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn spegel_0_7_4_keeps_exactly_one_mirror_target_after_the_ipv6_patch() {
+        let spegel = crate::pull_through_cache::SpegelSpec {
+            chart_version: "0.7.4".to_string(),
+            ..Default::default()
+        };
+        let values = crate::pull_through_cache::build_values(&spegel);
+        let rendered = render_chart(&SPEGEL_CHART, &spegel.chart_version, &values)
+            .await
+            .expect("helm template should succeed");
+        let mut objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
+
+        // Chart 0.7.4 emits a hostPort target and a NodePort target.
+        let removed = crate::pull_through_cache::drop_unbracketed_node_ip_mirror_targets(&mut objects);
+
+        assert_eq!(removed, 1);
+        let daemon_set = objects
+            .iter()
+            .find(|o| o.types.as_ref().is_some_and(|t| t.kind == "DaemonSet"))
+            .expect("the chart renders a DaemonSet");
+        let args: Vec<&str> = daemon_set.data["spec"]["template"]["spec"]["initContainers"][0]["args"]
+            .as_array()
+            .expect("args is an array")
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+        let targets: Vec<&&str> = args.iter().filter(|a| a.starts_with("http://$(NODE_IP):")).collect();
+        assert_eq!(targets, vec![&"http://$(NODE_IP):30020"], "{args:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
     async fn v3_32_1_chart_ships_no_crds() {
         let spec = crate::crd::CalicoSpec {
             chart_version: "v3.32.1".to_string(),

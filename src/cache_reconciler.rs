@@ -208,6 +208,13 @@ async fn reconcile_inner(
 
     let mut objects = crate::manifests::parse_manifests(&rendered)?;
     crate::manifests::sort_manifests(&mut objects);
+    let dropped = crate::pull_through_cache::drop_unbracketed_node_ip_mirror_targets(&mut objects);
+    if dropped > 0 {
+        tracing::info!(
+            dropped,
+            "dropped chart mirror targets that containerd cannot parse on IPv6 nodes"
+        );
+    }
     tracing::info!(
         object_count = objects.len(),
         "parsed and sorted rendered manifests"
