@@ -3,3 +3,4 @@
 - [Wait for CRD Established](wait-for-crd-established.md) — fixed CRD-registration race; every networked poll here must use tokio::time::timeout_at, not a bare await
 - [IPv6-only Calico slice](ipv6-only-calico-2026-09.md) — typed bgp/loadBalancerPools; chart v3.32.1 ships no CRDs so reconcile waits for kinds; pools need matching names; live-verified, cleanup order and pool sweep
 - [PullThroughCache (Spegel) slice](pull-through-cache-2026-09.md) — second CRD beside CniInstallation; OCI chart tag has no v, helm prints Pulled:/Digest: to stdout, omitted registries mirrors everything, post-delete hook not run under --no-hooks
+- [CloudControllerManager (OpenStack) slice](cloud-controller-manager-2026-09.md) — third CRD; chart 2.36.5 facts (no Secret rendered, key cloud.conf, hostPath volumes overridden); controller Deployment needs the uninitialized-taint toleration; nothing live-verified yet
