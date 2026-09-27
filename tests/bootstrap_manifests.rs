@@ -35,7 +35,7 @@ fn example_cni_installation_yaml_defines_a_single_cni_installation() {
 }
 
 #[test]
-fn crd_yaml_defines_both_platform_resources() {
+fn crd_yaml_defines_all_platform_resources() {
     let content = std::fs::read_to_string("deploy/crd.yaml")
         .expect("deploy/crd.yaml should exist; run `cargo run -q --bin crdgen > deploy/crd.yaml`");
     let objects = parse_manifests(&content).expect("crd.yaml should be valid YAML");
@@ -53,6 +53,7 @@ fn crd_yaml_defines_both_platform_resources() {
         vec![
             "cniinstallations.platform.rye.ninja",
             "pullthroughcaches.platform.rye.ninja",
+            "cloudcontrollermanagers.platform.rye.ninja",
         ]
     );
 }

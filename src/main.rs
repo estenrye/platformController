@@ -1,6 +1,8 @@
 use futures::StreamExt;
 use kube::runtime::{predicates, reflector, watcher, Controller, Predicate, WatchStreamExt};
 use kube::{Api, Client, Resource};
+use platform_controller::ccm_reconciler;
+use platform_controller::cloud_controller_manager::CloudControllerManager;
 use platform_controller::crd::CniInstallation;
 use platform_controller::leader;
 use platform_controller::pull_through_cache::PullThroughCache;
@@ -106,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         .run(
             cache_reconciler::reconcile_with_finalizer,
             cache_reconciler::error_policy,
-            context,
+            context.clone(),
         )
         .for_each(|result| async move {
             match result {
@@ -115,11 +117,40 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+    // The cloud controller manager gets its own watcher, store and Controller
+    // too, with the same predicate filter and the same Context (one leader lease).
+    let ccm_api: Api<CloudControllerManager> = Api::all(client.clone());
+    let (ccm_reader, ccm_writer) = reflector::store();
+    let managers = watcher(ccm_api, watcher::Config::default())
+        .default_backoff()
+        .reflect(ccm_writer)
+        .applied_objects()
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
+
+    let ccm_controller = Controller::for_stream(managers, ccm_reader)
+        .run(
+            ccm_reconciler::reconcile_with_finalizer,
+            ccm_reconciler::error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok(action) => tracing::debug!(?action, "reconciled cloud controller manager"),
+                Err(err) => tracing::error!(error = %err, "cloud controller manager reconcile failed"),
+            }
+        });
+
     let mut sigterm = signal(SignalKind::terminate())?;
 
     tokio::select! {
         _ = controller => {}
         _ = cache_controller => {}
+        _ = ccm_controller => {}
         // `leader::run` loops forever, so this branch only resolves if it
         // panicked. Exit non-zero and let Kubernetes restart the pod rather than
         // limp on with a permanently stale `is_leader` flag.
@@ -207,5 +238,28 @@ mod tests {
         .expect("cache should deserialize");
 
         assert_eq!(deletion_requested(&cache), Some(1));
+    }
+
+    #[test]
+    fn deletion_requested_works_for_the_cloud_controller_manager_kind_too() {
+        let ccm: CloudControllerManager = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "CloudControllerManager",
+            "metadata": {
+                "name": "default",
+                "deletionTimestamp": "2026-09-26T00:00:00Z"
+            },
+            "spec": {
+                "platformKind": "talos-linux",
+                "provider": "openstack",
+                "openstack": {
+                    "chartVersion": "2.36.5",
+                    "cloudConfigSecretRef": { "name": "cloud-config" }
+                }
+            }
+        }))
+        .expect("ccm should deserialize");
+
+        assert_eq!(deletion_requested(&ccm), Some(1));
     }
 }
