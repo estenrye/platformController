@@ -12,6 +12,14 @@ pub const CALICO_CHART_REPO: &str = "https://docs.tigera.io/calico/charts";
 /// tigera-operator, the chart renders no `Namespace` object of its own.
 pub const SPEGEL_NAMESPACE: &str = "spegel";
 
+/// Namespace the OpenStack cloud-controller-manager chart is released into. The
+/// namespace already exists and Talos's default admission configuration exempts
+/// it from Pod Security, so unlike Spegel no namespace is synthesized.
+pub const CCM_NAMESPACE: &str = "kube-system";
+
+/// The Helm repository the OpenStack cloud-controller-manager chart is fetched from.
+pub const OPENSTACK_CCM_CHART_REPO: &str = "https://kubernetes.github.io/cloud-provider-openstack";
+
 /// Where a Helm chart is fetched from. The two forms invoke `helm template`
 /// differently.
 pub enum ChartSource {
@@ -43,6 +51,17 @@ pub const SPEGEL_CHART: ChartRef = ChartRef {
         reference: "oci://ghcr.io/spegel-org/helm-charts/spegel",
     },
     namespace: SPEGEL_NAMESPACE,
+};
+
+/// The release name is part of the DaemonSet's immutable `selector` (the chart
+/// labels pods `release: <name>`), so it must never change for an installed cluster.
+pub const OPENSTACK_CCM_CHART: ChartRef = ChartRef {
+    release: "openstack-ccm",
+    source: ChartSource::Repo {
+        url: OPENSTACK_CCM_CHART_REPO,
+        chart: "openstack-cloud-controller-manager",
+    },
+    namespace: CCM_NAMESPACE,
 };
 
 pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
@@ -336,6 +355,31 @@ mod tests {
     }
 
     #[test]
+    fn openstack_ccm_render_args_use_the_repo_form_and_kube_system() {
+        let path = std::path::Path::new("/tmp/values.yaml");
+        let args = render_args(&OPENSTACK_CCM_CHART, "2.36.5", path);
+
+        assert_eq!(
+            args,
+            vec![
+                "template".to_string(),
+                "openstack-ccm".to_string(),
+                "--repo".to_string(),
+                "https://kubernetes.github.io/cloud-provider-openstack".to_string(),
+                "openstack-cloud-controller-manager".to_string(),
+                "--version".to_string(),
+                "2.36.5".to_string(),
+                "--values".to_string(),
+                "/tmp/values.yaml".to_string(),
+                "--include-crds".to_string(),
+                "--no-hooks".to_string(),
+                "--namespace".to_string(),
+                "kube-system".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn strips_the_oci_pull_progress_lines_before_the_first_manifest() {
         let output = "Pulled: ghcr.io/spegel-org/helm-charts/spegel:0.7.4\n\
                       Digest: sha256:abc\n\
@@ -482,6 +526,56 @@ mod tests {
         // Spegel requires URLs; the entries reach the DaemonSet args unchanged.
         assert!(rendered.contains("- \"https://docker.io\""), "{rendered}");
         // --no-hooks: the post-delete cleanup hook must not be rendered as live objects.
+        assert!(!rendered.contains("helm.sh/hook"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn openstack_ccm_chart_renders_the_shape_the_spec_relies_on() {
+        let openstack = crate::cloud_controller_manager::OpenstackSpec {
+            chart_version: "2.36.5".to_string(),
+            cloud_config_secret_ref: crate::cloud_controller_manager::SecretNameRef {
+                name: "my-cloud-config".to_string(),
+            },
+            ..Default::default()
+        };
+        let values = crate::cloud_controller_manager::build_values(&openstack);
+
+        let rendered = render_chart(&OPENSTACK_CCM_CHART, &openstack.chart_version, &values)
+            .await
+            .expect("helm template should succeed");
+        let objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
+
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|o| o.types.as_ref().expect("every rendered object has a type").kind.as_str())
+            .collect();
+        // The controller never creates the credentials Secret; the user does.
+        assert!(!kinds.contains(&"Secret"), "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|kind| **kind == "DaemonSet").count(), 1, "{kinds:?}");
+
+        let daemon_set = objects
+            .iter()
+            .find(|o| o.types.as_ref().unwrap().kind == "DaemonSet")
+            .expect("one DaemonSet");
+        assert_eq!(daemon_set.metadata.namespace.as_deref(), Some("kube-system"));
+
+        // Only the cloud-config Secret volume remains: the hostPath mounts are gone.
+        let volumes = daemon_set
+            .data
+            .pointer("/spec/template/spec/volumes")
+            .and_then(|value| value.as_array())
+            .expect("the DaemonSet has volumes");
+        assert_eq!(volumes.len(), 1, "{volumes:?}");
+        assert_eq!(volumes[0]["secret"]["secretName"], "my-cloud-config");
+        assert!(!rendered.contains("hostPath"), "{rendered}");
+
+        // The chart reads the config from the `cloud.conf` key of that Secret, and
+        // its Role is scoped to the same name.
+        assert!(rendered.contains("/etc/config/cloud.conf"), "{rendered}");
+        assert!(rendered.contains("- my-cloud-config"), "{rendered}");
+
+        // --no-hooks: no hook objects are rendered as live objects.
         assert!(!rendered.contains("helm.sh/hook"));
     }
 
