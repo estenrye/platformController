@@ -76,6 +76,12 @@ pub enum CcmSpecError {
     InvalidSecretName(String),
     #[error("spec.openstack.helmValues must be a JSON object")]
     HelmValuesNotObject,
+    #[error(
+        "spec.openstack.helmValues must not set cloudConfig or cloudConfigContents: \
+         secret.create is always false, so the chart never renders a Secret from them and \
+         they have no effect; use spec.openstack.cloudConfigSecretRef instead"
+    )]
+    CloudConfigInHelmValues,
 }
 
 impl CcmSpecError {
@@ -86,7 +92,9 @@ impl CcmSpecError {
                 "InvalidChartVersion"
             }
             CcmSpecError::InvalidSecretName(_) => "InvalidSecretRef",
-            CcmSpecError::HelmValuesNotObject => "InvalidHelmValues",
+            CcmSpecError::HelmValuesNotObject | CcmSpecError::CloudConfigInHelmValues => {
+                "InvalidHelmValues"
+            }
         }
     }
 }
@@ -122,10 +130,13 @@ pub fn validate_openstack(openstack: &OpenstackSpec) -> Result<(), CcmSpecError>
             openstack.cloud_config_secret_ref.name.clone(),
         ));
     }
-    if let Some(values) = &openstack.helm_values
-        && !values.is_object()
-    {
-        return Err(CcmSpecError::HelmValuesNotObject);
+    if let Some(values) = &openstack.helm_values {
+        if !values.is_object() {
+            return Err(CcmSpecError::HelmValuesNotObject);
+        }
+        if values.get("cloudConfig").is_some() || values.get("cloudConfigContents").is_some() {
+            return Err(CcmSpecError::CloudConfigInHelmValues);
+        }
     }
     Ok(())
 }
@@ -138,6 +149,14 @@ pub fn validate_openstack(openstack: &OpenstackSpec) -> Result<(), CcmSpecError>
 ///   `/etc/kubernetes/pki` and the kubelet flexvolume directory. The CCM uses
 ///   in-cluster config and needs neither, and Talos provides neither, so they
 ///   are always emptied (a user's own `extraVolumes` is overridden too).
+/// - `dnsPolicy` defaults (with the chart's own `hostNetwork: true`) to
+///   `ClusterFirstWithHostNet`, which points the pod at the cluster DNS service
+///   IP. That IP is unreachable before a CNI is up, and CoreDNS itself cannot
+///   schedule until the CCM clears the `uninitialized` taint from every node --
+///   the same deadlock `deploy/bootstrap.yaml` already documents for this
+///   controller's own Deployment. `Default` (inheriting the node's resolv.conf)
+///   is set unconditionally, so a `helmValues` passthrough can never reintroduce
+///   the deadlock.
 pub fn build_values(openstack: &OpenstackSpec) -> serde_json::Value {
     let mut values = openstack
         .helm_values
@@ -152,6 +171,7 @@ pub fn build_values(openstack: &OpenstackSpec) -> serde_json::Value {
         },
         "extraVolumes": [],
         "extraVolumeMounts": [],
+        "dnsPolicy": "Default",
     });
 
     crate::pull_through_cache::merge(&mut values, typed);
@@ -300,6 +320,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cloud_config_smuggled_through_helm_values() {
+        // secret.create is always forced to false, so the chart's Secret
+        // template (guarded by `if and .Values.secret.create .Values.secret.enabled`)
+        // never renders: cloudConfig/cloudConfigContents have no effect on the
+        // running CCM. A user who follows them would have their OpenStack
+        // credentials sit, with no effect, in a cluster-scoped CR that is not a
+        // Secret. Reject them outright rather than silently ignoring them.
+        for key in ["cloudConfig", "cloudConfigContents"] {
+            let mut spec = openstack();
+            spec.helm_values = Some(serde_json::json!({ key: "[Global]\nauth-url=..." }));
+
+            let err = validate_openstack(&spec).expect_err("cloudConfig via helmValues is invalid");
+
+            assert_eq!(err, CcmSpecError::CloudConfigInHelmValues, "{key}");
+            assert_eq!(err.reason(), "InvalidHelmValues");
+        }
+    }
+
+    #[test]
+    fn accepts_helm_values_that_do_not_touch_cloud_config() {
+        let mut spec = openstack();
+        spec.helm_values = Some(serde_json::json!({ "cluster": { "name": "prod" } }));
+
+        assert_eq!(validate_openstack(&spec), Ok(()));
+    }
+
+    #[test]
     fn values_point_the_chart_at_the_existing_secret_and_never_create_one() {
         let values = build_values(&openstack());
 
@@ -317,12 +364,28 @@ mod tests {
     }
 
     #[test]
+    fn values_always_use_the_default_dns_policy() {
+        // The chart defaults to hostNetwork: true with dnsPolicy:
+        // ClusterFirstWithHostNet, which points the pod at the cluster DNS
+        // service IP. That IP is unreachable before a CNI is up, and CoreDNS
+        // itself cannot schedule until the CCM clears the uninitialized taint
+        // from every node -- a deadlock identical to the one deploy/bootstrap.yaml
+        // already documents for this controller's own Deployment. `Default`
+        // inherits the node's resolv.conf, which resolves the cloud's Keystone
+        // endpoint with no pod network required.
+        let values = build_values(&openstack());
+
+        assert_eq!(values["dnsPolicy"], "Default");
+    }
+
+    #[test]
     fn typed_and_talos_values_win_over_conflicting_helm_values() {
         let mut spec = openstack();
         spec.helm_values = Some(serde_json::json!({
             "secret": { "create": true, "enabled": false, "name": "other" },
             "extraVolumes": [{ "name": "x" }],
-            "extraVolumeMounts": [{ "name": "x" }]
+            "extraVolumeMounts": [{ "name": "x" }],
+            "dnsPolicy": "ClusterFirstWithHostNet"
         }));
 
         let values = build_values(&spec);
@@ -332,6 +395,7 @@ mod tests {
         assert_eq!(values["secret"]["name"], "cloud-config");
         assert_eq!(values["extraVolumes"], serde_json::json!([]));
         assert_eq!(values["extraVolumeMounts"], serde_json::json!([]));
+        assert_eq!(values["dnsPolicy"], "Default");
     }
 
     #[test]

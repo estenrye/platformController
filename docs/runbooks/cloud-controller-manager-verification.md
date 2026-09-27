@@ -91,6 +91,13 @@ Check `kubectl -n kube-system logs <pod>` for errors reaching Keystone.
 This also verifies the `extraVolumes: []` override: the pod starts on Talos with
 no hostPath mounts (`kubectl -n kube-system get pod <pod> -o yaml | grep -c hostPath` is `0`).
 
+Also confirm the `dnsPolicy: Default` override: the pod's resolv.conf should be
+the node's, not the cluster DNS service IP (`kubectl -n kube-system exec <pod> --
+cat /etc/resolv.conf`; the chart's own default, `ClusterFirstWithHostNet`, would
+point it at the cluster DNS service IP and deadlock this exact bootstrap, since
+CoreDNS cannot schedule until the CCM clears the `uninitialized` taint). Record
+the time from applying the CR to the taint clearing (step 3) alongside this.
+
 ## 3. Node initialization
 
 ```sh

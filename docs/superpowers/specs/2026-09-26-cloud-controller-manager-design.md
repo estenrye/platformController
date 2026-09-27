@@ -53,8 +53,9 @@ spec:
 - `cloudConfigSecretRef.name` names a Secret in `kube-system`. The namespace is not configurable: the chart mounts the Secret from its own release namespace. The Secret must hold the whole cloud config under the key **`cloud.conf`**; the chart's DaemonSet reads `/etc/config/cloud.conf`. The controller passes only the name to the chart. It never reads the Secret, so nothing secret appears in the CR, its status or the ledger.
 - Values layering, as for `PullThroughCache`: `helmValues` first, then the typed fields (`secret.enabled: true`, `secret.create: false`, `secret.name: <ref>`), then the controller's unconditional Talos overrides. A passthrough can never contradict a typed field or a platform-implied value.
 - For `talos-linux` the controller always sets `extraVolumes: []` and `extraVolumeMounts: []`. The chart's defaults hostPath-mount `/etc/kubernetes/pki` and the kubelet flexvolume directory, which the CCM does not use (it uses in-cluster config) and which Talos does not provide. This is the same kind of unconditional platform-implied value as Calico's `flexVolumePath: None`. Not verified live; see the runbook.
+- The controller always sets `dnsPolicy: Default`. The chart defaults to `hostNetwork: true` with `dnsPolicy: ClusterFirstWithHostNet`, which points the pod at the cluster DNS service IP. That IP is unreachable before a CNI is up, and CoreDNS itself cannot schedule until the CCM clears the `uninitialized` taint from every node — the same deadlock `deploy/bootstrap.yaml` already documents for this controller's own Deployment (see its "Default, not ClusterFirstWithHostNet" comment). `Default` inherits the node's resolv.conf, which resolves the cloud's Keystone endpoint with no pod network required. Set unconditionally, so a `helmValues` passthrough can never reintroduce the deadlock.
 - No `cleanupTimeoutSeconds`: the CCM has no operator-owned resources that need a bounded wait on removal.
-- Deliberately not typed: `clusterName`, `enabledControllers` and the `cloudConfig` block. They remain reachable through `helmValues`.
+- Deliberately not typed: `clusterName` and `enabledControllers`. They remain reachable through `helmValues`. The `cloudConfig`/`cloudConfigContents` block is **not** reachable through `helmValues`, and setting it there is rejected (`InvalidHelmValues`): `secret.create` is always forced to `false` (see above), so the chart's Secret template, the only consumer of `cloudConfig`/`cloudConfigContents`, never renders — the values would have no effect, and a user who set them there would have OpenStack credentials sitting, uselessly, in a cluster-scoped custom resource that is not a Secret. The credential path is exactly one: `cloudConfigSecretRef`.
 
 Validation, rejected with `phase: Failed` and a `reason`, like the other paths:
 
@@ -64,6 +65,7 @@ Validation, rejected with `phase: Failed` and a `reason`, like the other paths:
 - `chartVersion` has leading or trailing whitespace
 - `cloudConfigSecretRef.name` is empty or is not a valid Kubernetes object name (DNS-1123 subdomain)
 - `helmValues` is not a JSON object
+- `helmValues` sets `cloudConfig` or `cloudConfigContents` (see above)
 
 Status mirrors `PullThroughCacheStatus` and reuses `Phase`, `Condition` and `AppliedResourceRef`: `phase`, `observedGeneration`, `chartVersion`, `appliedResources`, `conditions`.
 

@@ -570,6 +570,15 @@ mod tests {
         assert_eq!(volumes[0]["secret"]["secretName"], "my-cloud-config");
         assert!(!rendered.contains("hostPath"), "{rendered}");
 
+        // The chart defaults to dnsPolicy: ClusterFirstWithHostNet, which would
+        // deadlock this exact bootstrap (CoreDNS cannot schedule until the CCM
+        // clears every node's uninitialized taint, and the CCM cannot resolve its
+        // cloud's endpoint without CoreDNS). The controller always overrides it.
+        assert_eq!(
+            daemon_set.data.pointer("/spec/template/spec/dnsPolicy"),
+            Some(&serde_json::json!("Default"))
+        );
+
         // The chart reads the config from the `cloud.conf` key of that Secret, and
         // its Role is scoped to the same name.
         assert!(rendered.contains("/etc/config/cloud.conf"), "{rendered}");
