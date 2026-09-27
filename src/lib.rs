@@ -1,4 +1,5 @@
 pub mod cache_reconciler;
+pub mod cloud_controller_manager;
 pub mod apply;
 pub mod calico;
 pub mod cidr;

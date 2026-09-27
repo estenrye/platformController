@@ -46,7 +46,7 @@ pub struct SpegelSpec {
     pub helm_values: Option<serde_json::Value>,
 }
 
-fn preserve_unknown_object(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+pub(crate) fn preserve_unknown_object(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "object",
         "x-kubernetes-preserve-unknown-fields": true
@@ -229,7 +229,7 @@ fn drop_extra_node_ip_targets(args: &mut Vec<serde_json::Value>) -> usize {
 }
 
 /// Recursively merges `overlay` into `base`; on a conflict the overlay wins.
-fn merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
+pub(crate) fn merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
     match (base, overlay) {
         (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
             for (key, value) in overlay {
