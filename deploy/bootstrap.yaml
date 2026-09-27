@@ -65,6 +65,13 @@ spec:
         - key: node-role.kubernetes.io/control-plane
           operator: Exists
           effect: NoSchedule
+        # With kubelets on --cloud-provider=external (the prerequisite for a
+        # CloudControllerManager), every node is tainted uninitialized until the
+        # CCM runs. This controller is what installs the CCM, so it must be
+        # schedulable before that.
+        - key: node.cloudprovider.kubernetes.io/uninitialized
+          operator: Exists
+          effect: NoSchedule
       # Preferred, not required: a small dev/test cluster may only have one or
       # two control-plane nodes, and a hard requirement could leave a replica
       # permanently unschedulable.

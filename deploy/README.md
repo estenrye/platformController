@@ -6,11 +6,12 @@ Apply in this order:
 kubectl apply -f deploy/crd.yaml
 kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/pullthroughcaches.platform.rye.ninja
+kubectl wait --for=condition=established --timeout=60s crd/cloudcontrollermanagers.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```
 
-`crd.yaml` (both CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
+`crd.yaml` (all three CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
 contains a `CniInstallation` custom resource, and the API server rejects a custom
 resource whose kind is not yet registered (`no matches for kind "CniInstallation"`).
 Registration is asynchronous: the CRD can exist while its API endpoint is not yet
@@ -59,6 +60,41 @@ Omitting `spec.spegel.registries` mirrors every registry, private ones included.
 both CRDs to be Established) *before* rolling the controller image. A controller
 that starts without the `PullThroughCache` CRD logs watch errors for it and
 retries with backoff; it still reconciles `CniInstallation` normally.
+
+## Cloud controller manager (optional)
+
+`examples/cloud-controller-manager.yaml` is a `CloudControllerManager` that
+installs the OpenStack cloud controller manager on a self-hosted Talos cluster
+running on OpenStack VMs. Skip it on a managed cluster (EKS, GKE, AKS, OKE): the
+provider already runs one. It needs two things the controller cannot do for you:
+
+- a one-time Talos machine-config change so kubelets use
+  `--cloud-provider=external` (`docs/runbooks/cloud-controller-manager-verification.md`,
+  step 0), and
+- a Secret named as `spec.openstack.cloudConfigSecretRef.name` in `kube-system`,
+  holding the OpenStack cloud config under the key `cloud.conf`. The controller
+  never reads it, and does not check that it exists: with the Secret missing the
+  DaemonSet's pod sits in `ContainerCreating` while `.status.phase` still says
+  `Ready` (which means "manifests applied").
+
+`spec.openstack.chartVersion` is the Helm chart version (`2.36.5`), not the
+application version (`v1.36.0`).
+
+**Apply order:** `CloudControllerManager`, then `CniInstallation`, then
+`PullThroughCache`. The controller enforces no ordering; each reconciles when
+applied. With external cloud-provider kubelets every node is tainted
+`node.cloudprovider.kubernetes.io/uninitialized` until the CCM initializes it, and
+the CCM runs on the host network, so it does not need the CNI.
+
+**Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
+all three CRDs to be Established) *before* rolling the controller image. The new
+image's Deployment also tolerates the `uninitialized` taint (`deploy/bootstrap.yaml`);
+without that toleration the controller could not schedule on a cluster whose
+kubelets use an external cloud provider.
+
+**Deleting** a `CloudControllerManager` removes the chart's objects but does not
+undo node initialization (providerIDs and addresses stay) and does not delete
+existing cloud load balancers.
 
 ## Calico node address autodetection
 

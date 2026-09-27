@@ -24,6 +24,34 @@ fn bootstrap_yaml_parses_into_expected_kinds_in_apply_order() {
 }
 
 #[test]
+fn controller_deployment_tolerates_the_uninitialized_cloud_provider_taint() {
+    // With kubelets on --cloud-provider=external every node starts tainted
+    // node.cloudprovider.kubernetes.io/uninitialized until the CCM initializes
+    // it. This controller installs the CCM, so it has to schedule first.
+    let content = std::fs::read_to_string("deploy/bootstrap.yaml").expect("bootstrap.yaml should exist");
+    let objects = parse_manifests(&content).expect("bootstrap.yaml should be valid YAML documents");
+    let deployment = objects
+        .iter()
+        .find(|o| o.types.as_ref().unwrap().kind == "Deployment")
+        .expect("bootstrap.yaml has the controller Deployment");
+
+    let tolerations = deployment
+        .data
+        .pointer("/spec/template/spec/tolerations")
+        .and_then(|value| value.as_array())
+        .expect("the Deployment has tolerations");
+
+    assert!(
+        tolerations.iter().any(|toleration| {
+            toleration["key"] == "node.cloudprovider.kubernetes.io/uninitialized"
+                && toleration["operator"] == "Exists"
+                && toleration["effect"] == "NoSchedule"
+        }),
+        "{tolerations:?}"
+    );
+}
+
+#[test]
 fn example_cni_installation_yaml_defines_a_single_cni_installation() {
     let content = std::fs::read_to_string("examples/cni-installation.yaml")
         .expect("examples/cni-installation.yaml should exist");

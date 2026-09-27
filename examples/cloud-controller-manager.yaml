@@ -1,0 +1,44 @@
+# Sample CloudControllerManager for a self-hosted Talos Linux cluster running on
+# OpenStack VMs: the OpenStack cloud controller manager initializes nodes (sets
+# providerID and addresses), removes nodes whose VM is gone, and provisions
+# LoadBalancer Services. It does nothing on a managed cluster (EKS, GKE, AKS,
+# OKE), where the provider already runs its own.
+#
+# BEFORE applying this:
+#
+# 1. Every node needs a one-time Talos machine-config change the controller
+#    cannot make for you (see docs/runbooks/cloud-controller-manager-verification.md,
+#    step 0):
+#
+#      cluster:
+#        externalCloudProvider:
+#          enabled: true
+#
+# 2. Create the cloud config Secret in kube-system. The controller never reads it;
+#    it only tells the chart its name. The key MUST be `cloud.conf`:
+#
+#      kubectl -n kube-system create secret generic cloud-config \
+#        --from-file=cloud.conf=./cloud.conf
+#
+#    cloud.conf is the OpenStack cloud config (auth-url, an application credential,
+#    region, and any [Networking]/[LoadBalancer] settings); see
+#    https://github.com/kubernetes/cloud-provider-openstack
+#
+# Apply this before the CniInstallation: the CCM runs on the host network and does
+# not need the CNI, but nodes stay tainted until it has initialized them.
+#
+#   kubectl apply -f examples/cloud-controller-manager.yaml
+apiVersion: platform.rye.ninja/v1alpha1
+kind: CloudControllerManager
+metadata:
+  name: default
+spec:
+  platformKind: talos-linux
+  provider: openstack
+  openstack:
+    # The Helm CHART version of openstack-cloud-controller-manager (2.x), not the
+    # application version (v1.x), and with no "v" prefix. If .status shows
+    # Failed / RenderFailed, this is the usual cause.
+    chartVersion: "2.36.5"
+    cloudConfigSecretRef:
+      name: cloud-config
