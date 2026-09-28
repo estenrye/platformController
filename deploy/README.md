@@ -119,9 +119,11 @@ A bare `kubectl get csidrivers` resolves to the built-in resource, not this
 one; use `kubectl get csi` (the shortname) or the fully-qualified
 `csidrivers.platform.rye.ninja` instead.
 
-The chart's `csi-snapshotter` sidecar crash-loops on this cluster (block-volume
-provisioning is unaffected); see the runbook's step 2 for why and how to
-silence it.
+The chart's `csi-snapshotter` sidecar logs continuous (but harmless) "CRD not
+found" errors until the cluster has the separate, cluster-level
+external-snapshotter CRDs and `snapshot-controller` installed; block-volume
+provisioning is unaffected. See the runbook's step 2 for the full explanation
+and how to silence the log noise.
 
 It needs a Secret named as `spec.openstackCinder.cloudConfigSecretRef.name` in
 `kube-system`, holding the OpenStack cloud config under the key `cloud.conf`.

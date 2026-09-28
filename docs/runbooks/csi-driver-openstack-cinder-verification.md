@@ -4,8 +4,8 @@ Manual acceptance for the `CsiDriver` resource (`driver: openstackCinder`).
 Needs a real OpenStack cloud you can boot Talos VMs in, credentials for it, a
 `CloudControllerManager` already `Ready` (see
 `docs/runbooks/cloud-controller-manager-verification.md`), and a `CniInstallation`
-already `Ready`. Nothing here has been run yet: record what you observe under
-"Findings to record" at the end.
+already `Ready`. First run: 2026-09-28, against a real Talos-on-OpenStack lab
+cluster; see "Findings to record" at the end for what was and wasn't verified.
 
 ## 1. Apply order
 
@@ -38,18 +38,21 @@ controller plugin Deployment has one pod, Running. `Ready` means the manifests
 were applied, not that the driver is healthy: the pods are the real signal.
 Check `kubectl -n kube-system logs <pod>` for errors reaching Keystone or Cinder.
 
-**Expected exception:** the controller plugin's `csi-snapshotter` container
-specifically will be `CrashLoopBackOff` here and stay that way, showing the
-overall pod `0/1 READY` even once everything else is healthy. It calls
-`ensureCustomResourceDefinitionsExist` at startup and exits non-zero unless the
-cluster already has the external-snapshotter CRDs (`snapshot.storage.k8s.io`)
-and `snapshot-controller` installed -- a separate, cluster-level concern this
-component's spec deliberately excludes (see the spec's Non-goals). Block-volume
-provisioning, attach, mount and expansion (via the provisioner, attacher and
-resizer sidecars) are unaffected. To silence the crash-loop instead of
-installing snapshot support, set `spec.openstackCinder.helmValues: {csi:
-{snapshotter: {enabled: false}}}` on the `CsiDriver` (this flag exists in the
-chart's real values).
+**Expected noise, live-verified 2026-09-28 (corrects an earlier, wrong claim in
+this runbook that the sidecar crash-loops -- it doesn't):** the controller
+plugin's `csi-snapshotter` container (chart `2.36.5`, sidecar `v8.4.0`) logs a
+continuous stream of `Failed to watch ... the server could not find the
+requested resource (get volumesnapshotclasses.snapshot.storage.k8s.io /
+volumesnapshotcontents.snapshot.storage.k8s.io)` errors, retrying with backoff,
+for as long as the cluster lacks the external-snapshotter CRDs
+(`snapshot.storage.k8s.io`) and `snapshot-controller` -- a separate,
+cluster-level concern this component's spec deliberately excludes (see the
+spec's Non-goals). The container itself stays `Running`, the pod reaches
+`6/6 READY`, and block-volume provisioning, attach, mount and expansion are
+unaffected; only volume snapshots don't work until that cluster-level install
+happens. To silence the log noise instead of installing snapshot support, set
+`spec.openstackCinder.helmValues: {csi: {snapshotter: {enabled: false}}}` on
+the `CsiDriver` (this flag exists in the chart's real values).
 
 ## 3. StorageClasses and the default
 
@@ -95,6 +98,32 @@ Expected: capacity grows to `2Gi` (`allowVolumeExpansion: true` on both
 StorageClasses). Delete the pod and PVC afterwards and confirm the Cinder
 volume is removed (`openstack volume list`) for `csi-cinder-sc-delete`, and
 confirm it is *not* removed for a PVC against `csi-cinder-sc-retain`.
+
+**Known caveat, live-verified 2026-09-28: Nova/Cinder availability-zone
+mismatch is possible and is not something this component can fix.** The
+chart runs the provisioner with `--with-topology=true`, so by default it
+derives a new volume's `availability` from the scheduling node's
+`topology.kubernetes.io/zone` label -- which cloud-provider-openstack sets
+from the node's **Nova** compute AZ. On a cluster where Cinder's own AZ list
+(`GET /os-availability-zone` on the Cinder endpoint) doesn't include that
+same name -- a legitimate, common OpenStack deployment shape, since Nova and
+Cinder AZs are independently configured and many deployments leave Cinder's
+at its default `nova` -- the plain `csi-cinder-sc-delete`/`-retain`
+StorageClasses fail provisioning outright:
+`CreateVolume failed ... Availability zone '<nova-az>' is invalid`. This was
+hit on first live run here (Nova AZ `pcd-ce-lab`, Cinder AZ only `nova`).
+Provisioning and deletion were confirmed working end-to-end against real
+Cinder using a one-off StorageClass with `parameters: {availability: nova}`
+(bypassing topology-derived AZ selection); but the resulting PV's node
+affinity then required a node labeled `zone: nova`, which none of this
+cluster's nodes are (they're all `pcd-ce-lab`), so a pod could not schedule
+against that volume in this lab. If your Nova and Cinder AZs diverge, the
+fix is either an explicit `parameters.availability` matching a real Cinder
+AZ *and* matching node topology, or disabling topology entirely via
+`spec.openstackCinder.helmValues: {csi: {provisioner: {topology: "false"}}}`
+on the `CsiDriver`. Not something the typed API covers (AZ/topology is a
+documented Non-goal); this is an operator-facing StorageClass-design
+decision, not a controller bug.
 
 ## 5. Node plugin mounts on Talos
 
@@ -171,7 +200,37 @@ left with a stuck detach/unmount.
 
 ## Findings to record
 
-To fill in from the first live run: where the pods scheduled and how long
-after both prerequisites were `Ready` (step 1-2), the provision/attach/mount/
-expand round trip (step 4), the `/etc/cacert` and `kubeletDir` mount behavior
-on Talos (step 5), and anything in step 7 that differs from "Expected".
+From the first live run, 2026-09-28, against a real Talos-on-OpenStack lab
+cluster (already running `CloudControllerManager` and `CniInstallation`,
+both `Ready`, no lingering `uninitialized` taints):
+
+- **Step 1-2:** both plugins scheduled immediately once the CR was applied
+  (controller-plugin and every node-plugin pod `Running` within ~30s);
+  `status.phase` reached `Ready`. Confirmed the fixed image (see the
+  `/etc/cacert` finding below) is required for this -- before the fix, every
+  `cinder-csi-plugin` container sat in `CreateContainerError` instead.
+- **Step 2's `csi-snapshotter` note:** the sidecar does *not* crash-loop
+  (an earlier version of this runbook wrongly said it did, based on
+  inference rather than a live run). It logs continuous, harmless
+  `Failed to watch ...` retries for `VolumeSnapshotClass`/
+  `VolumeSnapshotContent` and stays `Running`/`6/6 READY`.
+- **Step 3:** both StorageClasses rendered correctly; `csi-cinder-sc-delete`
+  carried the `is-default-class: "true"` annotation, `csi-cinder-sc-retain`
+  did not.
+- **Step 4 (provision/attach/mount/expand):** provisioning against the
+  plain StorageClasses failed with `Availability zone '<nova-az>' is
+  invalid` -- this cluster's Cinder only has AZ `nova`, while Nova's compute
+  AZ (and the node topology label the topology-aware provisioner defaults
+  to) is a different name. See the caveat under step 4 for the full
+  explanation. Provisioning and deletion were confirmed working end-to-end
+  against real Cinder (verified directly against the Cinder API, not just
+  Kubernetes-side status) using a StorageClass with an explicit
+  `parameters.availability: nova` override; the resulting PV's node
+  affinity then had no matching node in this lab, so pod attach/mount and
+  volume expansion were not completed here. Both are still open items for a
+  cluster whose Nova and Cinder AZs coincide (or with topology disabled).
+- **Step 5:** the `/etc/cacert` hostPath mount broke every `cinder-csi-plugin`
+  container on Talos (`CreateContainerError: read-only file system`) before
+  the fix in this same session; after the fix, `mount | grep -c cacert`
+  correctly returns `0` and the `kubeletDir` mount is present and healthy.
+- **Step 6-7:** not yet run in this session.
