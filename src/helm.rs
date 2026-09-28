@@ -640,6 +640,29 @@ mod tests {
             cloud_config_secret_ref: crate::crd::SecretNameRef {
                 name: "my-cloud-config".to_string(),
             },
+            storage_classes: crate::csi_driver::StorageClassesSpec {
+                additional: vec![
+                    crate::csi_driver::AdditionalStorageClassSpec {
+                        name: "csi-cinder-sc-az1".to_string(),
+                        reclaim_policy: crate::csi_driver::ReclaimPolicy::Delete,
+                        parameters: std::collections::BTreeMap::from([(
+                            "availability".to_string(),
+                            "az1".to_string(),
+                        )]),
+                        is_default: false,
+                    },
+                    crate::csi_driver::AdditionalStorageClassSpec {
+                        name: "csi-cinder-sc-az2".to_string(),
+                        reclaim_policy: crate::csi_driver::ReclaimPolicy::Retain,
+                        parameters: std::collections::BTreeMap::from([(
+                            "availability".to_string(),
+                            "az2".to_string(),
+                        )]),
+                        is_default: false,
+                    },
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let values = crate::csi_driver::build_values(&openstack_cinder);
@@ -730,7 +753,7 @@ mod tests {
             "{controller_tolerations:?}"
         );
 
-        // defaultStorageClass defaults to `delete`: only csi-cinder-sc-delete is
+        // storageClasses.default defaults to `delete`: only csi-cinder-sc-delete is
         // annotated as the cluster default.
         let delete_class = objects
             .iter()
@@ -757,6 +780,29 @@ mod tests {
                 .and_then(|annotations| annotations.get("storageclass.kubernetes.io/is-default-class"))
                 .is_none()
         );
+
+        // storageClasses.additional renders each entry as a real extra
+        // StorageClass through the chart's own storageClass.custom raw-YAML
+        // extension point -- with two entries, confirming the `---\n`-joined
+        // documents concatenate into valid multi-document YAML the chart
+        // accepts (the multi-AZ scenario that motivated this feature).
+        let extra_class_az1 = objects
+            .iter()
+            .find(|o| o.metadata.name.as_deref() == Some("csi-cinder-sc-az1"))
+            .expect("the az1 additional StorageClass");
+        assert_eq!(extra_class_az1.types.as_ref().unwrap().kind, "StorageClass");
+        assert_eq!(extra_class_az1.data["provisioner"], "cinder.csi.openstack.org");
+        assert_eq!(extra_class_az1.data["reclaimPolicy"], "Delete");
+        assert_eq!(extra_class_az1.data["parameters"]["availability"], "az1");
+
+        let extra_class_az2 = objects
+            .iter()
+            .find(|o| o.metadata.name.as_deref() == Some("csi-cinder-sc-az2"))
+            .expect("the az2 additional StorageClass");
+        assert_eq!(extra_class_az2.types.as_ref().unwrap().kind, "StorageClass");
+        assert_eq!(extra_class_az2.data["provisioner"], "cinder.csi.openstack.org");
+        assert_eq!(extra_class_az2.data["reclaimPolicy"], "Retain");
+        assert_eq!(extra_class_az2.data["parameters"]["availability"], "az2");
 
         // --no-hooks: no hook objects are rendered as live objects.
         assert!(!rendered.contains("helm.sh/hook"));
