@@ -525,3 +525,158 @@ spec:
     storage: true
     subresources:
       status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: csidrivers.platform.rye.ninja
+spec:
+  group: platform.rye.ninja
+  names:
+    kind: CsiDriver
+    plural: csidrivers
+    shortNames:
+    - csi
+    singular: csidriver
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CsiDriverSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              driver:
+                description: |-
+                  Unlike `CniInstallation`'s or `CloudControllerManager`'s singleton, a
+                  `CsiDriver` is not a `name: default` singleton: a cloud can need several
+                  drivers installed at once (e.g. AWS's EBS and EFS drivers together), so
+                  each driver gets its own CR instance instead of nesting many drivers under
+                  one. `expected_name` is the cross-field constraint that keeps at most one
+                  CR managing a given driver: the CRD schema can't express "name must equal
+                  this other field", so `csi_reconciler::validate` checks it at runtime.
+                enum:
+                - openstackCinder
+                type: string
+              openstackCinder:
+                properties:
+                  chartVersion:
+                    description: |-
+                      The Helm chart version of `openstack-cinder-csi` (for example
+                      `2.36.5`), not the application version (`v1.36.0`).
+                    type: string
+                  cloudConfigSecretRef:
+                    description: |-
+                      The Secret holding the OpenStack cloud config. It must exist in
+                      `kube-system` and hold the whole config under the key `cloud.conf`. The
+                      controller passes only its name to the chart and never reads it.
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  defaultStorageClass:
+                    default: delete
+                    description: |-
+                      Which of the chart's two StorageClasses (`csi-cinder-sc-delete`,
+                      `csi-cinder-sc-retain`) is the cluster's default. The controller always
+                      sets both `storageClass.*.isDefault` flags from this one field, so a
+                      `helmValues` passthrough can never create two defaults between them.
+                    enum:
+                    - delete
+                    - retain
+                    - none
+                    type: string
+                  helmValues:
+                    description: |-
+                      Free-form values merged into the chart's values. Typed fields are
+                      overlaid on top, so they always win.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                required:
+                - chartVersion
+                - cloudConfigSecretRef
+                type: object
+              platformKind:
+                enum:
+                - talos-linux
+                type: string
+            required:
+            - driver
+            - openstackCinder
+            - platformKind
+            type: object
+          status:
+            nullable: true
+            properties:
+              appliedResources:
+                default: []
+                items:
+                  properties:
+                    apiVersion:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      default: ''
+                      type: string
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  type: object
+                type: array
+              chartVersion:
+                default: ''
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                default: 0
+                format: int64
+                type: integer
+              phase:
+                default: Pending
+                enum:
+                - Pending
+                - Installing
+                - Ready
+                - Failed
+                type: string
+            type: object
+        required:
+        - spec
+        title: CsiDriver
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

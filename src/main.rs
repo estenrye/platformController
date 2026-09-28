@@ -4,6 +4,8 @@ use kube::{Api, Client, Resource};
 use platform_controller::ccm_reconciler;
 use platform_controller::cloud_controller_manager::CloudControllerManager;
 use platform_controller::crd::CniInstallation;
+use platform_controller::csi_driver::CsiDriver;
+use platform_controller::csi_reconciler;
 use platform_controller::leader;
 use platform_controller::pull_through_cache::PullThroughCache;
 use platform_controller::reconciler::{error_policy, reconcile_with_finalizer, Context};
@@ -136,12 +138,40 @@ async fn main() -> anyhow::Result<()> {
         .run(
             ccm_reconciler::reconcile_with_finalizer,
             ccm_reconciler::error_policy,
-            context,
+            context.clone(),
         )
         .for_each(|result| async move {
             match result {
                 Ok(action) => tracing::debug!(?action, "reconciled cloud controller manager"),
                 Err(err) => tracing::error!(error = %err, "cloud controller manager reconcile failed"),
+            }
+        });
+
+    // The CSI driver component gets its own watcher, store and Controller too,
+    // with the same predicate filter and the same Context (one leader lease).
+    let csi_api: Api<CsiDriver> = Api::all(client.clone());
+    let (csi_reader, csi_writer) = reflector::store();
+    let drivers = watcher(csi_api, watcher::Config::default())
+        .default_backoff()
+        .reflect(csi_writer)
+        .applied_objects()
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
+
+    let csi_controller = Controller::for_stream(drivers, csi_reader)
+        .run(
+            csi_reconciler::reconcile_with_finalizer,
+            csi_reconciler::error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok(action) => tracing::debug!(?action, "reconciled csi driver"),
+                Err(err) => tracing::error!(error = %err, "csi driver reconcile failed"),
             }
         });
 
@@ -151,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
         _ = controller => {}
         _ = cache_controller => {}
         _ = ccm_controller => {}
+        _ = csi_controller => {}
         // `leader::run` loops forever, so this branch only resolves if it
         // panicked. Exit non-zero and let Kubernetes restart the pod rather than
         // limp on with a permanently stale `is_leader` flag.
@@ -261,5 +292,28 @@ mod tests {
         .expect("ccm should deserialize");
 
         assert_eq!(deletion_requested(&ccm), Some(1));
+    }
+
+    #[test]
+    fn deletion_requested_works_for_the_csi_driver_kind_too() {
+        let driver: CsiDriver = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "CsiDriver",
+            "metadata": {
+                "name": "openstack-cinder",
+                "deletionTimestamp": "2026-09-28T00:00:00Z"
+            },
+            "spec": {
+                "platformKind": "talos-linux",
+                "driver": "openstackCinder",
+                "openstackCinder": {
+                    "chartVersion": "2.36.5",
+                    "cloudConfigSecretRef": { "name": "cloud-config" }
+                }
+            }
+        }))
+        .expect("driver should deserialize");
+
+        assert_eq!(deletion_requested(&driver), Some(1));
     }
 }

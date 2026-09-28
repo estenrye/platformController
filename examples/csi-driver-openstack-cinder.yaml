@@ -1,0 +1,44 @@
+# Sample CsiDriver for a self-hosted Talos Linux cluster running on OpenStack
+# VMs: installs the openstack-cinder-csi driver, giving the cluster two
+# StorageClasses (csi-cinder-sc-delete, csi-cinder-sc-retain) backed by Cinder
+# block volumes. It does nothing on a managed cluster (EKS, GKE, AKS, OKE),
+# where the provider already runs its own CSI drivers.
+#
+# BEFORE applying this:
+#
+# 1. Apply CloudControllerManager and CniInstallation first (see deploy/README.md,
+#    "Apply order"): the controller-plugin Deployment runs on the regular pod
+#    network and has no toleration for the uninitialized cloud-provider taint,
+#    so it needs both a working CNI and CloudControllerManager's node
+#    initialization before it can schedule and run.
+#
+# 2. Create the cloud config Secret in kube-system. The controller never reads it;
+#    it only tells the chart its name. The key MUST be `cloud.conf`:
+#
+#      kubectl -n kube-system create secret generic cloud-config \
+#        --from-file=cloud.conf=./cloud.conf
+#
+#    cloud.conf is the OpenStack cloud config (auth-url, an application credential,
+#    region); see https://github.com/kubernetes/cloud-provider-openstack
+#
+#   kubectl apply -f examples/csi-driver-openstack-cinder.yaml
+apiVersion: platform.rye.ninja/v1alpha1
+kind: CsiDriver
+metadata:
+  # Must equal the driver's expected name: "openstack-cinder" for
+  # driver: openstackCinder. Unlike the other example CRs this is not
+  # "default" -- a CsiDriver is one CR per driver, not a singleton.
+  name: openstack-cinder
+spec:
+  platformKind: talos-linux
+  driver: openstackCinder
+  openstackCinder:
+    # The Helm CHART version of openstack-cinder-csi (2.x), not the
+    # application version (v1.x), and with no "v" prefix. If .status shows
+    # Failed / RenderFailed, this is the usual cause.
+    chartVersion: "2.36.5"
+    cloudConfigSecretRef:
+      name: cloud-config
+    # csi-cinder-sc-delete is the cluster's default StorageClass. Set to
+    # "retain" or "none" to choose differently.
+    defaultStorageClass: delete
