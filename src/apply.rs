@@ -187,6 +187,24 @@ pub fn is_missing_kind_error(err: &kube::Error) -> bool {
     }
 }
 
+/// True when the API server rejected a patch because some field is immutable
+/// on update -- the standard Kubernetes shape for "you can't change this
+/// after creation" (e.g. a `StorageClass`'s `parameters`, `provisioner` or
+/// `reclaimPolicy`). Live-verified 2026-09-28: the message says "Invalid
+/// value: null" even when the actual change is a real value, since the API
+/// server compares the whole field rather than explaining what changed.
+pub fn is_immutable_field_error(err: &kube::Error) -> bool {
+    match err {
+        kube::Error::Api(status) => {
+            status.is_invalid()
+                && status.details.as_ref().is_some_and(|details| {
+                    details.causes.iter().any(|cause| cause.message.contains("field is immutable"))
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Polls API discovery until `api_version`/`kind` resolves. From Calico 3.32
 /// the operator (not the chart) creates every CRD at startup, so the
 /// controller cannot apply a CRD and wait on it; it can only wait for the kind
@@ -353,6 +371,25 @@ pub async fn delete_and_wait_for_removal(
     }
 }
 
+/// Recovers from an immutable-field conflict on `apply_object`: delete the
+/// existing object, wait for it to actually disappear, then apply the
+/// desired object fresh. Safe only for kinds where a brief absence has no
+/// consequence for anything already relying on the object -- the caller
+/// decides which kinds that's true for (see `csi_reconciler.rs`, which only
+/// calls this for `StorageClass`: already-bound PVs never reference the
+/// StorageClass object again, so the only effect is a brief window where a
+/// *new* PVC can't bind until the object reappears).
+pub async fn recreate_after_immutable_field_conflict(
+    client: &kube::Client,
+    obj: &DynamicObject,
+    field_manager: &str,
+    timeout: Duration,
+) -> Result<AppliedResourceRef, ApplyError> {
+    let reference = resource_ref(obj);
+    delete_and_wait_for_removal(client, &reference, timeout).await?;
+    apply_object(client, obj, field_manager).await
+}
+
 pub fn resources_to_prune(
     previous: &[AppliedResourceRef],
     current: &[AppliedResourceRef],
@@ -501,6 +538,64 @@ mod tests {
         }));
 
         assert!(!is_missing_kind_error(&err));
+    }
+
+    fn invalid_status_with_cause(field: &str, message: &str) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status {
+            reason: "Invalid".to_string(),
+            code: 422,
+            details: Some(kube::core::response::StatusDetails {
+                name: String::new(),
+                group: String::new(),
+                kind: String::new(),
+                uid: String::new(),
+                causes: vec![kube::core::response::StatusCause {
+                    reason: "FieldValueInvalid".to_string(),
+                    message: message.to_string(),
+                    field: field.to_string(),
+                }],
+                retry_after_seconds: 0,
+            }),
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn field_immutable_errors_are_detected() {
+        // The API server's actual wording, live-verified: it says "null" even
+        // though the real change was a value edit, since it compares the
+        // whole field rather than explaining what changed.
+        let err = invalid_status_with_cause("parameters", "Invalid value: null: field is immutable");
+
+        assert!(is_immutable_field_error(&err));
+    }
+
+    #[test]
+    fn field_immutable_is_detected_regardless_of_which_field() {
+        for field in ["provisioner", "reclaimPolicy"] {
+            let err = invalid_status_with_cause(field, "Invalid value: \"x\": field is immutable");
+
+            assert!(is_immutable_field_error(&err), "{field}");
+        }
+    }
+
+    #[test]
+    fn other_invalid_causes_are_not_immutable_field_conflicts() {
+        let err = invalid_status_with_cause(
+            "metadata.name",
+            "Invalid value: \"Bad_Name\": a lowercase RFC 1123 subdomain must consist of...",
+        );
+
+        assert!(!is_immutable_field_error(&err));
+    }
+
+    #[test]
+    fn non_api_errors_are_not_immutable_field_conflicts() {
+        let err = kube::Error::Discovery(kube::error::DiscoveryError::MissingKind(
+            "StorageClass".to_string(),
+        ));
+
+        assert!(!is_immutable_field_error(&err));
     }
 
     #[test]
