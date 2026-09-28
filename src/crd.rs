@@ -2,6 +2,28 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// A reference to a Secret by name only: the namespace is fixed by whichever
+/// chart consumes it.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct SecretNameRef {
+    pub name: String,
+}
+
+/// A Kubernetes object name: a DNS-1123 subdomain. One or more dot-separated
+/// labels of lowercase alphanumerics and '-', each starting and ending with an
+/// alphanumeric, at most 253 characters in all.
+pub(crate) fn is_dns1123_subdomain(name: &str) -> bool {
+    let alphanumeric = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            bytes.first().is_some_and(alphanumeric)
+                && bytes.last().is_some_and(alphanumeric)
+                && bytes.iter().all(|b| alphanumeric(b) || *b == b'-')
+        })
+}
+
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
     group = "platform.rye.ninja",

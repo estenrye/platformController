@@ -1,3 +1,4 @@
+pub use crate::crd::SecretNameRef;
 use crate::crd::{AppliedResourceRef, Condition, Phase, PlatformKind};
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -39,12 +40,6 @@ pub struct OpenstackSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::pull_through_cache::preserve_unknown_object")]
     pub helm_values: Option<serde_json::Value>,
-}
-
-/// A reference to a Secret by name only: the namespace is fixed by the chart.
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
-pub struct SecretNameRef {
-    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -99,21 +94,6 @@ impl CcmSpecError {
     }
 }
 
-/// A Kubernetes object name: a DNS-1123 subdomain. One or more dot-separated
-/// labels of lowercase alphanumerics and '-', each starting and ending with an
-/// alphanumeric, at most 253 characters in all.
-fn is_dns1123_subdomain(name: &str) -> bool {
-    let alphanumeric = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    !name.is_empty()
-        && name.len() <= 253
-        && name.split('.').all(|label| {
-            let bytes = label.as_bytes();
-            bytes.first().is_some_and(alphanumeric)
-                && bytes.last().is_some_and(alphanumeric)
-                && bytes.iter().all(|b| alphanumeric(b) || *b == b'-')
-        })
-}
-
 /// Rejects specs the chart would silently mis-handle, before anything is
 /// applied.
 pub fn validate_openstack(openstack: &OpenstackSpec) -> Result<(), CcmSpecError> {
@@ -125,7 +105,7 @@ pub fn validate_openstack(openstack: &OpenstackSpec) -> Result<(), CcmSpecError>
             openstack.chart_version.clone(),
         ));
     }
-    if !is_dns1123_subdomain(&openstack.cloud_config_secret_ref.name) {
+    if !crate::crd::is_dns1123_subdomain(&openstack.cloud_config_secret_ref.name) {
         return Err(CcmSpecError::InvalidSecretName(
             openstack.cloud_config_secret_ref.name.clone(),
         ));
