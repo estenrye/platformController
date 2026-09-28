@@ -178,10 +178,23 @@ async fn reconcile_inner(
         "validation passed, reconciling"
     );
 
-    let values = crate::csi_driver::build_values(&obj.spec.openstack_cinder);
-    let rendered =
-        crate::helm::render_chart(&crate::helm::OPENSTACK_CINDER_CSI_CHART, &chart_version, &values)
-            .await?;
+    // Matching on `spec.driver` here, even with a single variant today, forces a
+    // compiler error (non-exhaustive match) the moment a second `Driver` variant
+    // is added, instead of that variant silently installing Cinder's chart. The
+    // validation above already dispatches on the driver via `expected_name()`
+    // and `validate_openstack_cinder`; this match covers the values-building and
+    // chart-selection portion the same way.
+    let rendered = match obj.spec.driver {
+        Driver::OpenstackCinder => {
+            let values = crate::csi_driver::build_values(&obj.spec.openstack_cinder);
+            crate::helm::render_chart(
+                &crate::helm::OPENSTACK_CINDER_CSI_CHART,
+                &chart_version,
+                &values,
+            )
+            .await?
+        }
+    };
     tracing::info!(
         chart_version = %chart_version,
         namespace = crate::helm::CINDER_CSI_NAMESPACE,
@@ -221,8 +234,10 @@ async fn reconcile_inner(
 
     let mut applied = Vec::new();
     for object in &objects {
-        // The chart renders neither CRDs nor custom resources today; this guards a
-        // future chart bump that adds either.
+        // StorageClass and CSIDriver have no entry in `rank_for_kind`'s table, so
+        // both fall into CUSTOM_RESOURCE_RANK and take this wait path too, even
+        // though they're built-in kinds the API server already serves: the wait
+        // resolves immediately for them, it's not a bug.
         if crate::manifests::is_custom_resource(object) {
             wait_for_object_kind(&ctx.client, object).await?;
         }

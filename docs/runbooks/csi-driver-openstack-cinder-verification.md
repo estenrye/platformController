@@ -38,6 +38,19 @@ controller plugin Deployment has one pod, Running. `Ready` means the manifests
 were applied, not that the driver is healthy: the pods are the real signal.
 Check `kubectl -n kube-system logs <pod>` for errors reaching Keystone or Cinder.
 
+**Expected exception:** the controller plugin's `csi-snapshotter` container
+specifically will be `CrashLoopBackOff` here and stay that way, showing the
+overall pod `0/1 READY` even once everything else is healthy. It calls
+`ensureCustomResourceDefinitionsExist` at startup and exits non-zero unless the
+cluster already has the external-snapshotter CRDs (`snapshot.storage.k8s.io`)
+and `snapshot-controller` installed -- a separate, cluster-level concern this
+component's spec deliberately excludes (see the spec's Non-goals). Block-volume
+provisioning, attach, mount and expansion (via the provisioner, attacher and
+resizer sidecars) are unaffected. To silence the crash-loop instead of
+installing snapshot support, set `spec.openstackCinder.helmValues: {csi:
+{snapshotter: {enabled: false}}}` on the `CsiDriver` (this flag exists in the
+chart's real values).
+
 ## 3. StorageClasses and the default
 
 ```sh
@@ -96,6 +109,12 @@ path). Record what you find; nothing is overridden for these today.
 
 ## 6. Missing Secret
 
+**Warning:** if step 2 reused the CCM's `cloud-config` Secret rather than
+creating a separate one, deleting it here also breaks the CCM once its own
+pods restart against it. Recreate the Secret immediately after this check and
+confirm the CCM's pods recover too (not just the CSI driver's), or avoid this
+entirely by using a separate Secret name for the CSI driver from the start.
+
 ```sh
 kubectl -n kube-system delete secret cloud-config
 kubectl -n kube-system delete pod -l app=openstack-cinder-csi
@@ -105,7 +124,7 @@ kubectl get csi openstack-cinder -o jsonpath='{.status.phase}{"\n"}'   # still R
 
 Expected (and by design): the pods cannot mount the Secret and stay
 `ContainerCreating`, while status still says `Ready`. Recreate the Secret and
-the pods start.
+the pods start -- check the CCM's pods too if it shares this Secret.
 
 ## 7. Delete, and what stays
 
@@ -133,6 +152,17 @@ left with a stuck detach/unmount.
 - The ledger (`status.appliedResources`) is saved before anything is applied,
   so deleting the resource after a failed first install still removes
   everything that was created.
+- An `ApplyFailed` on the `CSIDriver` object or either `StorageClass`
+  (`csi-cinder-sc-delete`, `csi-cinder-sc-retain`) after a chart version bump
+  likely means a field that's immutable on update changed (`attachRequired`,
+  `podInfoOnMount` or `volumeLifecycleModes` on the `CSIDriver`;
+  `provisioner` or `reclaimPolicy` on a `StorageClass`), and every reconcile
+  will keep failing the same way. Recover by deleting that specific object by
+  hand (`kubectl delete csidrivers.storage.k8s.io cinder.csi.openstack.org` --
+  the fully-qualified built-in resource, not this operator's own
+  `csidrivers.platform.rye.ninja` CR -- or `kubectl delete storageclass
+  csi-cinder-sc-delete`/`csi-cinder-sc-retain` as appropriate) and letting the
+  next reconcile recreate it.
 
 ## Findings to record
 

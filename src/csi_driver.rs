@@ -378,8 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn typed_values_win_over_conflicting_helm_values() {
+    fn typed_values_win_over_conflicting_helm_values_default_storage_class_delete() {
         let mut spec = openstack_cinder();
+        spec.default_storage_class = DefaultStorageClass::Delete;
         spec.helm_values = Some(serde_json::json!({
             "secret": { "create": true, "enabled": false, "hostMount": true, "name": "other" },
             "storageClass": { "delete": { "isDefault": false }, "retain": { "isDefault": true } }
@@ -392,6 +393,48 @@ mod tests {
         assert_eq!(values["secret"]["hostMount"], false);
         assert_eq!(values["secret"]["name"], "cloud-config");
         assert_eq!(values["storageClass"]["delete"]["isDefault"], true);
+        assert_eq!(values["storageClass"]["retain"]["isDefault"], false);
+    }
+
+    #[test]
+    fn typed_values_win_over_conflicting_helm_values_default_storage_class_retain() {
+        let mut spec = openstack_cinder();
+        spec.default_storage_class = DefaultStorageClass::Retain;
+        // helmValues claims the opposite class (delete) is default; the typed
+        // field must still win, in the opposite direction from the delete case.
+        spec.helm_values = Some(serde_json::json!({
+            "secret": { "create": true, "enabled": false, "hostMount": true, "name": "other" },
+            "storageClass": { "delete": { "isDefault": true }, "retain": { "isDefault": false } }
+        }));
+
+        let values = build_values(&spec);
+
+        assert_eq!(values["secret"]["create"], false);
+        assert_eq!(values["secret"]["enabled"], true);
+        assert_eq!(values["secret"]["hostMount"], false);
+        assert_eq!(values["secret"]["name"], "cloud-config");
+        assert_eq!(values["storageClass"]["delete"]["isDefault"], false);
+        assert_eq!(values["storageClass"]["retain"]["isDefault"], true);
+    }
+
+    #[test]
+    fn typed_values_win_over_conflicting_helm_values_default_storage_class_none() {
+        let mut spec = openstack_cinder();
+        spec.default_storage_class = DefaultStorageClass::None;
+        // helmValues claims both classes are default; the typed field must still
+        // win and clear both flags.
+        spec.helm_values = Some(serde_json::json!({
+            "secret": { "create": true, "enabled": false, "hostMount": true, "name": "other" },
+            "storageClass": { "delete": { "isDefault": true }, "retain": { "isDefault": true } }
+        }));
+
+        let values = build_values(&spec);
+
+        assert_eq!(values["secret"]["create"], false);
+        assert_eq!(values["secret"]["enabled"], true);
+        assert_eq!(values["secret"]["hostMount"], false);
+        assert_eq!(values["secret"]["name"], "cloud-config");
+        assert_eq!(values["storageClass"]["delete"]["isDefault"], false);
         assert_eq!(values["storageClass"]["retain"]["isDefault"], false);
     }
 

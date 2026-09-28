@@ -82,8 +82,8 @@ provider already runs one. It needs two things the controller cannot do for you:
 application version (`v1.36.0`).
 
 **Apply order:** `CloudControllerManager`, then `CniInstallation`, then
-`PullThroughCache`. The controller enforces no ordering; each reconciles when
-applied. With external cloud-provider kubelets every node is tainted
+`CsiDriver`, then `PullThroughCache`. The controller enforces no ordering; each
+reconciles when applied. With external cloud-provider kubelets every node is tainted
 `node.cloudprovider.kubernetes.io/uninitialized` until the CCM initializes it, and
 the CCM runs on the host network, so it does not need the CNI.
 
@@ -111,6 +111,17 @@ controller only builds OpenStack Cinder today), so each CR manages exactly one
 driver and its name must equal that driver's own expected name --
 `openstack-cinder` for `driver: openstackCinder`. A CR with any other name is
 rejected (`Unsupported`).
+
+This operator's CRD (`csidrivers.platform.rye.ninja`) shares its bare plural,
+`csidrivers`, with Kubernetes' own built-in `storage.k8s.io` `CSIDriver`
+resource -- which this exact chart also installs, as `cinder.csi.openstack.org`.
+A bare `kubectl get csidrivers` resolves to the built-in resource, not this
+one; use `kubectl get csi` (the shortname) or the fully-qualified
+`csidrivers.platform.rye.ninja` instead.
+
+The chart's `csi-snapshotter` sidecar crash-loops on this cluster (block-volume
+provisioning is unaffected); see the runbook's step 2 for why and how to
+silence it.
 
 It needs a Secret named as `spec.openstackCinder.cloudConfigSecretRef.name` in
 `kube-system`, holding the OpenStack cloud config under the key `cloud.conf`.
