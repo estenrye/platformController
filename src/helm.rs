@@ -686,6 +686,29 @@ mod tests {
         // The chart reads the config from the `cloud.conf` key of that Secret.
         assert!(rendered.contains("/etc/config/cloud.conf"), "{rendered}");
 
+        // The chart's default csi.plugin.volumes hostPath-mounts /etc/cacert on
+        // both plugin containers. Talos's root filesystem is read-only and never
+        // creates that directory, so the container runtime's mkdir for the bind
+        // mount fails outright (live-verified against a real Talos cluster: every
+        // cinder-csi-plugin container sat in CreateContainerError). The override
+        // must drop it from both the node and controller plugin.
+        assert!(
+            !volumes.iter().any(|volume| volume["name"] == "cacert"),
+            "the node plugin must not mount /etc/cacert on Talos: {volumes:?}"
+        );
+        let controller_plugin_volumes = objects
+            .iter()
+            .find(|o| o.types.as_ref().unwrap().kind == "Deployment")
+            .expect("one Deployment")
+            .data
+            .pointer("/spec/template/spec/volumes")
+            .and_then(|value| value.as_array())
+            .expect("the Deployment has volumes");
+        assert!(
+            !controller_plugin_volumes.iter().any(|volume| volume["name"] == "cacert"),
+            "the controller plugin must not mount /etc/cacert on Talos: {controller_plugin_volumes:?}"
+        );
+
         // Unlike the node plugin, the controller plugin has no hostNetwork and no
         // toleration: it needs a working CNI and the uninitialized taint cleared
         // before it can schedule and run. This is why the deploy README documents

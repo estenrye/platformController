@@ -98,14 +98,19 @@ confirm it is *not* removed for a PVC against `csi-cinder-sc-retain`.
 
 ## 5. Node plugin mounts on Talos
 
+The `/etc/cacert` hostPath is now unconditionally dropped by `build_values`
+(live-verified: it crashed every `cinder-csi-plugin` container with
+`CreateContainerError: read-only file system` before this override existed).
+Confirm it stays gone and that `/var/lib/kubelet` `kubeletDir` still mounts:
+
 ```sh
 kubectl -n kube-system get pod -l component=nodeplugin -o name | head -1 | \
-  xargs -I{} kubectl -n kube-system exec {} -c cinder-csi-plugin -- mount | grep -c cacert
+  xargs -I{} kubectl -n kube-system exec {} -c cinder-csi-plugin -- mount | grep -c cacert   # 0
+kubectl -n kube-system get pod -l component=nodeplugin -o name | head -1 | \
+  xargs -I{} kubectl -n kube-system exec {} -c cinder-csi-plugin -- mount | grep kubelet
 ```
 
-Expected: confirm the `/etc/cacert` hostPath mount and `/var/lib/kubelet`
-`kubeletDir` mount behave correctly on Talos (no crash-loop from a missing host
-path). Record what you find; nothing is overridden for these today.
+Expected: `0` cacert mounts; the kubelet directory mount present and healthy.
 
 ## 6. Missing Secret
 
