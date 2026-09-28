@@ -187,16 +187,30 @@ left with a stuck detach/unmount.
   so deleting the resource after a failed first install still removes
   everything that was created.
 - An `ApplyFailed` on the `CSIDriver` object or either `StorageClass`
-  (`csi-cinder-sc-delete`, `csi-cinder-sc-retain`) after a chart version bump
-  likely means a field that's immutable on update changed (`attachRequired`,
-  `podInfoOnMount` or `volumeLifecycleModes` on the `CSIDriver`;
-  `provisioner` or `reclaimPolicy` on a `StorageClass`), and every reconcile
-  will keep failing the same way. Recover by deleting that specific object by
-  hand (`kubectl delete csidrivers.storage.k8s.io cinder.csi.openstack.org` --
-  the fully-qualified built-in resource, not this operator's own
-  `csidrivers.platform.rye.ninja` CR -- or `kubectl delete storageclass
+  (`csi-cinder-sc-delete`, `csi-cinder-sc-retain`) means a field that's
+  immutable on update changed (`attachRequired`, `podInfoOnMount` or
+  `volumeLifecycleModes` on the `CSIDriver`; `provisioner`, `reclaimPolicy`
+  **or `parameters`** on a `StorageClass`), and every reconcile will keep
+  failing the same way. **`parameters` is the one to expect routinely, not
+  just on a chart bump** -- live-verified 2026-09-28: editing
+  `spec.openstackCinder.storageClasses.delete.parameters` (e.g. adding
+  `availability: nova`) on a `CsiDriver` whose `csi-cinder-sc-delete` already
+  exists fails with `StorageClass.storage.k8s.io "csi-cinder-sc-delete" is
+  invalid: parameters: Invalid value: null: field is immutable` -- the
+  message says "null" even though the change is a real value edit, since the
+  API server compares the whole field, not per-key. This is expected: the
+  StorageClass API has no in-place way to change `parameters`. Recover by
+  deleting that specific object by hand (`kubectl delete
+  csidrivers.storage.k8s.io cinder.csi.openstack.org` -- the fully-qualified
+  built-in resource, not this operator's own `csidrivers.platform.rye.ninja`
+  CR -- or `kubectl delete storageclass
   csi-cinder-sc-delete`/`csi-cinder-sc-retain` as appropriate) and letting the
-  next reconcile recreate it.
+  next reconcile recreate it. This is exactly what fixed it live here:
+  provisioning failed first with `Availability zone 'pcd-ce-lab' is invalid`
+  (see step 4's caveat), the CR was edited to add `parameters: {availability:
+  nova}`, the resulting `ApplyFailed` was resolved by deleting the two
+  StorageClasses, and a PVC against the default StorageClass then bound
+  successfully with no workaround StorageClass needed.
 
 ## Findings to record
 

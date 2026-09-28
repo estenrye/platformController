@@ -139,7 +139,12 @@ built-in StorageClasses, if any, is the cluster default. Each of
 `availability`, `type`), and `storageClasses.additional` is a list of further
 StorageClasses (`name`, `reclaimPolicy`, `parameters`, `isDefault`) --
 directly motivated by the Nova/Cinder availability-zone mismatch found while
-live-testing this driver (see the runbook). Unlike the built-in `delete`/
+live-testing this driver (see the runbook). **Changing `storageClasses.delete
+.parameters`/`.retain.parameters` after `csi-cinder-sc-delete`/`-retain`
+already exist fails with `ApplyFailed`** -- `StorageClass.parameters` is
+immutable in the Kubernetes API, live-verified 2026-09-28; see the runbook's
+"When something goes wrong" for the recovery (delete the affected
+StorageClass, let the next reconcile recreate it). Unlike the built-in `delete`/
 `retain` classes, where `helmValues` passthrough still reaches untyped fields
 (e.g. `helmValues.storageClass.delete.volumeBindingMode`), `additional[]`
 entries render with exactly this fixed field set -- there is no `helmValues`
