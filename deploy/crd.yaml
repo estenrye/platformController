@@ -577,24 +577,100 @@ spec:
                     required:
                     - name
                     type: object
-                  defaultStorageClass:
-                    default: delete
-                    description: |-
-                      Which of the chart's two StorageClasses (`csi-cinder-sc-delete`,
-                      `csi-cinder-sc-retain`) is the cluster's default. The controller always
-                      sets both `storageClass.*.isDefault` flags from this one field, so a
-                      `helmValues` passthrough can never create two defaults between them.
-                    enum:
-                    - delete
-                    - retain
-                    - none
-                    type: string
                   helmValues:
                     description: |-
                       Free-form values merged into the chart's values. Typed fields are
                       overlaid on top, so they always win.
                     type: object
                     x-kubernetes-preserve-unknown-fields: true
+                  storageClasses:
+                    default:
+                      additional: []
+                      default: delete
+                      delete:
+                        parameters: {}
+                      retain:
+                        parameters: {}
+                    description: |-
+                      Which StorageClass is the cluster's default, plus typed customization
+                      of the chart's own two StorageClasses and any number of additional
+                      ones.
+                    properties:
+                      additional:
+                        default: []
+                        description: |-
+                          Additional StorageClasses beyond the chart's built-in delete/retain
+                          pair. Rendered into the chart's `storageClass.custom` raw-YAML
+                          extension point, unconditionally, so this list is always the single
+                          source of truth for extra StorageClasses once set.
+                        items:
+                          properties:
+                            isDefault:
+                              default: false
+                              description: |-
+                                At most one StorageClass total (this pool plus `storageClasses.default`)
+                                may set this to `true`.
+                              type: boolean
+                            name:
+                              description: |-
+                                Must be a valid Kubernetes object name and must not collide with the
+                                chart's own `csi-cinder-sc-delete`/`csi-cinder-sc-retain` names.
+                              type: string
+                            parameters:
+                              additionalProperties:
+                                type: string
+                              default: {}
+                              type: object
+                            reclaimPolicy:
+                              description: |-
+                                Spelled `Delete`/`Retain` (capitalized), unlike this CRD's other enums:
+                                the value is copied verbatim into the rendered `StorageClass`'s own
+                                `reclaimPolicy` field, which the Kubernetes API itself spells that way.
+                              enum:
+                              - Delete
+                              - Retain
+                              type: string
+                          required:
+                          - name
+                          - reclaimPolicy
+                          type: object
+                        type: array
+                      default:
+                        default: delete
+                        description: |-
+                          Which of the chart's two built-in StorageClasses is the cluster
+                          default. The controller always sets both `storageClass.*.isDefault`
+                          flags from this one field, so a `helmValues` passthrough can never
+                          create two defaults between them. Making an additional StorageClass
+                          the default is done through that entry's own `isDefault`, not here.
+                        enum:
+                        - delete
+                        - retain
+                        - none
+                        type: string
+                      delete:
+                        default:
+                          parameters: {}
+                        description: Typed `parameters` for `csi-cinder-sc-delete`.
+                        properties:
+                          parameters:
+                            additionalProperties:
+                              type: string
+                            default: {}
+                            type: object
+                        type: object
+                      retain:
+                        default:
+                          parameters: {}
+                        description: Typed `parameters` for `csi-cinder-sc-retain`.
+                        properties:
+                          parameters:
+                            additionalProperties:
+                              type: string
+                            default: {}
+                            type: object
+                        type: object
+                    type: object
                 required:
                 - chartVersion
                 - cloudConfigSecretRef
