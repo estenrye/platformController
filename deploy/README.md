@@ -7,11 +7,12 @@ kubectl apply -f deploy/crd.yaml
 kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/pullthroughcaches.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/cloudcontrollermanagers.platform.rye.ninja
+kubectl wait --for=condition=established --timeout=60s crd/csidrivers.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```
 
-`crd.yaml` (all three CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
+`crd.yaml` (all four CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
 contains a `CniInstallation` custom resource, and the API server rejects a custom
 resource whose kind is not yet registered (`no matches for kind "CniInstallation"`).
 Registration is asynchronous: the CRD can exist while its API endpoint is not yet
@@ -87,7 +88,7 @@ applied. With external cloud-provider kubelets every node is tainted
 the CCM runs on the host network, so it does not need the CNI.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all three CRDs to be Established) *before* rolling the controller image. The new
+all four CRDs to be Established) *before* rolling the controller image. The new
 image's Deployment also tolerates the `uninitialized` taint (`deploy/bootstrap.yaml`);
 without that toleration the controller could not schedule on a cluster whose
 kubelets use an external cloud provider.
@@ -95,6 +96,46 @@ kubelets use an external cloud provider.
 **Deleting** a `CloudControllerManager` removes the chart's objects but does not
 undo node initialization (providerIDs and addresses stay) and does not delete
 existing cloud load balancers.
+
+## CSI driver (OpenStack Cinder, optional)
+
+`examples/csi-driver-openstack-cinder.yaml` is a `CsiDriver` that installs the
+`openstack-cinder-csi` driver (block storage) on a self-hosted Talos cluster
+running on OpenStack VMs, giving the cluster two StorageClasses
+(`csi-cinder-sc-delete`, `csi-cinder-sc-retain`). Skip it on a managed cluster
+(EKS, GKE, AKS, OKE): the provider already runs its own CSI drivers.
+
+Unlike `CloudControllerManager`, `CsiDriver` is **not a `name: default`
+singleton**: a cloud can need several drivers installed at once (this
+controller only builds OpenStack Cinder today), so each CR manages exactly one
+driver and its name must equal that driver's own expected name --
+`openstack-cinder` for `driver: openstackCinder`. A CR with any other name is
+rejected (`Unsupported`).
+
+It needs a Secret named as `spec.openstackCinder.cloudConfigSecretRef.name` in
+`kube-system`, holding the OpenStack cloud config under the key `cloud.conf`.
+The controller never reads it, and does not check that it exists: with the
+Secret missing the driver's pods sit in `ContainerCreating` while
+`.status.phase` still says `Ready` (which means "manifests applied").
+
+`spec.openstackCinder.chartVersion` is the Helm chart version (`2.36.5`), not
+the application version (`v1.36.0`). `spec.openstackCinder.defaultStorageClass`
+(`delete`, `retain` or `none`; default `delete`) picks which StorageClass, if
+any, is the cluster default.
+
+**Apply order:** `CloudControllerManager`, then `CniInstallation`, then
+`CsiDriver`, then `PullThroughCache`. The controller enforces no ordering, but
+unlike the CCM's DaemonSet, the CSI driver's controller-plugin Deployment runs
+on the regular pod network and has no toleration for the `uninitialized` taint
+-- it needs both the CNI and the CCM's node initialization to actually run,
+even though the reconcile that applies its manifests will succeed regardless.
+
+**Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait
+for all four CRDs to be Established) *before* rolling the controller image.
+
+**Deleting** a `CsiDriver` removes the chart's objects but does not delete
+already-provisioned Cinder volumes; PVCs or pods still depending on them can be
+left with a stuck detach/unmount.
 
 ## Calico node address autodetection
 
