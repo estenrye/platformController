@@ -17,8 +17,15 @@ pub const SPEGEL_NAMESPACE: &str = "spegel";
 /// it from Pod Security, so unlike Spegel no namespace is synthesized.
 pub const CCM_NAMESPACE: &str = "kube-system";
 
-/// The Helm repository the OpenStack cloud-controller-manager chart is fetched from.
-pub const OPENSTACK_CCM_CHART_REPO: &str = "https://kubernetes.github.io/cloud-provider-openstack";
+/// The Helm repository both OpenStack charts (cloud-controller-manager and
+/// cinder-csi) are fetched from.
+pub const CLOUD_PROVIDER_OPENSTACK_CHART_REPO: &str = "https://kubernetes.github.io/cloud-provider-openstack";
+
+/// Namespace the openstack-cinder-csi chart is released into. Same reasoning
+/// as `CCM_NAMESPACE`: the chart mounts the cloud-config Secret from its own
+/// release namespace, and `kube-system` already exists on Talos, so no
+/// namespace is synthesized.
+pub const CINDER_CSI_NAMESPACE: &str = "kube-system";
 
 /// Where a Helm chart is fetched from. The two forms invoke `helm template`
 /// differently.
@@ -58,10 +65,22 @@ pub const SPEGEL_CHART: ChartRef = ChartRef {
 pub const OPENSTACK_CCM_CHART: ChartRef = ChartRef {
     release: "openstack-ccm",
     source: ChartSource::Repo {
-        url: OPENSTACK_CCM_CHART_REPO,
+        url: CLOUD_PROVIDER_OPENSTACK_CHART_REPO,
         chart: "openstack-cloud-controller-manager",
     },
     namespace: CCM_NAMESPACE,
+};
+
+/// The release name is part of the node DaemonSet's and controller
+/// Deployment's immutable `selector` (the chart labels pods `release:
+/// <name>`), so it must never change for an installed cluster.
+pub const OPENSTACK_CINDER_CSI_CHART: ChartRef = ChartRef {
+    release: "cinder-csi",
+    source: ChartSource::Repo {
+        url: CLOUD_PROVIDER_OPENSTACK_CHART_REPO,
+        chart: "openstack-cinder-csi",
+    },
+    namespace: CINDER_CSI_NAMESPACE,
 };
 
 pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
@@ -380,6 +399,31 @@ mod tests {
     }
 
     #[test]
+    fn openstack_cinder_csi_render_args_use_the_repo_form_and_kube_system() {
+        let path = std::path::Path::new("/tmp/values.yaml");
+        let args = render_args(&OPENSTACK_CINDER_CSI_CHART, "2.36.5", path);
+
+        assert_eq!(
+            args,
+            vec![
+                "template".to_string(),
+                "cinder-csi".to_string(),
+                "--repo".to_string(),
+                "https://kubernetes.github.io/cloud-provider-openstack".to_string(),
+                "openstack-cinder-csi".to_string(),
+                "--version".to_string(),
+                "2.36.5".to_string(),
+                "--values".to_string(),
+                "/tmp/values.yaml".to_string(),
+                "--include-crds".to_string(),
+                "--no-hooks".to_string(),
+                "--namespace".to_string(),
+                "kube-system".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn strips_the_oci_pull_progress_lines_before_the_first_manifest() {
         let output = "Pulled: ghcr.io/spegel-org/helm-charts/spegel:0.7.4\n\
                       Digest: sha256:abc\n\
@@ -583,6 +627,113 @@ mod tests {
         // its Role is scoped to the same name.
         assert!(rendered.contains("/etc/config/cloud.conf"), "{rendered}");
         assert!(rendered.contains("- my-cloud-config"), "{rendered}");
+
+        // --no-hooks: no hook objects are rendered as live objects.
+        assert!(!rendered.contains("helm.sh/hook"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn openstack_cinder_csi_chart_renders_the_shape_the_spec_relies_on() {
+        let openstack_cinder = crate::csi_driver::OpenstackCinderSpec {
+            chart_version: "2.36.5".to_string(),
+            cloud_config_secret_ref: crate::crd::SecretNameRef {
+                name: "my-cloud-config".to_string(),
+            },
+            ..Default::default()
+        };
+        let values = crate::csi_driver::build_values(&openstack_cinder);
+
+        let rendered = render_chart(&OPENSTACK_CINDER_CSI_CHART, &openstack_cinder.chart_version, &values)
+            .await
+            .expect("helm template should succeed");
+        let objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
+
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|o| o.types.as_ref().expect("every rendered object has a type").kind.as_str())
+            .collect();
+
+        // The controller never creates the credentials Secret; the user does.
+        assert!(!kinds.contains(&"Secret"), "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|kind| **kind == "DaemonSet").count(), 1, "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|kind| **kind == "Deployment").count(), 1, "{kinds:?}");
+        assert!(kinds.contains(&"CSIDriver"), "{kinds:?}");
+
+        let csi_driver_object = objects
+            .iter()
+            .find(|o| o.types.as_ref().unwrap().kind == "CSIDriver")
+            .expect("one CSIDriver");
+        assert_eq!(csi_driver_object.metadata.name.as_deref(), Some("cinder.csi.openstack.org"));
+
+        let node_plugin = objects
+            .iter()
+            .find(|o| o.types.as_ref().unwrap().kind == "DaemonSet")
+            .expect("one DaemonSet");
+        assert_eq!(node_plugin.metadata.namespace.as_deref(), Some("kube-system"));
+
+        let volumes = node_plugin
+            .data
+            .pointer("/spec/template/spec/volumes")
+            .and_then(|value| value.as_array())
+            .expect("the DaemonSet has volumes");
+        let secret_volume = volumes
+            .iter()
+            .find(|volume| volume.get("secret").is_some())
+            .expect("a Secret volume");
+        assert_eq!(secret_volume["secret"]["secretName"], "my-cloud-config");
+
+        // The chart reads the config from the `cloud.conf` key of that Secret.
+        assert!(rendered.contains("/etc/config/cloud.conf"), "{rendered}");
+
+        // Unlike the node plugin, the controller plugin has no hostNetwork and no
+        // toleration: it needs a working CNI and the uninitialized taint cleared
+        // before it can schedule and run. This is why the deploy README documents
+        // CsiDriver as applying after both CloudControllerManager and CniInstallation.
+        let controller_plugin = objects
+            .iter()
+            .find(|o| o.types.as_ref().unwrap().kind == "Deployment")
+            .expect("one Deployment");
+        assert!(
+            controller_plugin.data.pointer("/spec/template/spec/hostNetwork").is_none(),
+            "the controller plugin runs on the pod network"
+        );
+        let controller_tolerations = controller_plugin
+            .data
+            .pointer("/spec/template/spec/tolerations")
+            .and_then(|value| value.as_array());
+        assert!(
+            controller_tolerations.is_none_or(|tolerations| tolerations.is_empty()),
+            "{controller_tolerations:?}"
+        );
+
+        // defaultStorageClass defaults to `delete`: only csi-cinder-sc-delete is
+        // annotated as the cluster default.
+        let delete_class = objects
+            .iter()
+            .find(|o| o.metadata.name.as_deref() == Some("csi-cinder-sc-delete"))
+            .expect("the delete-reclaim StorageClass");
+        let retain_class = objects
+            .iter()
+            .find(|o| o.metadata.name.as_deref() == Some("csi-cinder-sc-retain"))
+            .expect("the retain-reclaim StorageClass");
+        assert_eq!(
+            delete_class
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("storageclass.kubernetes.io/is-default-class"))
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            retain_class
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("storageclass.kubernetes.io/is-default-class"))
+                .is_none()
+        );
 
         // --no-hooks: no hook objects are rendered as live objects.
         assert!(!rendered.contains("helm.sh/hook"));
