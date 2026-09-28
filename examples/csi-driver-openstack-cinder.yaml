@@ -39,6 +39,9 @@ spec:
     chartVersion: "2.36.5"
     cloudConfigSecretRef:
       name: cloud-config
-    # csi-cinder-sc-delete is the cluster's default StorageClass. Set to
-    # "retain" or "none" to choose differently.
-    defaultStorageClass: delete
+    storageClasses:
+      # csi-cinder-sc-delete is the cluster's default StorageClass. Set to
+      # "retain" or "none" to choose differently. delete/retain parameters
+      # (e.g. availability, type) and additional StorageClasses go here too;
+      # see docs/superpowers/specs/2026-09-28-csi-driver-storage-class-customization-design.md
+      default: delete

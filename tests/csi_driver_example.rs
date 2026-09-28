@@ -46,3 +46,12 @@ fn example_values_name_the_secret_the_comment_tells_you_to_create() {
     assert_eq!(values["secret"]["create"], false);
     assert_eq!(values["secret"]["hostMount"], false);
 }
+
+#[test]
+fn example_marks_csi_cinder_sc_delete_as_the_cluster_default() {
+    use platform_controller::csi_driver::DefaultStorageClass;
+
+    let openstack_cinder = load().spec.openstack_cinder;
+
+    assert_eq!(openstack_cinder.storage_classes.default, DefaultStorageClass::Delete);
+}

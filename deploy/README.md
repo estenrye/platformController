@@ -132,9 +132,14 @@ Secret missing the driver's pods sit in `ContainerCreating` while
 `.status.phase` still says `Ready` (which means "manifests applied").
 
 `spec.openstackCinder.chartVersion` is the Helm chart version (`2.36.5`), not
-the application version (`v1.36.0`). `spec.openstackCinder.defaultStorageClass`
-(`delete`, `retain` or `none`; default `delete`) picks which StorageClass, if
-any, is the cluster default.
+the application version (`v1.36.0`). `spec.openstackCinder.storageClasses.default`
+(`delete`, `retain` or `none`; default `delete`) picks which of the two
+built-in StorageClasses, if any, is the cluster default. Each of
+`storageClasses.delete`/`.retain` takes a typed `parameters` map (e.g.
+`availability`, `type`), and `storageClasses.additional` is a list of further
+StorageClasses (`name`, `reclaimPolicy`, `parameters`, `isDefault`) --
+directly motivated by the Nova/Cinder availability-zone mismatch found while
+live-testing this driver (see the runbook).
 
 **Apply order:** `CloudControllerManager`, then `CniInstallation`, then
 `CsiDriver`, then `PullThroughCache`. The controller enforces no ordering, but

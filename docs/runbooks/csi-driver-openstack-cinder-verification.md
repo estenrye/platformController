@@ -61,7 +61,7 @@ kubectl get storageclass
 ```
 
 Expected: `csi-cinder-sc-delete` and `csi-cinder-sc-retain`, both provisioner
-`cinder.csi.openstack.org`. With the example's default `defaultStorageClass:
+`cinder.csi.openstack.org`. With the example's default `storageClasses.default:
 delete`, `csi-cinder-sc-delete` is annotated
 `storageclass.kubernetes.io/is-default-class: "true"` and is the one a PVC that
 names no `storageClassName` gets.
