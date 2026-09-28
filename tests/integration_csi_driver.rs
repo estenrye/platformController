@@ -99,3 +99,117 @@ async fn openstack_cinder_csi_is_applied_and_cleaned_up() {
     })
     .await;
 }
+
+// Run manually against a real cluster with a CsiDriver already applied and
+// Ready (this test mutates an existing one; it doesn't create it from
+// scratch, since csi-cinder-sc-delete must already exist for the
+// immutable-field conflict to trigger at all):
+//
+//   kubectl apply -f examples/csi-driver-openstack-cinder.yaml
+//   # wait for it to reach Ready, then:
+//   cargo test --test integration_csi_driver openstack_cinder_csi_recovers -- --ignored --nocapture
+//
+// Leaves the CsiDriver's csi-cinder-sc-delete/retain parameters set to
+// {availability: nova} at the end -- the real fix for the Nova/Cinder
+// availability-zone mismatch this environment hits, not just a test marker.
+#[tokio::test]
+#[ignore = "requires a real cluster with the controller running and a Ready CsiDriver; see module docs"]
+async fn openstack_cinder_csi_recovers_from_an_immutable_storage_class_parameter_change() {
+    use k8s_openapi::api::storage::v1::StorageClass;
+    use kube::api::{Patch, PatchParams};
+
+    let client = Client::try_default()
+        .await
+        .expect("KUBECONFIG should point at the test cluster");
+
+    let drivers: Api<CsiDriver> = Api::all(client.clone());
+    let storage_classes: Api<StorageClass> = Api::all(client.clone());
+
+    eventually(
+        "CsiDriver already Ready before this test begins",
+        Duration::from_secs(60),
+        || async {
+            drivers
+                .get("openstack-cinder")
+                .await
+                .ok()
+                .and_then(|driver| driver.status)
+                .is_some_and(|status| matches!(status.phase, Phase::Ready))
+        },
+    )
+    .await;
+
+    let before = storage_classes
+        .get("csi-cinder-sc-delete")
+        .await
+        .expect("csi-cinder-sc-delete should already exist");
+    let before_uid = before.metadata.uid.clone();
+
+    // StorageClass.parameters is immutable on update, so this must fail to
+    // apply in place and exercise the reconciler's delete-and-recreate
+    // recovery -- no manual kubectl intervention in this test.
+    let marker_patch = serde_json::json!({
+        "spec": { "openstackCinder": { "storageClasses": {
+            "delete": { "parameters": { "availability": "integration-test-marker" } },
+            "retain": { "parameters": { "availability": "integration-test-marker" } }
+        } } }
+    });
+    drivers
+        .patch("openstack-cinder", &PatchParams::default(), &Patch::Merge(&marker_patch))
+        .await
+        .expect("should patch the CsiDriver with the marker value");
+
+    eventually(
+        "CsiDriver reaching Ready again after the immutable-field recovery",
+        Duration::from_secs(60),
+        || async {
+            drivers
+                .get("openstack-cinder")
+                .await
+                .ok()
+                .and_then(|driver| driver.status)
+                .is_some_and(|status| matches!(status.phase, Phase::Ready))
+        },
+    )
+    .await;
+
+    let after = storage_classes
+        .get("csi-cinder-sc-delete")
+        .await
+        .expect("csi-cinder-sc-delete should exist again after recovery");
+    assert_eq!(
+        after.parameters.as_ref().and_then(|p| p.get("availability")).map(String::as_str),
+        Some("integration-test-marker"),
+        "the new parameters value should have taken effect"
+    );
+    assert_ne!(
+        after.metadata.uid, before_uid,
+        "the StorageClass should have been deleted and recreated (a new UID), not left as-is"
+    );
+
+    // Leave the cluster in the real desired state, not the test marker.
+    let nova_patch = serde_json::json!({
+        "spec": { "openstackCinder": { "storageClasses": {
+            "delete": { "parameters": { "availability": "nova" } },
+            "retain": { "parameters": { "availability": "nova" } }
+        } } }
+    });
+    drivers
+        .patch("openstack-cinder", &PatchParams::default(), &Patch::Merge(&nova_patch))
+        .await
+        .expect("should patch the CsiDriver back to the real availability zone");
+
+    eventually(
+        "CsiDriver reaching Ready after restoring the real availability zone",
+        Duration::from_secs(60),
+        || async {
+            drivers
+                .get("openstack-cinder")
+                .await
+                .ok()
+                .and_then(|driver| driver.status)
+                .is_some_and(|status| matches!(status.phase, Phase::Ready))
+        },
+    )
+    .await;
+}

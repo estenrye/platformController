@@ -241,8 +241,37 @@ async fn reconcile_inner(
         if crate::manifests::is_custom_resource(object) {
             wait_for_object_kind(&ctx.client, object).await?;
         }
-        let reference =
-            crate::apply::apply_object(&ctx.client, object, "platform-controller").await?;
+        let reference = match crate::apply::apply_object(&ctx.client, object, "platform-controller").await {
+            Ok(reference) => reference,
+            // StorageClass has three immutable-on-update fields (parameters,
+            // provisioner, reclaimPolicy); a routine spec edit -- typing a
+            // storageClasses.delete.parameters value onto a StorageClass that
+            // already exists -- hits this every time, live-verified
+            // 2026-09-28. A brief delete-and-recreate is safe here and only
+            // here: an already-bound PV never references the StorageClass
+            // object again, so the only effect is a short window where a
+            // *new* PVC can't bind until the object reappears. Not extended
+            // to CSIDriver, whose immutable fields inform live attach/detach
+            // behavior -- that stays manual, per the runbook.
+            Err(crate::apply::ApplyError::Patch { source, .. })
+                if object.types.as_ref().is_some_and(|types| types.kind == "StorageClass")
+                    && crate::apply::is_immutable_field_error(&source) =>
+            {
+                tracing::warn!(
+                    kind = "StorageClass",
+                    name = object.metadata.name.as_deref().unwrap_or_default(),
+                    "StorageClass field is immutable on update; deleting and recreating"
+                );
+                crate::apply::recreate_after_immutable_field_conflict(
+                    &ctx.client,
+                    object,
+                    "platform-controller",
+                    Duration::from_secs(10),
+                )
+                .await?
+            }
+            Err(err) => return Err(err.into()),
+        };
         if reference.kind == "CustomResourceDefinition" {
             crate::apply::wait_for_crd_established(
                 &ctx.client,
