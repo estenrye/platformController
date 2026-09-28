@@ -640,6 +640,18 @@ mod tests {
             cloud_config_secret_ref: crate::crd::SecretNameRef {
                 name: "my-cloud-config".to_string(),
             },
+            storage_classes: crate::csi_driver::StorageClassesSpec {
+                additional: vec![crate::csi_driver::AdditionalStorageClassSpec {
+                    name: "csi-cinder-sc-az1".to_string(),
+                    reclaim_policy: crate::csi_driver::ReclaimPolicy::Delete,
+                    parameters: std::collections::BTreeMap::from([(
+                        "availability".to_string(),
+                        "az1".to_string(),
+                    )]),
+                    is_default: false,
+                }],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let values = crate::csi_driver::build_values(&openstack_cinder);
@@ -757,6 +769,17 @@ mod tests {
                 .and_then(|annotations| annotations.get("storageclass.kubernetes.io/is-default-class"))
                 .is_none()
         );
+
+        // storageClasses.additional renders a real extra StorageClass through
+        // the chart's own storageClass.custom raw-YAML extension point.
+        let extra_class = objects
+            .iter()
+            .find(|o| o.metadata.name.as_deref() == Some("csi-cinder-sc-az1"))
+            .expect("the additional StorageClass");
+        assert_eq!(extra_class.types.as_ref().unwrap().kind, "StorageClass");
+        assert_eq!(extra_class.data["provisioner"], "cinder.csi.openstack.org");
+        assert_eq!(extra_class.data["reclaimPolicy"], "Delete");
+        assert_eq!(extra_class.data["parameters"]["availability"], "az1");
 
         // --no-hooks: no hook objects are rendered as live objects.
         assert!(!rendered.contains("helm.sh/hook"));
