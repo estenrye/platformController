@@ -620,6 +620,50 @@ mod tests {
     }
 
     #[test]
+    fn values_render_two_additional_storage_classes_into_separate_documents() {
+        use serde::Deserialize;
+
+        let mut spec = openstack_cinder();
+        spec.storage_classes.additional.push(AdditionalStorageClassSpec {
+            name: "csi-cinder-sc-az1".to_string(),
+            reclaim_policy: ReclaimPolicy::Delete,
+            parameters: std::collections::BTreeMap::from([("availability".to_string(), "az1".to_string())]),
+            is_default: false,
+        });
+        spec.storage_classes.additional.push(AdditionalStorageClassSpec {
+            name: "csi-cinder-sc-az2".to_string(),
+            reclaim_policy: ReclaimPolicy::Retain,
+            parameters: std::collections::BTreeMap::from([("availability".to_string(), "az2".to_string())]),
+            is_default: false,
+        });
+
+        let values = build_values(&spec);
+        let custom = values["storageClass"]["custom"].as_str().expect("custom is a string");
+        let docs: Vec<serde_json::Value> = serde_yaml::Deserializer::from_str(custom)
+            .map(|doc| serde_yaml::Value::deserialize(doc).expect("valid YAML"))
+            .map(|v| serde_json::to_value(v).expect("YAML converts to JSON"))
+            .collect();
+
+        assert_eq!(docs.len(), 2, "{custom}");
+
+        let az1 = docs
+            .iter()
+            .find(|doc| doc["metadata"]["name"] == "csi-cinder-sc-az1")
+            .expect("the az1 document");
+        assert_eq!(az1["reclaimPolicy"], "Delete");
+        assert_eq!(az1["parameters"]["availability"], "az1");
+        assert_eq!(az1["parameters"].as_object().unwrap().len(), 1, "{custom}");
+
+        let az2 = docs
+            .iter()
+            .find(|doc| doc["metadata"]["name"] == "csi-cinder-sc-az2")
+            .expect("the az2 document");
+        assert_eq!(az2["reclaimPolicy"], "Retain");
+        assert_eq!(az2["parameters"]["availability"], "az2");
+        assert_eq!(az2["parameters"].as_object().unwrap().len(), 1, "{custom}");
+    }
+
+    #[test]
     fn values_mark_an_additional_storage_class_default_via_annotation() {
         // serde_yaml quotes an ambiguous scalar like the string "true" (as
         // 'true', not "true", and the exact quote style is an implementation

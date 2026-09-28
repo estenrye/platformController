@@ -139,7 +139,13 @@ built-in StorageClasses, if any, is the cluster default. Each of
 `availability`, `type`), and `storageClasses.additional` is a list of further
 StorageClasses (`name`, `reclaimPolicy`, `parameters`, `isDefault`) --
 directly motivated by the Nova/Cinder availability-zone mismatch found while
-live-testing this driver (see the runbook).
+live-testing this driver (see the runbook). Unlike the built-in `delete`/
+`retain` classes, where `helmValues` passthrough still reaches untyped fields
+(e.g. `helmValues.storageClass.delete.volumeBindingMode`), `additional[]`
+entries render with exactly this fixed field set -- there is no `helmValues`
+escape hatch for anything beyond `name`/`reclaimPolicy`/`parameters`/
+`isDefault` on those entries, since `storageClass.custom` is a raw string
+`build_values` overwrites unconditionally and wholesale.
 
 **Apply order:** `CloudControllerManager`, then `CniInstallation`, then
 `CsiDriver`, then `PullThroughCache`. The controller enforces no ordering, but
