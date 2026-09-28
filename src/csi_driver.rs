@@ -175,6 +175,24 @@ pub fn build_values(spec: &OpenstackCinderSpec) -> serde_json::Value {
             "delete": { "isDefault": delete_is_default },
             "retain": { "isDefault": retain_is_default },
         },
+        // The chart's default csi.plugin.volumes hostPath-mounts /etc/cacert
+        // (an optional TLS CA bundle) on both the node and controller plugin
+        // containers. Talos's root filesystem is read-only and never creates
+        // that directory, so the container runtime's mkdir for the bind mount
+        // fails outright ("failed to mkdir \"/etc/cacert\": read-only file
+        // system") -- live-verified against a real Talos cluster. The only
+        // other consumer of csi.plugin.volumeMounts is the required
+        // cloud-config Secret mount, so it's replaced here rather than
+        // emptied, unconditionally so a helmValues passthrough can never
+        // reintroduce the crash.
+        "csi": {
+            "plugin": {
+                "volumes": [],
+                "volumeMounts": [
+                    { "name": "cloud-config", "mountPath": "/etc/config", "readOnly": true },
+                ],
+            },
+        },
     });
 
     crate::pull_through_cache::merge(&mut values, typed);
@@ -348,6 +366,23 @@ mod tests {
     }
 
     #[test]
+    fn values_always_drop_the_incompatible_cacert_hostpath_mount() {
+        // Talos's root filesystem is read-only and never creates /etc/cacert,
+        // so the chart's default hostPath mount for it crashes both the node
+        // and controller plugin containers outright (live-verified). Only the
+        // required cloud-config Secret mount survives the override.
+        let values = build_values(&openstack_cinder());
+
+        assert_eq!(values["csi"]["plugin"]["volumes"], serde_json::json!([]));
+        assert_eq!(
+            values["csi"]["plugin"]["volumeMounts"],
+            serde_json::json!([
+                { "name": "cloud-config", "mountPath": "/etc/config", "readOnly": true },
+            ])
+        );
+    }
+
+    #[test]
     fn default_storage_class_delete_marks_the_delete_class_default() {
         let values = build_values(&openstack_cinder());
 
@@ -383,7 +418,8 @@ mod tests {
         spec.default_storage_class = DefaultStorageClass::Delete;
         spec.helm_values = Some(serde_json::json!({
             "secret": { "create": true, "enabled": false, "hostMount": true, "name": "other" },
-            "storageClass": { "delete": { "isDefault": false }, "retain": { "isDefault": true } }
+            "storageClass": { "delete": { "isDefault": false }, "retain": { "isDefault": true } },
+            "csi": { "plugin": { "volumes": [{ "name": "cacert", "hostPath": { "path": "/etc/cacert" } }] } }
         }));
 
         let values = build_values(&spec);
@@ -394,6 +430,7 @@ mod tests {
         assert_eq!(values["secret"]["name"], "cloud-config");
         assert_eq!(values["storageClass"]["delete"]["isDefault"], true);
         assert_eq!(values["storageClass"]["retain"]["isDefault"], false);
+        assert_eq!(values["csi"]["plugin"]["volumes"], serde_json::json!([]));
     }
 
     #[test]
