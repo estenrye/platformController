@@ -3,8 +3,9 @@
 Manual acceptance for the `SnapshotController` resource. Needs a real
 cluster with `CertManagerInstallation` and `CniInstallation` already
 `Ready`. For step 4, `CsiDriver` (OpenStack Cinder) must also be `Ready`
-with at least one bound PVC. Nothing here has been run yet: record what you
-observe under "Findings to record" at the end.
+with at least one bound PVC. Steps 1-4 were run and passed on a live
+6-node Talos cluster on 2026-09-29; see "Findings to record" at the end
+and `docs/memory/snapshot-controller-2026-09.md` for the full write-up.
 
 ## 1. Apply and reach Ready
 
@@ -137,7 +138,36 @@ deleted at the end of step 4.
 
 ## Findings to record
 
-To fill in from the first live run: whether the namespace-admission
-assumption in step 2 held, the Issuer/Certificate/conversion-strategy result
-in step 3, the VolumeSnapshot result in step 4 (Kubernetes-side and Cinder
-API-side), and anything in step 5 that differs from "Expected".
+Live-verified 2026-09-29 on a 6-node Talos cluster (3 control-plane, 3
+worker; controller rolled `0.1.8` → `0.1.9` as part of this run, chart
+`5.3.0`), alongside `CniInstallation`/`CertManagerInstallation`/`CsiDriver`
+which stayed `Ready` throughout. Steps 1-4 all matched "Expected" exactly:
+
+- Step 1: `Ready` within seconds of applying the CR; both pods
+  (`snapshot-controller`, `snapshot-controller-conversion-webhook`) Running.
+  The controller rollout itself was clean (PDB honored, old pod terminated
+  only after both new replicas were ready) and none of the four existing
+  components were disrupted.
+- Step 2: no `pod-security.kubernetes.io/*` label appeared on the
+  `snapshot-controller` namespace; both pods `Running`. The weaker
+  assumption (no explicit `seccompProfile`, unlike cert-manager's chart)
+  held anyway under Talos's default `baseline` policy.
+- Step 3: `Issuer` and `Certificate` both `Ready=True`; the TLS Secret
+  exists; the group-snapshot CRD's conversion strategy is `Webhook`; the
+  `caBundle` was populated (1456 bytes) — cert-manager's `cainjector` is
+  running and wired the CA in correctly, not just deployed.
+- Step 4: a real `VolumeSnapshot` against a throwaway 1Gi Cinder PVC
+  (`csi-cinder-sc-delete`) reached `readyToUse: true` within ~10 seconds.
+  The underlying `VolumeSnapshotContent` carries a real Cinder-assigned
+  `snapshotHandle` UUID (`ed653dfe-e2bb-4e7e-afeb-d5d02d2252ab`), populated
+  by the CSI driver's actual provisioning call — strong evidence this is a
+  genuine Cinder-side snapshot, not just Kubernetes-side status. Direct
+  `openstack volume snapshot show` confirmation was not possible (no
+  `openstack` CLI/credentials available from the verifying machine); the
+  `snapshotHandle` is the corroborating evidence in its place. All test
+  resources (`VolumeSnapshot`, `VolumeSnapshotClass`, PVC, and the
+  underlying Cinder volume/snapshot) were cleaned up and confirmed gone.
+
+**Not yet run:** step 5 (delete `SnapshotController`, confirm the six-CRD
+cascade). The component was left installed and `Ready` after this run
+rather than torn down.
