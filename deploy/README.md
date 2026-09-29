@@ -211,23 +211,29 @@ not install itself (see that section above): without it, the sidecar runs
 but every `VolumeSnapshot` attempt just retries forever against CRDs that
 don't exist.
 
-This resource has a **hard dependency on `CertManagerInstallation`** being
-`Ready` first: it creates a self-signed `cert-manager.io` `Issuer` for the
-conversion webhook's TLS (group-snapshot support is on by default, which
-needs the webhook), and that `Issuer`'s own CRD only exists once
-`CertManagerInstallation` has been applied. Applying this first surfaces
-`Failed`/`ApplyFailed` and retries automatically once
-`CertManagerInstallation` catches up -- reapplying in the right order isn't
-necessary, just waiting.
+`spec.groupSnapshotsEnabled` defaults to **`false`** -- leave it there on
+OpenStack. `cinder-csi-plugin` has never implemented the CSI group-snapshot
+RPCs (confirmed by searching `kubernetes/cloud-provider-openstack`'s own
+source), and live-testing with this forced on found the conversion webhook
+itself actively erroring on every attempt (`unexpected conversion version
+from "groupsnapshot.storage.k8s.io/v1" to "...v1beta2"`) rather than sitting
+idle. Setting it `true` is only useful for a platform/driver that genuinely
+implements group snapshots (none does today); doing so also creates a
+self-signed `cert-manager.io` `Issuer` for the conversion webhook's TLS,
+which then makes this resource have a **hard dependency on
+`CertManagerInstallation`** being `Ready` first -- applying it before that
+surfaces `Failed`/`ApplyFailed` and retries automatically once
+`CertManagerInstallation` catches up, no need to reapply in order. With the
+default `false`, there is no `CertManagerInstallation` dependency at all.
 
 `spec.chartVersion` is the Helm chart version (`5.3.0`). Like the OpenStack
 charts and unlike cert-manager, chart and app versions do **not** track
 together (chart `5.3.0` ships app `v8.6.0`).
 
-**Apply order:** after `CertManagerInstallation` and `CniInstallation` are
-both `Ready`. No dependency on `CloudControllerManager` or `CsiDriver`,
-though installing this is what makes `CsiDriver`'s `csi-snapshotter` log
-noise stop.
+**Apply order:** after `CniInstallation` is `Ready`. No dependency on
+`CloudControllerManager` or `CsiDriver` (though installing this is what makes
+`CsiDriver`'s `csi-snapshotter` log noise stop), and none on
+`CertManagerInstallation` either unless `groupSnapshotsEnabled: true`.
 
 **Deleting** a `SnapshotController` removes the chart's objects,
 **including its six CRDs** (`volumesnapshots.snapshot.storage.k8s.io`,

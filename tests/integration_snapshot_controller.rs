@@ -1,17 +1,14 @@
 // Run manually against a real cluster (the Talos-in-Docker setup in
 // tests/integration_talos.rs is enough; no OpenStack is needed). With the
-// controller running, all six CRDs Established, and CertManagerInstallation
-// already Ready (this component has a hard dependency on it -- see
-// examples/snapshot-controller.yaml):
+// controller running and all six CRDs Established:
 //
-//   kubectl apply -f examples/cert-manager.yaml
-//   kubectl wait --for=jsonpath='{.status.phase}'=Ready certmgr/default --timeout=300s
 //   kubectl apply -f examples/snapshot-controller.yaml
 //   cargo test --test integration_snapshot_controller -- --ignored --nocapture
 //
-// The test deletes the SnapshotController at the end, so re-apply the
-// example to run it again. It does NOT exercise the Issuer/Certificate
-// smoke test or a real VolumeSnapshot; those are manual runbook steps
+// The example leaves groupSnapshotsEnabled: false (the default), so this has
+// no dependency on CertManagerInstallation. The test deletes the
+// SnapshotController at the end, so re-apply the example to run it again. It
+// does NOT exercise a real VolumeSnapshot; that is a manual runbook step
 // (docs/runbooks/snapshot-controller-verification.md).
 
 use k8s_openapi::api::apps::v1::Deployment;
@@ -69,8 +66,9 @@ async fn snapshot_controller_is_applied_and_cleaned_up() {
         .expect("should list Deployments in the snapshot-controller namespace");
     assert_eq!(
         listed.items.len(),
-        2,
-        "Ready but the expected 2 Deployments (controller, conversion-webhook) are not both present: {:?}",
+        1,
+        "Ready but the expected controller Deployment is not present (groupSnapshotsEnabled: false \
+         means no conversion-webhook Deployment renders): {:?}",
         listed.items.iter().filter_map(|d| d.metadata.name.clone()).collect::<Vec<_>>()
     );
 

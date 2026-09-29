@@ -985,6 +985,7 @@ mod tests {
         let spec = crate::snapshot_controller::SnapshotControllerSpec {
             platform_kind: crate::crd::PlatformKind::TalosLinux,
             chart_version: "5.3.0".to_string(),
+            group_snapshots_enabled: false,
             helm_values: None,
         };
         let values = crate::snapshot_controller::build_values(&spec);
@@ -1000,7 +1001,10 @@ mod tests {
             .collect();
 
         // installCRDs: true is always set (build_values), so all six CRDs
-        // render, in the chart's own document order (live-verified against 5.3.0).
+        // render, in the chart's own document order (live-verified against 5.3.0)
+        // -- even with group snapshots disabled, since installCRDs is a single
+        // all-or-nothing toggle covering all six; the group-snapshot ones just
+        // sit unused until group_snapshots_enabled is also true.
         let crd_names: Vec<&str> = objects
             .iter()
             .filter(|o| o.types.as_ref().unwrap().kind == "CustomResourceDefinition")
@@ -1020,6 +1024,59 @@ mod tests {
         );
         assert!(!kinds.contains(&"Namespace"), "{kinds:?}");
         assert!(!kinds.contains(&"Secret"), "{kinds:?}");
+
+        // With the webhook off, exactly one Deployment (the controller only,
+        // no conversion-webhook) and no Service or Certificate at all
+        // (live-verified 2026-09-29: webhook.enabled: false renders none of
+        // those three).
+        let deployment_names: Vec<&str> = objects
+            .iter()
+            .filter(|o| o.types.as_ref().unwrap().kind == "Deployment")
+            .map(|o| o.metadata.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(deployment_names, vec!["snapshot-controller"], "{deployment_names:?}");
+        assert!(!kinds.contains(&"Service"), "{kinds:?}");
+        assert!(!kinds.contains(&"Certificate"), "{kinds:?}");
+
+        // No CRD carries a conversion block at all with the webhook off --
+        // the API server defaults spec.conversion to strategy: None, matching
+        // upstream (live-verified: zero "conversion:" occurrences).
+        assert!(!rendered.contains("conversion:"), "{rendered}");
+
+        // Group-snapshot support is off by default: no CSI driver this
+        // controller supports today implements the group-snapshot RPCs
+        // (confirmed absent from cinder-csi-plugin's own source), and
+        // live-testing with it forced on found the webhook itself actively
+        // erroring rather than sitting idle.
+        assert!(rendered.contains("--feature-gates="), "{rendered}");
+        assert!(!rendered.contains("--feature-gates=CSIVolumeGroupSnapshot=true"), "{rendered}");
+
+        // No hostPath anywhere, and hostNetwork explicitly false (never true)
+        // -- supports (but does not by itself confirm) the synthesized
+        // namespace needing no pod-security.kubernetes.io/* labels;
+        // live-verified 2026-09-29 against a real Talos cluster.
+        assert!(!rendered.contains("hostPath"), "{rendered}");
+        assert!(!rendered.contains("hostNetwork: true"), "{rendered}");
+
+        // --no-hooks: no hook objects are rendered as live objects.
+        assert!(!rendered.contains("helm.sh/hook"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn snapshot_controller_chart_renders_group_snapshot_support_when_enabled() {
+        let spec = crate::snapshot_controller::SnapshotControllerSpec {
+            platform_kind: crate::crd::PlatformKind::TalosLinux,
+            chart_version: "5.3.0".to_string(),
+            group_snapshots_enabled: true,
+            helm_values: None,
+        };
+        let values = crate::snapshot_controller::build_values(&spec);
+
+        let rendered = render_chart(&SNAPSHOT_CONTROLLER_CHART, &spec.chart_version, &values)
+            .await
+            .expect("helm template should succeed");
+        let objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
 
         // Exactly the controller and conversion-webhook Deployments.
         let mut deployment_names: Vec<&str> = objects
@@ -1055,19 +1112,18 @@ mod tests {
         );
         assert_eq!(certificate.data["spec"]["issuerRef"]["kind"], "Issuer");
 
-        // Group-snapshot support is on (the chart's own default, left
-        // unoverridden per the approved design).
+        // Group-snapshot support is on when explicitly requested.
         assert!(rendered.contains("--feature-gates=CSIVolumeGroupSnapshot=true"), "{rendered}");
 
-        // No hostPath anywhere, and hostNetwork explicitly false (never true) on
-        // both Deployments -- supports (but does not by itself confirm) the
-        // synthesized namespace needing no pod-security.kubernetes.io/* labels;
-        // reconfirm live per Task 6's runbook.
-        assert!(!rendered.contains("hostPath"), "{rendered}");
-        assert!(!rendered.contains("hostNetwork: true"), "{rendered}");
-
-        // --no-hooks: no hook objects are rendered as live objects.
-        assert!(!rendered.contains("helm.sh/hook"));
+        // KNOWN ISSUE, live-verified 2026-09-29: enabling the webhook this way
+        // makes the snapshot-controller unable to actually create any
+        // VolumeGroupSnapshotContent at all -- the conversion webhook itself
+        // errors on every attempt ("unexpected conversion version from
+        // groupsnapshot.storage.k8s.io/v1 to groupsnapshot.storage.k8s.io/v1beta2"),
+        // and separately no CSI driver this controller supports implements the
+        // group-snapshot RPCs regardless. group_snapshots_enabled defaults to
+        // false for this reason; this test only pins the chart's *rendered
+        // shape* when the flag is set, not that the feature works end to end.
     }
 
     #[tokio::test]

@@ -22,10 +22,24 @@ pub const SNAPSHOT_CONTROLLER_ISSUER_NAME: &str = "snapshot-controller-selfsigne
 pub struct SnapshotControllerSpec {
     pub platform_kind: PlatformKind,
     pub chart_version: String,
+    /// Whether to also install the CRD conversion webhook and the self-signed
+    /// cert-manager `Issuer` group-snapshot support needs. Defaults to
+    /// `false`: no CSI driver this controller supports today implements the
+    /// CSI group-snapshot RPCs (`CreateVolumeGroupSnapshot` and friends --
+    /// confirmed absent anywhere in `kubernetes/cloud-provider-openstack`'s
+    /// `cinder-csi-plugin` source, live-verified 2026-09-29), and live-testing
+    /// with this forced on found the webhook itself actively erroring
+    /// (`unexpected conversion version from "groupsnapshot.storage.k8s.io/v1"
+    /// to "...v1beta2"` on every attempt) rather than sitting idle -- worse
+    /// than a no-op. A future platform or driver that does implement group
+    /// snapshots can opt in explicitly once that's actually true.
+    #[serde(default)]
+    pub group_snapshots_enabled: bool,
     /// Free-form values merged into the chart's values. The controller's own
-    /// typed values (`installCRDs`, `webhook.enabled`, `webhook.tls.*`) are
-    /// overlaid afterwards, so they always win -- and `validate_snapshot_controller`
-    /// rejects a `helmValues` attempt to set any of them outright, rather than
+    /// typed values (`installCRDs`, `webhook.enabled`, `webhook.tls.*`,
+    /// `controller.args.featureGates`) are overlaid afterwards, so they
+    /// always win -- and `validate_snapshot_controller` rejects a
+    /// `helmValues` attempt to set any of them outright, rather than
     /// silently overriding it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::pull_through_cache::preserve_unknown_object")]
@@ -61,15 +75,21 @@ pub enum SnapshotControllerSpecError {
     )]
     HelmValuesSetInstallCrds,
     #[error(
-        "spec.helmValues must not set webhook.enabled: the conversion webhook is always forced \
-         on for group-snapshot support"
+        "spec.helmValues must not set webhook.enabled: it is always derived from \
+         spec.groupSnapshotsEnabled"
     )]
     HelmValuesSetWebhookEnabled,
     #[error(
-        "spec.helmValues must not set webhook.tls.*: TLS is always wired to the self-signed \
-         cert-manager Issuer this component creates"
+        "spec.helmValues must not set webhook.tls.*: it is always derived from \
+         spec.groupSnapshotsEnabled -- wired to the self-signed cert-manager Issuer this \
+         component creates when true, left at the chart default when false"
     )]
     HelmValuesSetWebhookTls,
+    #[error(
+        "spec.helmValues must not set controller.args.featureGates: it is always derived from \
+         spec.groupSnapshotsEnabled"
+    )]
+    HelmValuesSetControllerArgsFeatureGates,
 }
 
 impl SnapshotControllerSpecError {
@@ -81,7 +101,8 @@ impl SnapshotControllerSpecError {
             SnapshotControllerSpecError::HelmValuesNotObject
             | SnapshotControllerSpecError::HelmValuesSetInstallCrds
             | SnapshotControllerSpecError::HelmValuesSetWebhookEnabled
-            | SnapshotControllerSpecError::HelmValuesSetWebhookTls => "InvalidHelmValues",
+            | SnapshotControllerSpecError::HelmValuesSetWebhookTls
+            | SnapshotControllerSpecError::HelmValuesSetControllerArgsFeatureGates => "InvalidHelmValues",
         }
     }
 }
@@ -112,6 +133,14 @@ pub fn validate_snapshot_controller(
     if values.get("webhook").and_then(|webhook| webhook.get("tls")).is_some() {
         return Err(SnapshotControllerSpecError::HelmValuesSetWebhookTls);
     }
+    if values
+        .get("controller")
+        .and_then(|controller| controller.get("args"))
+        .and_then(|args| args.get("featureGates"))
+        .is_some()
+    {
+        return Err(SnapshotControllerSpecError::HelmValuesSetControllerArgsFeatureGates);
+    }
     Ok(())
 }
 
@@ -122,28 +151,53 @@ pub fn validate_snapshot_controller(
 /// `installCRDs: true` is also this chart's own default (live-verified
 /// against 5.3.0), but forced here the same way `CertManagerInstallation`
 /// forces `crds.enabled` -- defense against a future chart-default flip, not
-/// defensive redundancy today. `webhook.enabled: true` turns on the
-/// conversion webhook the group-snapshot CRDs need; `webhook.tls.autogenerate:
-/// false` plus `certManagerIssuerRef` point its TLS at the self-signed
-/// `Issuer` the reconciler creates (`SNAPSHOT_CONTROLLER_ISSUER_NAME`),
-/// instead of the chart's own Helm-generated self-signed cert -- the exact
-/// recipe from the chart's own README.
+/// defensive redundancy today.
+///
+/// `webhook.*` and `controller.args.featureGates` are entirely driven by
+/// `spec.group_snapshots_enabled`:
+/// - `false` (the default): `webhook.enabled: false` and
+///   `featureGates: ""` -- live-verified against chart 5.3.0 to render
+///   exactly one Deployment, no Service, no `Certificate`, and no
+///   `spec.conversion` block on any of the six CRDs (defaults to `None`).
+/// - `true`: `webhook.enabled: true`, `webhook.tls.autogenerate: false` plus
+///   `certManagerIssuerRef` pointing at the self-signed `Issuer` the
+///   reconciler creates (`SNAPSHOT_CONTROLLER_ISSUER_NAME`) -- the exact
+///   recipe from the chart's own README -- and
+///   `featureGates: "CSIVolumeGroupSnapshot=true"`.
 pub fn build_values(spec: &SnapshotControllerSpec) -> serde_json::Value {
     let mut values = spec.helm_values.clone().unwrap_or_else(|| serde_json::json!({}));
 
-    let typed = serde_json::json!({
+    let (webhook_enabled, feature_gates) =
+        if spec.group_snapshots_enabled { (true, "CSIVolumeGroupSnapshot=true") } else { (false, "") };
+
+    let mut typed = serde_json::json!({
         "installCRDs": true,
         "webhook": {
-            "enabled": true,
-            "tls": {
-                "autogenerate": false,
-                "certManagerIssuerRef": {
-                    "name": SNAPSHOT_CONTROLLER_ISSUER_NAME,
-                    "kind": "Issuer",
-                },
+            "enabled": webhook_enabled,
+        },
+        "controller": {
+            "args": {
+                "featureGates": feature_gates,
             },
         },
     });
+
+    if spec.group_snapshots_enabled {
+        crate::pull_through_cache::merge(
+            &mut typed,
+            serde_json::json!({
+                "webhook": {
+                    "tls": {
+                        "autogenerate": false,
+                        "certManagerIssuerRef": {
+                            "name": SNAPSHOT_CONTROLLER_ISSUER_NAME,
+                            "kind": "Issuer",
+                        },
+                    },
+                },
+            }),
+        );
+    }
 
     crate::pull_through_cache::merge(&mut values, typed);
     values
@@ -158,6 +212,7 @@ mod tests {
         SnapshotControllerSpec {
             platform_kind: crate::crd::PlatformKind::TalosLinux,
             chart_version: "5.3.0".to_string(),
+            group_snapshots_enabled: false,
             helm_values: None,
         }
     }
@@ -172,7 +227,20 @@ mod tests {
 
         assert_eq!(spec.platform_kind, crate::crd::PlatformKind::TalosLinux);
         assert_eq!(spec.chart_version, "5.3.0");
+        assert!(!spec.group_snapshots_enabled, "omitted groupSnapshotsEnabled must default to false");
         assert!(spec.helm_values.is_none());
+    }
+
+    #[test]
+    fn spec_deserializes_group_snapshots_enabled_when_set() {
+        let spec: SnapshotControllerSpec = serde_json::from_value(serde_json::json!({
+            "platformKind": "talos-linux",
+            "chartVersion": "5.3.0",
+            "groupSnapshotsEnabled": true
+        }))
+        .expect("spec should deserialize");
+
+        assert!(spec.group_snapshots_enabled);
     }
 
     #[test]
@@ -276,14 +344,46 @@ mod tests {
     }
 
     #[test]
-    fn values_always_force_install_crds_webhook_and_the_selfsigned_issuer_ref() {
+    fn rejects_helm_values_that_set_controller_args_feature_gates() {
+        let mut s = spec();
+        s.helm_values = Some(serde_json::json!({ "controller": { "args": { "featureGates": "Foo=true" } } }));
+
+        let err = validate_snapshot_controller(&s).expect_err("controller.args.featureGates via helmValues is invalid");
+
+        assert_eq!(err, SnapshotControllerSpecError::HelmValuesSetControllerArgsFeatureGates);
+        assert_eq!(err.reason(), "InvalidHelmValues");
+    }
+
+    #[test]
+    fn accepts_helm_values_that_touch_other_controller_args() {
+        let mut s = spec();
+        s.helm_values = Some(serde_json::json!({ "controller": { "args": { "httpEndpoint": ":9090" } } }));
+
+        assert_eq!(validate_snapshot_controller(&s), Ok(()));
+    }
+
+    #[test]
+    fn values_disable_webhook_and_the_group_snapshot_feature_gate_by_default() {
         let values = build_values(&spec());
+
+        assert_eq!(values["installCRDs"], true);
+        assert_eq!(values["webhook"]["enabled"], false);
+        assert_eq!(values["controller"]["args"]["featureGates"], "");
+    }
+
+    #[test]
+    fn values_enable_webhook_and_the_group_snapshot_feature_gate_when_requested() {
+        let mut s = spec();
+        s.group_snapshots_enabled = true;
+
+        let values = build_values(&s);
 
         assert_eq!(values["installCRDs"], true);
         assert_eq!(values["webhook"]["enabled"], true);
         assert_eq!(values["webhook"]["tls"]["autogenerate"], false);
         assert_eq!(values["webhook"]["tls"]["certManagerIssuerRef"]["name"], SNAPSHOT_CONTROLLER_ISSUER_NAME);
         assert_eq!(values["webhook"]["tls"]["certManagerIssuerRef"]["kind"], "Issuer");
+        assert_eq!(values["controller"]["args"]["featureGates"], "CSIVolumeGroupSnapshot=true");
     }
 
     #[test]
@@ -296,7 +396,7 @@ mod tests {
         assert_eq!(values["controller"]["replicaCount"], 2);
         assert_eq!(values["webhook"]["replicaCount"], 2);
         assert_eq!(values["installCRDs"], true);
-        assert_eq!(values["webhook"]["enabled"], true);
+        assert_eq!(values["webhook"]["enabled"], false);
     }
 
     #[test]
