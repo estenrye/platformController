@@ -9,6 +9,7 @@ kubectl wait --for=condition=established --timeout=60s crd/pullthroughcaches.pla
 kubectl wait --for=condition=established --timeout=60s crd/cloudcontrollermanagers.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/csidrivers.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/certmanagerinstallations.platform.rye.ninja
+kubectl wait --for=condition=established --timeout=60s crd/snapshotcontrollers.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```
@@ -59,7 +60,7 @@ Omitting `spec.spegel.registries` mirrors every registry, private ones included.
 `spec.spegel.chartVersion` is the OCI chart tag and has no `v` prefix (`0.7.4`).
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all five CRDs to be Established) *before* rolling the controller image. A controller
+all six CRDs to be Established) *before* rolling the controller image. A controller
 that starts without the `PullThroughCache` CRD logs watch errors for it and
 retries with backoff; it still reconciles `CniInstallation` normally.
 
@@ -89,7 +90,7 @@ reconciles when applied. With external cloud-provider kubelets every node is tai
 the CCM runs on the host network, so it does not need the CNI.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all five CRDs to be Established) *before* rolling the controller image. The new
+all six CRDs to be Established) *before* rolling the controller image. The new
 image's Deployment also tolerates the `uninitialized` taint (`deploy/bootstrap.yaml`);
 without that toleration the controller could not schedule on a cluster whose
 kubelets use an external cloud provider.
@@ -161,7 +162,7 @@ on the regular pod network and has no toleration for the `uninitialized` taint
 even though the reconcile that applies its manifests will succeed regardless.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait
-for all five CRDs to be Established) *before* rolling the controller image.
+for all six CRDs to be Established) *before* rolling the controller image.
 
 **Deleting** a `CsiDriver` removes the chart's objects but does not delete
 already-provisioned Cinder volumes; PVCs or pods still depending on them can be
@@ -198,6 +199,43 @@ of a kind when its CRD is deleted, so this destroys **every**
 `Certificate`/`Issuer`/`ClusterIssuer`/`CertificateRequest`/`Order`/
 `Challenge` in the cluster along with it -- not just the ones this resource
 manages. Back up or export anything you need before deleting.
+
+## Cluster-wide CSI snapshot support (optional)
+
+`examples/snapshot-controller.yaml` is a `SnapshotController` that installs
+the cluster-wide `snapshot.storage.k8s.io`/`groupsnapshot.storage.k8s.io`
+CRDs and the `snapshot-controller` itself, from
+[piraeusdatastore/helm-charts](https://github.com/piraeusdatastore/helm-charts).
+This is the piece `CsiDriver`'s own `csi-snapshotter` sidecar needs but does
+not install itself (see that section above): without it, the sidecar runs
+but every `VolumeSnapshot` attempt just retries forever against CRDs that
+don't exist.
+
+This resource has a **hard dependency on `CertManagerInstallation`** being
+`Ready` first: it creates a self-signed `cert-manager.io` `Issuer` for the
+conversion webhook's TLS (group-snapshot support is on by default, which
+needs the webhook), and that `Issuer`'s own CRD only exists once
+`CertManagerInstallation` has been applied. Applying this first surfaces
+`Failed`/`ApplyFailed` and retries automatically once
+`CertManagerInstallation` catches up -- reapplying in the right order isn't
+necessary, just waiting.
+
+`spec.chartVersion` is the Helm chart version (`5.3.0`). Like the OpenStack
+charts and unlike cert-manager, chart and app versions do **not** track
+together (chart `5.3.0` ships app `v8.6.0`).
+
+**Apply order:** after `CertManagerInstallation` and `CniInstallation` are
+both `Ready`. No dependency on `CloudControllerManager` or `CsiDriver`,
+though installing this is what makes `CsiDriver`'s `csi-snapshotter` log
+noise stop.
+
+**Deleting** a `SnapshotController` removes the chart's objects,
+**including its six CRDs** (`volumesnapshots.snapshot.storage.k8s.io`,
+`volumesnapshotclasses.snapshot.storage.k8s.io`, etc.). Kubernetes deletes
+every instance of a kind when its CRD is deleted, so this destroys **every**
+`VolumeSnapshot`/`VolumeSnapshotContent`/`VolumeSnapshotClass`/
+`VolumeGroupSnapshot*` in the cluster along with it -- not just ones this
+resource manages. Back up or export anything you need before deleting.
 
 ## Calico node address autodetection
 

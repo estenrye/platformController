@@ -15,5 +15,7 @@ pub mod leader;
 pub mod ledger;
 pub mod manifests;
 pub mod pull_through_cache;
+pub mod snapshot_controller;
+pub mod snapshot_controller_reconciler;
 pub mod reconciler;
 pub mod spec_validation;

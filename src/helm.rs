@@ -32,6 +32,17 @@ pub const CINDER_CSI_NAMESPACE: &str = "kube-system";
 /// own (live-verified against chart v1.16.2).
 pub const CERT_MANAGER_NAMESPACE: &str = "cert-manager";
 
+/// Namespace the snapshot-controller chart's namespaced objects belong in.
+/// Like tigera-operator, Spegel and cert-manager, the chart renders no
+/// `Namespace` object of its own (live-verified against chart 5.3.0).
+pub const SNAPSHOT_CONTROLLER_NAMESPACE: &str = "snapshot-controller";
+
+/// The Helm repository the snapshot-controller chart is fetched from --
+/// piraeusdatastore/helm-charts' classic repo, sourced directly from
+/// kubernetes-csi/external-snapshotter (there is no official chart from
+/// kubernetes-csi itself).
+pub const PIRAEUS_CHART_REPO: &str = "https://piraeus.io/helm-charts/";
+
 /// Where a Helm chart is fetched from. The two forms invoke `helm template`
 /// differently.
 pub enum ChartSource {
@@ -97,6 +108,15 @@ pub const CERT_MANAGER_CHART: ChartRef = ChartRef {
         reference: "oci://quay.io/jetstack/charts/cert-manager",
     },
     namespace: CERT_MANAGER_NAMESPACE,
+};
+
+pub const SNAPSHOT_CONTROLLER_CHART: ChartRef = ChartRef {
+    release: "snapshot-controller",
+    source: ChartSource::Repo {
+        url: PIRAEUS_CHART_REPO,
+        chart: "snapshot-controller",
+    },
+    namespace: SNAPSHOT_CONTROLLER_NAMESPACE,
 };
 
 pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
@@ -408,6 +428,31 @@ mod tests {
                 "--no-hooks".to_string(),
                 "--namespace".to_string(),
                 "cert-manager".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_controller_render_args_use_the_piraeus_repo_and_namespace() {
+        let path = std::path::Path::new("/tmp/values.yaml");
+        let args = render_args(&SNAPSHOT_CONTROLLER_CHART, "5.3.0", path);
+
+        assert_eq!(
+            args,
+            vec![
+                "template".to_string(),
+                "snapshot-controller".to_string(),
+                "--repo".to_string(),
+                "https://piraeus.io/helm-charts/".to_string(),
+                "snapshot-controller".to_string(),
+                "--version".to_string(),
+                "5.3.0".to_string(),
+                "--values".to_string(),
+                "/tmp/values.yaml".to_string(),
+                "--include-crds".to_string(),
+                "--no-hooks".to_string(),
+                "--namespace".to_string(),
+                "snapshot-controller".to_string(),
             ]
         );
     }
@@ -932,6 +977,97 @@ mod tests {
             !objects.iter().any(|o| o.types.as_ref().unwrap().kind == "CustomResourceDefinition"),
             "chart default changed: CRDs now render without crds.enabled"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn snapshot_controller_chart_renders_the_shape_the_spec_relies_on() {
+        let spec = crate::snapshot_controller::SnapshotControllerSpec {
+            platform_kind: crate::crd::PlatformKind::TalosLinux,
+            chart_version: "5.3.0".to_string(),
+            helm_values: None,
+        };
+        let values = crate::snapshot_controller::build_values(&spec);
+
+        let rendered = render_chart(&SNAPSHOT_CONTROLLER_CHART, &spec.chart_version, &values)
+            .await
+            .expect("helm template should succeed");
+        let objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
+
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|o| o.types.as_ref().expect("every rendered object has a type").kind.as_str())
+            .collect();
+
+        // installCRDs: true is always set (build_values), so all six CRDs
+        // render, in the chart's own document order (live-verified against 5.3.0).
+        let crd_names: Vec<&str> = objects
+            .iter()
+            .filter(|o| o.types.as_ref().unwrap().kind == "CustomResourceDefinition")
+            .map(|o| o.metadata.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            crd_names,
+            vec![
+                "volumesnapshotclasses.snapshot.storage.k8s.io",
+                "volumesnapshots.snapshot.storage.k8s.io",
+                "volumesnapshotcontents.snapshot.storage.k8s.io",
+                "volumegroupsnapshotclasses.groupsnapshot.storage.k8s.io",
+                "volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io",
+                "volumegroupsnapshots.groupsnapshot.storage.k8s.io",
+            ],
+            "{crd_names:?}"
+        );
+        assert!(!kinds.contains(&"Namespace"), "{kinds:?}");
+        assert!(!kinds.contains(&"Secret"), "{kinds:?}");
+
+        // Exactly the controller and conversion-webhook Deployments.
+        let mut deployment_names: Vec<&str> = objects
+            .iter()
+            .filter(|o| o.types.as_ref().unwrap().kind == "Deployment")
+            .map(|o| o.metadata.name.as_deref().unwrap())
+            .collect();
+        deployment_names.sort_unstable();
+        assert_eq!(
+            deployment_names,
+            vec!["snapshot-controller", "snapshot-controller-conversion-webhook"],
+            "{deployment_names:?}"
+        );
+
+        // Exactly one Service, for the webhook -- the controller serves no traffic.
+        let service_names: Vec<&str> = objects
+            .iter()
+            .filter(|o| o.types.as_ref().unwrap().kind == "Service")
+            .map(|o| o.metadata.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(service_names, vec!["snapshot-controller-conversion-webhook"], "{service_names:?}");
+
+        // The webhook's Certificate references the self-signed Issuer this
+        // component creates, by name and kind, not the chart's own
+        // Helm-generated cert (webhook.tls.autogenerate: false, verified here).
+        let certificate = objects
+            .iter()
+            .find(|o| o.types.as_ref().unwrap().kind == "Certificate")
+            .expect("chart renders a Certificate when webhook.enabled and webhook.tls.certManagerIssuerRef are set");
+        assert_eq!(
+            certificate.data["spec"]["issuerRef"]["name"],
+            crate::snapshot_controller::SNAPSHOT_CONTROLLER_ISSUER_NAME
+        );
+        assert_eq!(certificate.data["spec"]["issuerRef"]["kind"], "Issuer");
+
+        // Group-snapshot support is on (the chart's own default, left
+        // unoverridden per the approved design).
+        assert!(rendered.contains("--feature-gates=CSIVolumeGroupSnapshot=true"), "{rendered}");
+
+        // No hostPath anywhere, and hostNetwork explicitly false (never true) on
+        // both Deployments -- supports (but does not by itself confirm) the
+        // synthesized namespace needing no pod-security.kubernetes.io/* labels;
+        // reconfirm live per Task 6's runbook.
+        assert!(!rendered.contains("hostPath"), "{rendered}");
+        assert!(!rendered.contains("hostNetwork: true"), "{rendered}");
+
+        // --no-hooks: no hook objects are rendered as live objects.
+        assert!(!rendered.contains("helm.sh/hook"));
     }
 
     #[tokio::test]

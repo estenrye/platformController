@@ -124,9 +124,11 @@ Status mirrors every other kind and reuses `Phase`, `Condition` and
    This is a hard dependency: applying an `Issuer` object before its CRD
    exists is a discovery failure, not an eventually-consistent Pending pod
    like `CsiDriver`'s ordering against `CloudControllerManager`. Timing out
-   here writes `Failed`/`CertManagerNotReady` and the controller's normal
-   requeue retries once `CertManagerInstallation` has caught up — no new
-   retry mechanism, reusing what's already there.
+   here writes `Failed`/`ApplyFailed` (the same reason
+   `ApplyError::KindNotAvailable` already maps to, no new variant or reason
+   string) and the controller's normal requeue retries once
+   `CertManagerInstallation` has caught up — no new retry mechanism, reusing
+   what's already there.
 3. Build (not yet apply) two hand-built objects: a `snapshot-controller`
    namespace (the chart renders none, same as
    `tigera-operator`/`spegel`/`cert-manager`) and a self-signed `Issuer`
@@ -227,8 +229,8 @@ plainly.
   Deployments and the `Issuer`/`Certificate` appear and the `Certificate`
   reaches `Ready`, delete the CR, assert the applied resources (including the
   `Issuer`) are gone. Also assert that applying this CR **before**
-  `CertManagerInstallation` surfaces `Failed`/`CertManagerNotReady` rather
-  than hanging or erroring some other way.
+  `CertManagerInstallation` surfaces `Failed`/`ApplyFailed` rather than
+  hanging or erroring some other way.
 - **Live acceptance (manual, real cluster, runbook):** namespace admission;
   the self-signed `Issuer`/`Certificate` smoke test; a real `VolumeSnapshot`
   against a live Cinder PVC, confirmed `readyToUse: true` and a real Cinder
@@ -239,4 +241,10 @@ plainly.
 
 ## Verification status
 
-Not yet implemented.
+Implemented. All six tasks are merged and the full Rust test suite passes
+(283 tests, 0 failed, 9 ignored), including the ignored real-chart test in
+`src/helm.rs` run with `--ignored` against the live `piraeus.io` chart --
+the CRD list, Deployment/Service/Certificate shape and feature-gate default
+described above are live-verified facts, not assumptions. Cluster
+verification (the runbook, `docs/runbooks/snapshot-controller-verification.md`)
+has not yet been run.
