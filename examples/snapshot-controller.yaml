@@ -1,0 +1,27 @@
+# Sample SnapshotController for a self-hosted Talos Linux cluster: installs
+# the cluster-wide CSI VolumeSnapshot support (the snapshot.storage.k8s.io/
+# groupsnapshot.storage.k8s.io CRDs and the snapshot-controller itself) that
+# CsiDriver's own csi-snapshotter sidecar needs to actually produce a
+# VolumeSnapshot. Without this, the sidecar runs but every snapshot attempt
+# just retries forever against CRDs that don't exist yet.
+#
+# This resource has a hard dependency on CertManagerInstallation already
+# being Ready: it creates a self-signed cert-manager Issuer for the
+# conversion webhook's TLS, which needs cert-manager's own Issuer CRD
+# registered first. Applying this before CertManagerInstallation is Ready
+# surfaces Failed/ApplyFailed and retries automatically once it catches up --
+# no need to reapply in the right order, just wait.
+#
+#   kubectl apply -f examples/cert-manager.yaml
+#   kubectl wait --for=jsonpath='{.status.phase}'=Ready certmgr/default --timeout=300s
+#   kubectl apply -f examples/snapshot-controller.yaml
+apiVersion: platform.rye.ninja/v1alpha1
+kind: SnapshotController
+metadata:
+  name: default
+spec:
+  platformKind: talos-linux
+  # The Helm CHART version, not the app version (v8.6.0 at this chart
+  # version) -- chart and app versions do not track together here, unlike
+  # cert-manager.
+  chartVersion: "5.3.0"
