@@ -1,9 +1,19 @@
 ---
 name: csi-snapshot-support-2026-09
-description: Queued sub-project - CSI VolumeSnapshot support for CsiDriver (cluster-wide CRDs, snapshot-controller, VolumeSnapshotClasses); research done, not yet brainstormed to a spec
+description: Sub-project B, split 2026-09-29: the CRD/controller/webhook half shipped as SnapshotController (see [[snapshot-controller-2026-09]]); typed VolumeSnapshotClass support on CsiDriver remains genuinely queued
 metadata:
   type: project
 ---
+
+**Split 2026-09-29.** The CRD/controller/cluster-wide `snapshot-controller`
+half of this sub-project shipped as its own component,
+[[snapshot-controller-2026-09]] -- see that memory and
+`docs/superpowers/specs/2026-09-29-snapshot-controller-design.md` for what
+was actually built, including two corrections to the research below (a real
+Helm chart does exist; group-snapshot support was included rather than
+skipped). The typed-`VolumeSnapshotClass`-on-`CsiDriver` half described
+below (naming convention, `storageClasses.additional[]`-shaped
+`helmValues`) remains genuinely queued and unbuilt.
 
 Sub-project B of an original request that got decomposed during brainstorming on 2026-09-28. Sub-project A (typed StorageClass customization, [[csi-driver-openstack-cinder-2026-09]]) shipped as `v0.1.6`/`v0.1.7` and is done. This one has **not** been brainstormed to a spec yet -- classification, questions, and design are all still ahead of it. What follows is research and provisional recommendations from that day's conversation, not decisions.
 
