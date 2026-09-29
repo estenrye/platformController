@@ -891,12 +891,28 @@ spec:
             properties:
               chartVersion:
                 type: string
+              groupSnapshotsEnabled:
+                default: false
+                description: |-
+                  Whether to also install the CRD conversion webhook and the self-signed
+                  cert-manager `Issuer` group-snapshot support needs. Defaults to
+                  `false`: no CSI driver this controller supports today implements the
+                  CSI group-snapshot RPCs (`CreateVolumeGroupSnapshot` and friends --
+                  confirmed absent anywhere in `kubernetes/cloud-provider-openstack`'s
+                  `cinder-csi-plugin` source, live-verified 2026-09-29), and live-testing
+                  with this forced on found the webhook itself actively erroring
+                  (`unexpected conversion version from "groupsnapshot.storage.k8s.io/v1"
+                  to "...v1beta2"` on every attempt) rather than sitting idle -- worse
+                  than a no-op. A future platform or driver that does implement group
+                  snapshots can opt in explicitly once that's actually true.
+                type: boolean
               helmValues:
                 description: |-
                   Free-form values merged into the chart's values. The controller's own
-                  typed values (`installCRDs`, `webhook.enabled`, `webhook.tls.*`) are
-                  overlaid afterwards, so they always win -- and `validate_snapshot_controller`
-                  rejects a `helmValues` attempt to set any of them outright, rather than
+                  typed values (`installCRDs`, `webhook.enabled`, `webhook.tls.*`,
+                  `controller.args.featureGates`) are overlaid afterwards, so they
+                  always win -- and `validate_snapshot_controller` rejects a
+                  `helmValues` attempt to set any of them outright, rather than
                   silently overriding it.
                 type: object
                 x-kubernetes-preserve-unknown-fields: true

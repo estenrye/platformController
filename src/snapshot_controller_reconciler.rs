@@ -267,14 +267,15 @@ async fn reconcile_inner(
 
     // Everything this reconcile will apply is known now, in apply order: the
     // target namespace, the self-signed Issuer the webhook's Certificate
-    // references, then the chart's own rendered objects. Persist it before
-    // the first apply so a failure, a crash or a leader change can never
-    // leave an applied object out of the ledger cleanup acts on. Steady-state
-    // resyncs add nothing, so they write nothing.
-    let mut desired = vec![
-        crate::apply::resource_ref(&snapshot_controller_namespace_object()),
-        crate::apply::resource_ref(&snapshot_controller_selfsigned_issuer_object()),
-    ];
+    // references (only when group_snapshots_enabled), then the chart's own
+    // rendered objects. Persist it before the first apply so a failure, a
+    // crash or a leader change can never leave an applied object out of the
+    // ledger cleanup acts on. Steady-state resyncs add nothing, so they
+    // write nothing.
+    let mut desired = vec![crate::apply::resource_ref(&snapshot_controller_namespace_object())];
+    if obj.spec.group_snapshots_enabled {
+        desired.push(crate::apply::resource_ref(&snapshot_controller_selfsigned_issuer_object()));
+    }
     desired.extend(objects.iter().map(crate::apply::resource_ref));
     progress.desired = Some(desired.clone());
     if let Some(ledger) = crate::ledger::checkpoint_ledger(&previous, &desired) {
@@ -304,16 +305,20 @@ async fn reconcile_inner(
     .await?;
     applied.push(namespace_ref);
 
-    // The Issuer is a cert-manager.io custom resource: its CRD only exists
-    // once CertManagerInstallation has been applied and reconciled. Waiting
-    // here, rather than assuming it, is what turns "CertManagerInstallation
-    // isn't applied yet" into a retried Failed/ApplyFailed status instead of
-    // a hard, unretried discovery error.
-    let issuer_object = snapshot_controller_selfsigned_issuer_object();
-    wait_for_object_kind(&ctx.client, &issuer_object).await?;
-    let issuer_ref =
-        crate::apply::apply_object(&ctx.client, &issuer_object, "platform-controller").await?;
-    applied.push(issuer_ref);
+    // The Issuer only exists when group_snapshots_enabled -- CertManagerInstallation
+    // is a conditional dependency, not a hard one, of this component overall.
+    // It's a cert-manager.io custom resource: its CRD only exists once
+    // CertManagerInstallation has been applied and reconciled. Waiting here,
+    // rather than assuming it, is what turns "CertManagerInstallation isn't
+    // applied yet" into a retried Failed/ApplyFailed status instead of a
+    // hard, unretried discovery error.
+    if obj.spec.group_snapshots_enabled {
+        let issuer_object = snapshot_controller_selfsigned_issuer_object();
+        wait_for_object_kind(&ctx.client, &issuer_object).await?;
+        let issuer_ref =
+            crate::apply::apply_object(&ctx.client, &issuer_object, "platform-controller").await?;
+        applied.push(issuer_ref);
+    }
 
     for object in &objects {
         // The chart's own Certificate is a cert-manager.io custom resource
@@ -426,12 +431,12 @@ pub async fn cleanup(
         return Ok(Action::await_change());
     }
 
-    // Reverse ledger order: the namespace and Issuer were applied first, so
-    // they go last. installCRDs: true means the chart's own CRDs are in this
-    // ledger, so deleting them cascades away every VolumeSnapshot/
-    // VolumeGroupSnapshot-family object in the cluster, not just this
-    // component's own -- documented, not coded around, same as
-    // CertManagerInstallation's cleanup.
+    // Reverse ledger order: the namespace (and, when group_snapshots_enabled
+    // was true, the Issuer) were applied first, so they go last. installCRDs:
+    // true means the chart's own CRDs are in this ledger, so deleting them
+    // cascades away every VolumeSnapshot/VolumeGroupSnapshot-family object in
+    // the cluster, not just this component's own -- documented, not coded
+    // around, same as CertManagerInstallation's cleanup.
     for reference in applied.iter().rev() {
         tracing::info!(
             installation = %name,
@@ -474,6 +479,7 @@ mod tests {
         SnapshotControllerSpec {
             platform_kind,
             chart_version: "5.3.0".to_string(),
+            group_snapshots_enabled: false,
             helm_values: None,
         }
     }

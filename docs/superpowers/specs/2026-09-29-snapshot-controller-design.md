@@ -1,7 +1,30 @@
 # SnapshotController (CSI Volume Snapshot Support)
 
-Status: Draft, awaiting review
+Status: Implemented, live-verified
 Date: 2026-09-29
+
+**Update 2026-09-29 (post-live-verification):** the design below as
+originally written forced group-snapshot support (the conversion webhook,
+the self-signed `Issuer`, `CertManagerInstallation` as a hard dependency) on
+unconditionally. Deploying it to a real cluster found two independent,
+live-confirmed problems: (1) `kubernetes/cloud-provider-openstack`'s
+`cinder-csi-plugin` has never implemented the CSI group-snapshot RPCs
+(`CreateVolumeGroupSnapshot` etc. — confirmed absent anywhere in that
+project's source), so no CSI driver this controller supports today can act
+on a `VolumeGroupSnapshot` at all; and (2) the deployed conversion webhook
+itself actively errors on every conversion attempt
+(`unexpected conversion version from "groupsnapshot.storage.k8s.io/v1" to
+"...v1beta2"`), which is strictly worse than a no-op — a `VolumeGroupSnapshot`
+retries forever rather than failing cleanly. Rather than removing
+group-snapshot support outright (hard-coding "off" in the binary would mean
+a future platform/driver that does implement it needs a code change and
+redeploy to turn it back on), `spec.groupSnapshotsEnabled` was added: a
+typed, per-deployment toggle, defaulting to `false`. The body below is
+updated in place to describe the toggle; passages describing the
+now-superseded "always on" behavior have been corrected, not left as
+historical record — this is a behavior spec, and stale behavior claims here
+would mislead a future reader. The full live-testing narrative lives in
+`docs/memory/snapshot-controller-2026-09.md`.
 
 ## Purpose
 
@@ -15,24 +38,27 @@ the `snapshot-controller` Deployment those sidecars need to actually produce a
 doesn't work.
 
 This spec adds a sixth platform component, `SnapshotController`, that installs
-that missing cluster-level piece: the CRDs, the controller, and — because
-group-snapshot support and its conversion webhook are in scope for this slice
-— a self-signed `cert-manager` `Issuer` and `Certificate` for the webhook's
-TLS. It resumes the queued sub-project B recorded in
-[[csi-snapshot-support-2026-09]] (sub-project A, typed `StorageClass`
-customization on `CsiDriver`, already shipped), but departs from that
-project's research in one material way: that research assumed
-`kubernetes-csi/external-snapshotter` had no Helm chart and would need a new
-raw-YAML render path. It does have one — `piraeusdatastore/helm-charts`'
-`snapshot-controller` chart, sourced directly from the same upstream project —
-so this design reuses the existing `helm.rs` render pipeline unchanged, the
-same way every other component does.
+that missing cluster-level piece: the CRDs and the controller, always. Group
+snapshot support — a conversion webhook plus a self-signed `cert-manager`
+`Issuer`/`Certificate` for its TLS — is optional, off by default
+(`spec.groupSnapshotsEnabled: false`), since no CSI driver this controller
+supports today implements it (see the Update note above). It resumes the
+queued sub-project B recorded in [[csi-snapshot-support-2026-09]]
+(sub-project A, typed `StorageClass` customization on `CsiDriver`, already
+shipped), but departs from that project's research in one material way: that
+research assumed `kubernetes-csi/external-snapshotter` had no Helm chart and
+would need a new raw-YAML render path. It does have one —
+`piraeusdatastore/helm-charts`' `snapshot-controller` chart, sourced directly
+from the same upstream project — so this design reuses the existing `helm.rs`
+render pipeline unchanged, the same way every other component does.
 
-This component depends on `CertManagerInstallation` (already shipped,
-[[cert-manager-2026-09]]) being applied first, for the `Issuer`/`Certificate`
-CRDs the webhook's TLS setup needs. `CertManagerInstallation` itself
-deliberately installs no `Issuer`/`ClusterIssuer` — this is the "future,
-separate component" its own Non-goals pointed at.
+When `groupSnapshotsEnabled: true`, this component depends on
+`CertManagerInstallation` (already shipped, [[cert-manager-2026-09]]) being
+applied first, for the `Issuer`/`Certificate` CRDs the webhook's TLS setup
+needs. `CertManagerInstallation` itself deliberately installs no
+`Issuer`/`ClusterIssuer` — this is the "future, separate component" its own
+Non-goals pointed at. With the default `false`, this component has no
+dependency on `CertManagerInstallation` at all.
 
 ## Non-goals
 
@@ -51,12 +77,17 @@ separate component" its own Non-goals pointed at.
   same as everywhere else — not "the webhook is serving" or "a test
   `VolumeSnapshot` was issued".
 - **Waiting for `CertManagerInstallation` inside this spec's own validation.**
-  This component's reconcile waits for the `Issuer` kind to become available
-  (see Reconcile) and surfaces that as a retried `Failed` status if
-  `CertManagerInstallation` isn't there yet; it does not check for
-  `CertManagerInstallation`'s existence as a CR, the same "no cross-CR
-  ownership checks" stance `CsiDriver` already takes toward
+  When `groupSnapshotsEnabled: true`, this component's reconcile waits for
+  the `Issuer` kind to become available (see Reconcile) and surfaces that as
+  a retried `Failed` status if `CertManagerInstallation` isn't there yet; it
+  does not check for `CertManagerInstallation`'s existence as a CR, the same
+  "no cross-CR ownership checks" stance `CsiDriver` already takes toward
   `CloudControllerManager`'s taint-clearing.
+- **Making group snapshots work on OpenStack.** Not fixable here: no version
+  of `cinder-csi-plugin` implements the CSI group-snapshot RPCs (confirmed
+  by searching `kubernetes/cloud-provider-openstack`'s own source,
+  2026-09-29). This would need an upstream PR merged into that project, not
+  a change on this controller's side.
 - **An airgapped chart source.** Fetched from `https://piraeus.io/helm-charts/`,
   so it needs that egress, same caveat as every other chart-fetching
   component.
@@ -76,9 +107,10 @@ kind: SnapshotController        # cluster-scoped, shortname "snapctl"
 metadata:
   name: default                 # singleton, same rule as the other five
 spec:
-  platformKind: talos-linux     # only value accepted today
-  chartVersion: "5.3.0"         # required, no default, same as every other chart
-  helmValues: {}                # optional free-form passthrough
+  platformKind: talos-linux         # only value accepted today
+  chartVersion: "5.3.0"             # required, no default, same as every other chart
+  groupSnapshotsEnabled: false      # optional, default false
+  helmValues: {}                    # optional free-form passthrough
 ```
 
 - `chartVersion` is the `snapshot-controller` chart's own version (chart and
@@ -86,18 +118,28 @@ spec:
   `v8.6.0` — so this needs live confirmation and a note in the example, the
   same caution the Cinder spec already applies to chart-vs-app version
   drift).
+- `groupSnapshotsEnabled` is a typed, per-deployment toggle for the CRD
+  conversion webhook and its self-signed `Issuer`, defaulting to `false`.
+  Live-tested with it forced on: two independent problems, both confirmed on
+  a real cluster (see the Update note above) — no supported driver
+  implements the group-snapshot RPCs, and the deployed conversion webhook
+  itself errors on every attempt rather than sitting idle. Defaulting off
+  avoids both by default while leaving a real path to opt in once a
+  driver/platform actually supports it, without a controller code change.
 - `helmValues` is merged first; the controller's own typed values are
   overlaid afterwards, so a passthrough can never disable or contradict them.
-  Forced, not user-controlled: `installCRDs: true`, `webhook.enabled: true`,
-  `webhook.tls.autogenerate: false`, `webhook.tls.certManagerIssuerRef: {name:
-  snapshot-controller-selfsigned, kind: Issuer}`. Rejected as
-  `InvalidHelmValues` if `helmValues` sets any of `installCRDs`,
-  `webhook.enabled`, or `webhook.tls.*` — the same "don't silently let a
-  passthrough reintroduce a broken state" rule `CsiDriver` applies to
-  `secret.data`, made an explicit rejection here rather than a silent
-  overlay-and-ignore, since a webhook TLS misconfiguration fails loudly
-  (`Failed` cert issuance) rather than quietly like a re-added hostPath mount
-  would.
+  Always forced: `installCRDs: true`. Driven by `groupSnapshotsEnabled`:
+  `webhook.enabled` (`false` by default, `true` when enabled, along with
+  `webhook.tls.autogenerate: false` and `webhook.tls.certManagerIssuerRef:
+  {name: snapshot-controller-selfsigned, kind: Issuer}`) and
+  `controller.args.featureGates` (`""` by default, `"CSIVolumeGroupSnapshot=true"`
+  when enabled). Rejected as `InvalidHelmValues` if `helmValues` sets any of
+  `installCRDs`, `webhook.enabled`, `webhook.tls.*`, or
+  `controller.args.featureGates` — the same "don't silently let a passthrough
+  reintroduce a broken state" rule `CsiDriver` applies to `secret.data`, made
+  an explicit rejection here rather than a silent overlay-and-ignore, since
+  the only way to change these is the typed toggle that also gates the
+  `Issuer`/dependency logic.
 - No `cleanupTimeoutSeconds`: no DaemonSet-shaped, node-resident resources
   need a bounded wait on removal, same as `CertManagerInstallation`.
 
@@ -109,7 +151,8 @@ every other component:
 - `chartVersion` is empty, or has leading/trailing whitespace —
   `InvalidChartVersion`
 - `helmValues` is not a JSON object, or sets `installCRDs` /
-  `webhook.enabled` / any `webhook.tls.*` key — `InvalidHelmValues`
+  `webhook.enabled` / any `webhook.tls.*` key / `controller.args.featureGates`
+  — `InvalidHelmValues`
 
 Status mirrors every other kind and reuses `Phase`, `Condition` and
 `AppliedResourceRef`: `phase`, `observedGeneration`, `chartVersion`,
@@ -118,40 +161,39 @@ Status mirrors every other kind and reuses `Phase`, `Condition` and
 ### Reconcile
 
 1. Leader gate, then validate; write `Failed` status on rejection.
-2. **Wait for the `Issuer` kind (`cert-manager.io/v1`) to be available**,
-   via the existing `apply::wait_for_kind_available` — the same utility
-   `CniInstallation` already uses to wait for the tigera operator's own CRDs.
-   This is a hard dependency: applying an `Issuer` object before its CRD
-   exists is a discovery failure, not an eventually-consistent Pending pod
-   like `CsiDriver`'s ordering against `CloudControllerManager`. Timing out
-   here writes `Failed`/`ApplyFailed` (the same reason
-   `ApplyError::KindNotAvailable` already maps to, no new variant or reason
-   string) and the controller's normal requeue retries once
-   `CertManagerInstallation` has caught up — no new retry mechanism, reusing
-   what's already there.
-3. Build (not yet apply) two hand-built objects: a `snapshot-controller`
-   namespace (the chart renders none, same as
-   `tigera-operator`/`spegel`/`cert-manager`) and a self-signed `Issuer`
+2. Build (not yet apply) the `snapshot-controller` namespace object (the
+   chart renders none, same as `tigera-operator`/`spegel`/`cert-manager`).
+   The namespace gets no `pod-security.kubernetes.io/*` labels: the
+   controller's own `securityContext` drops all capabilities and runs
+   non-root, but (unlike cert-manager's chart) doesn't set `seccompProfile`
+   explicitly — live-verified 2026-09-29 against a real Talos cluster: no
+   admission rejection either way.
+3. **Only when `groupSnapshotsEnabled: true`:** build a self-signed `Issuer`
    named `snapshot-controller-selfsigned` in that namespace — the exact
    recipe from the chart's own README (`spec: { selfSigned: {} }`), not an
-   invented shape. The namespace gets no `pod-security.kubernetes.io/*`
-   labels: the controller's own `securityContext` drops all capabilities and
-   runs non-root, but (unlike cert-manager's chart) doesn't set
-   `seccompProfile` explicitly, so this design assumes Talos's default
-   `baseline` policy admits it unmodified — a stated assumption, confirmed or
-   corrected live in the runbook, the same pattern `CertManagerInstallation`'s
-   own spec already used for its namespace-admission assumption.
+   invented shape — and wait for the `Issuer` kind (`cert-manager.io/v1`) to
+   be available via the existing `apply::wait_for_kind_available`, the same
+   utility `CniInstallation` already uses to wait for the tigera operator's
+   own CRDs. This is a hard dependency when the flag is set: applying an
+   `Issuer` object before its CRD exists is a discovery failure, not an
+   eventually-consistent Pending pod like `CsiDriver`'s ordering against
+   `CloudControllerManager`. Timing out here writes `Failed`/`ApplyFailed`
+   (the same reason `ApplyError::KindNotAvailable` already maps to, no new
+   variant or reason string) and the controller's normal requeue retries
+   once `CertManagerInstallation` has caught up. When the flag is `false`
+   (the default), none of this runs and there is no `CertManagerInstallation`
+   dependency at all.
 4. Render the chart (`helm template`, classic repo
    `https://piraeus.io/helm-charts/`, chart `snapshot-controller`) with the
-   forced values from the API section above layered over `helmValues`,
+   forced values from the API section above layered over `helmValues` —
    `webhook.tls.certManagerIssuerRef` pointing at the `Issuer` name from
-   step 3.
-5. Parse the rendered objects, prepend the two hand-built objects from step
-   3, sort the combined set by rank. Checkpoint the ledger against this full
-   desired set *before* applying anything — the same "everything about to be
-   applied is known and persisted first" invariant every other reconciler
-   already follows — then apply in rank order and prune anything no longer
-   in the desired set.
+   step 3 only when `groupSnapshotsEnabled: true`.
+5. Parse the rendered objects, prepend the namespace (and, when enabled, the
+   `Issuer`) from steps 2-3, sort the combined set by rank. Checkpoint the
+   ledger against this full desired set *before* applying anything — the
+   same "everything about to be applied is known and persisted first"
+   invariant every other reconciler already follows — then apply in rank
+   order and prune anything no longer in the desired set.
 6. Write `Ready` status; requeue at 300s.
 
 ### Cleanup
@@ -192,59 +234,68 @@ plainly.
 - No RBAC change (cluster-admin already covers it); the RBAC ledger memory
   gains a row.
 - `examples/snapshot-controller.yaml`: a Talos starting point, `name:
-  default`, a pinned `chartVersion`.
-- New `deploy/README.md` section: apply **after** `CertManagerInstallation`
-  is `Ready` (hard dependency, step 2 above) and after `CniInstallation`
-  (pods run on the pod network and need cluster DNS). No dependency on
-  `CloudControllerManager` or `CsiDriver` — but installing it makes
+  default`, a pinned `chartVersion`, `groupSnapshotsEnabled: false`.
+- New `deploy/README.md` section: apply after `CniInstallation` (pods run on
+  the pod network and need cluster DNS). No dependency on
+  `CertManagerInstallation`, `CloudControllerManager` or `CsiDriver` with the
+  default `groupSnapshotsEnabled: false` — but installing it makes
   `CsiDriver`'s `csi-snapshotter` sidecar's log noise stop, so listing it near
-  `CsiDriver` in the apply-order doc is still useful context.
+  `CsiDriver` in the apply-order doc is still useful context. Enabling group
+  snapshots adds a hard `CertManagerInstallation` dependency, documented
+  where the flag itself is documented.
 - `docs/runbooks/snapshot-controller-verification.md`: namespace admission
-  under `baseline` PSS; the self-signed `Issuer`/`Certificate` issuing
-  correctly (confirms the webhook's own TLS, not yet the conversion path);
-  a real `VolumeSnapshot` created against a Cinder PVC and bound
-  (`readyToUse: true`), proving the `CsiDriver` sidecar integration this
-  whole slice exists for; a `VolumeGroupSnapshot` round-trip through the
-  conversion webhook; delete/cleanup, including the CRD cascade-delete
-  caveat.
+  under `baseline` PSS; a real `VolumeSnapshot` created against a Cinder PVC
+  and bound (`readyToUse: true`), proving the `CsiDriver` sidecar integration
+  this whole slice exists for; delete/cleanup, including the CRD
+  cascade-delete caveat. Group-snapshot-specific steps (the self-signed
+  `Issuer`/`Certificate`, a `VolumeGroupSnapshot` attempt) are documented as
+  a known-broken path, not a passing verification step.
 - A `docs/memory/` entry and index line, per `CLAUDE.md`; the queued
   `csi-snapshot-support-2026-09` memory gets superseded/updated to point here
   rather than left dangling as "queued".
 
 ## Testing
 
-- **Unit:** spec deserialization and defaults; each validation rejection
-  (including the three new `InvalidHelmValues` cases for `installCRDs`,
-  `webhook.enabled`, `webhook.tls.*`); values builder (forced fields always
-  win over `helmValues`); the `Issuer` object builder.
+- **Unit:** spec deserialization and defaults (`groupSnapshotsEnabled`
+  defaults `false`); each validation rejection (including the
+  `InvalidHelmValues` cases for `installCRDs`, `webhook.enabled`,
+  `webhook.tls.*`, `controller.args.featureGates`); values builder for both
+  branches of `groupSnapshotsEnabled` (forced fields always win over
+  `helmValues`); the `Issuer` object builder.
 - **Real-chart (ignored, needs network), in the style of the CCM/Cinder
-  real-chart tests:** render chart `5.3.0` with the controller's values and
-  assert all six CRDs, the webhook Deployment, the controller Deployment, and
-  that `certManagerIssuerRef` reaches the rendered `Certificate` object
-  correctly. Re-run on every chart bump.
+  real-chart tests:** two tests — `groupSnapshotsEnabled: false` (the
+  default) asserts all six CRDs, exactly one Deployment, no Service, no
+  `Certificate`, no CRD conversion block, and an empty feature-gates flag;
+  `groupSnapshotsEnabled: true` asserts the webhook Deployment/Service
+  appear and `certManagerIssuerRef` reaches the rendered `Certificate`
+  object correctly, noting the known-broken conversion path in a code
+  comment rather than asserting it works. Re-run both on every chart bump.
 - **Example:** the example manifest parses and validates, in the style of
   `tests/cloud_controller_manager_example.rs`.
-- **Integration (ignored, Talos-in-Docker):** apply
-  `CertManagerInstallation` then this CR, assert the controller/webhook
-  Deployments and the `Issuer`/`Certificate` appear and the `Certificate`
-  reaches `Ready`, delete the CR, assert the applied resources (including the
-  `Issuer`) are gone. Also assert that applying this CR **before**
-  `CertManagerInstallation` surfaces `Failed`/`ApplyFailed` rather than
-  hanging or erroring some other way.
-- **Live acceptance (manual, real cluster, runbook):** namespace admission;
-  the self-signed `Issuer`/`Certificate` smoke test; a real `VolumeSnapshot`
-  against a live Cinder PVC, confirmed `readyToUse: true` and a real Cinder
-  snapshot exists via the Cinder API directly (not just Kubernetes status,
-  matching how the Cinder PVC provisioning claim was verified); a
-  `VolumeGroupSnapshot` conversion-webhook round-trip; delete behavior and
-  the CRD cascade-delete confirmed for real.
+- **Integration (ignored, Talos-in-Docker):** apply this CR with the default
+  `groupSnapshotsEnabled: false`, assert the controller Deployment appears,
+  delete the CR, assert the applied resources are gone. No
+  `CertManagerInstallation` prerequisite needed for this path.
+- **Live acceptance (manual, real cluster, runbook):** namespace admission; a
+  real `VolumeSnapshot` against a live Cinder PVC, confirmed `readyToUse:
+  true` via a real Cinder-assigned `snapshotHandle`; delete behavior and the
+  CRD cascade-delete. Group snapshots are documented as a known-broken,
+  opt-in path, not a passing verification step.
 
 ## Verification status
 
-Implemented. All six tasks are merged and the full Rust test suite passes
-(283 tests, 0 failed, 9 ignored), including the ignored real-chart test in
-`src/helm.rs` run with `--ignored` against the live `piraeus.io` chart --
-the CRD list, Deployment/Service/Certificate shape and feature-gate default
-described above are live-verified facts, not assumptions. Cluster
-verification (the runbook, `docs/runbooks/snapshot-controller-verification.md`)
-has not yet been run.
+Implemented and live-verified, including the `groupSnapshotsEnabled` toggle.
+All six original tasks plus this correction are merged; the full Rust test
+suite passes, including both ignored real-chart tests in `src/helm.rs` run
+with `--ignored` against the live `piraeus.io` chart. Live-verified against a
+real 6-node Talos cluster 2026-09-29: with the default `groupSnapshotsEnabled:
+false`, `Ready` in seconds, namespace admission held, and a real
+`VolumeSnapshot` against a Cinder PVC reached `readyToUse: true` with a
+genuine Cinder-assigned `snapshotHandle`. With `groupSnapshotsEnabled: true`
+(tested before the toggle was added, prompting it): the CRD/controller/
+webhook infrastructure came up correctly (`Issuer`/`Certificate` both
+`Ready=True`, `cainjector` populated the CA bundle), but every
+`VolumeGroupSnapshot` attempt failed with a conversion-webhook error, and
+separately no CSI driver this controller supports implements the
+group-snapshot RPCs at all — see the Update note above. Full write-up:
+`docs/memory/snapshot-controller-2026-09.md`.

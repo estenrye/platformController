@@ -27,13 +27,13 @@ fn example_is_the_singleton_and_passes_validation() {
 }
 
 #[test]
-fn example_values_force_install_crds_webhook_and_the_selfsigned_issuer() {
-    let values = build_values(&load().spec);
+fn example_leaves_group_snapshots_disabled_by_default() {
+    let spec = load().spec;
+
+    assert!(!spec.group_snapshots_enabled);
+
+    let values = build_values(&spec);
 
     assert_eq!(values["installCRDs"], true);
-    assert_eq!(values["webhook"]["enabled"], true);
-    assert_eq!(
-        values["webhook"]["tls"]["certManagerIssuerRef"]["name"],
-        platform_controller::snapshot_controller::SNAPSHOT_CONTROLLER_ISSUER_NAME
-    );
+    assert_eq!(values["webhook"]["enabled"], false);
 }
