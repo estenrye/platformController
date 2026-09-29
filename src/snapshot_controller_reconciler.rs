@@ -86,6 +86,23 @@ pub fn snapshot_controller_selfsigned_issuer_object() -> DynamicObject {
     .expect("static Issuer JSON deserializes into a DynamicObject")
 }
 
+/// Whether `objects` include at least one rendered `CustomResourceDefinition`.
+///
+/// `chartVersion` is user-typed and has no default: `helm template` ignores
+/// unknown values keys rather than erroring, so a future chart version that
+/// renames or removes `installCRDs` would render zero CRDs while everything
+/// else (namespace, Issuer, RBAC, Deployments) still applies successfully.
+/// Checked here, after parsing, so that misconfiguration surfaces as
+/// `Failed` / `MissingCrds` instead of a cluster reporting `Ready` with the
+/// entire reason this component exists -- the
+/// `snapshot.storage.k8s.io`/`groupsnapshot.storage.k8s.io` CRDs --
+/// silently absent. Mirrors `cert_manager_reconciler::renders_expected_crds`.
+fn renders_expected_crds(objects: &[DynamicObject]) -> bool {
+    objects
+        .iter()
+        .any(|object| object.types.as_ref().is_some_and(|types| types.kind == "CustomResourceDefinition"))
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum SnapshotControllerReconcileError {
     #[error(transparent)]
@@ -100,6 +117,13 @@ pub enum SnapshotControllerReconcileError {
     Status(#[source] kube::Error),
     #[error("not the leader; standing down")]
     NotLeader,
+    #[error(
+        "chart version {0:?} rendered no CustomResourceDefinition objects; installCRDs is \
+         forced true but a future chart version that renames or removes that key would render \
+         none while helm silently ignores the unknown key -- pin a chart version that still \
+         supports installCRDs"
+    )]
+    NoCrdsRendered(String),
 }
 
 impl SnapshotControllerReconcileError {
@@ -120,6 +144,7 @@ impl SnapshotControllerReconcileError {
             SnapshotControllerReconcileError::Helm(_) => Some("RenderFailed"),
             SnapshotControllerReconcileError::Manifest(_) => Some("InvalidManifest"),
             SnapshotControllerReconcileError::Apply(_) => Some("ApplyFailed"),
+            SnapshotControllerReconcileError::NoCrdsRendered(_) => Some("MissingCrds"),
             SnapshotControllerReconcileError::Validation(_)
             | SnapshotControllerReconcileError::Status(_)
             | SnapshotControllerReconcileError::NotLeader => None,
@@ -235,6 +260,10 @@ async fn reconcile_inner(
         object_count = objects.len(),
         "parsed and sorted rendered manifests"
     );
+
+    if !renders_expected_crds(&objects) {
+        return Err(SnapshotControllerReconcileError::NoCrdsRendered(chart_version));
+    }
 
     // Everything this reconcile will apply is known now, in apply order: the
     // target namespace, the self-signed Issuer the webhook's Certificate
@@ -560,5 +589,38 @@ mod tests {
 
         assert_eq!(validation.failure_reason(), None);
         assert_eq!(SnapshotControllerReconcileError::NotLeader.failure_reason(), None);
+    }
+
+    #[test]
+    fn renders_expected_crds_is_false_when_no_crd_is_rendered() {
+        // Mirrors cert_manager_reconciler's own guard: chartVersion is
+        // user-typed and has no default, and helm ignores unknown values keys
+        // rather than erroring, so a future chart version that renames or
+        // removes installCRDs would render zero CRDs while everything else
+        // still applies successfully. This is the shape that scenario
+        // produces.
+        let objects = crate::manifests::parse_manifests(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: snapshot-controller\n  namespace: snapshot-controller\n",
+        )
+        .expect("manifest should parse");
+
+        assert!(!renders_expected_crds(&objects));
+    }
+
+    #[test]
+    fn renders_expected_crds_is_true_when_a_crd_is_rendered() {
+        let objects = crate::manifests::parse_manifests(
+            "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: volumesnapshots.snapshot.storage.k8s.io\n",
+        )
+        .expect("manifest should parse");
+
+        assert!(renders_expected_crds(&objects));
+    }
+
+    #[test]
+    fn missing_crds_errors_report_missing_crds() {
+        let err = SnapshotControllerReconcileError::NoCrdsRendered("5.2.0".to_string());
+
+        assert_eq!(err.failure_reason(), Some("MissingCrds"));
     }
 }
