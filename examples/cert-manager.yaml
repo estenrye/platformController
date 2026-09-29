@@ -1,0 +1,22 @@
+# Sample CertManagerInstallation for a self-hosted Talos Linux cluster:
+# installs cert-manager, the standard Kubernetes operator for issuing and
+# renewing X.509 certificates. This resource only installs cert-manager
+# itself -- it does NOT configure any ClusterIssuer/Issuer (self-signed CA,
+# ACME, DNS-01 solvers). Configure those directly against the running
+# cert-manager once this resource reaches Ready; see
+# docs/runbooks/cert-manager-verification.md for a self-signed smoke test.
+#
+# The chart runs cert-manager on the pod network, so apply this after the CNI
+# is Ready (a CniInstallation that has reached Ready).
+#
+#   kubectl apply -f examples/cert-manager.yaml
+apiVersion: platform.rye.ninja/v1alpha1
+kind: CertManagerInstallation
+metadata:
+  name: default
+spec:
+  platformKind: talos-linux
+  # Unlike the OpenStack charts, cert-manager's chart and app versions track
+  # together and both carry the "v" prefix. If .status shows Failed /
+  # RenderFailed, an app-only or un-prefixed version is the usual cause.
+  chartVersion: "v1.16.2"
