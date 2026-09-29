@@ -191,10 +191,13 @@ on the pod network and need cluster DNS, same reasoning as
 `PullThroughCache`). No dependency on `CloudControllerManager` or
 `CsiDriver`.
 
-**Deleting** a `CertManagerInstallation` removes the chart's objects
-(including its CRDs) but does not touch any `Certificate`/`Issuer`/
-`ClusterIssuer` a person created against it -- those become orphaned data
-with no controller renewing them.
+**Deleting** a `CertManagerInstallation` removes the chart's objects,
+**including its CRDs** (`certificates.cert-manager.io`,
+`clusterissuers.cert-manager.io`, etc.). Kubernetes deletes every instance
+of a kind when its CRD is deleted, so this destroys **every**
+`Certificate`/`Issuer`/`ClusterIssuer`/`CertificateRequest`/`Order`/
+`Challenge` in the cluster along with it -- not just the ones this resource
+manages. Back up or export anything you need before deleting.
 
 ## Calico node address autodetection
 

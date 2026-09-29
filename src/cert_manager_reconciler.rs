@@ -68,6 +68,22 @@ pub fn cert_manager_namespace_object() -> DynamicObject {
     .expect("static Namespace JSON deserializes into a DynamicObject")
 }
 
+/// Whether `objects` include at least one rendered `CustomResourceDefinition`.
+///
+/// `build_values` forces `crds.enabled: true` unconditionally, but that value
+/// has no effect on cert-manager charts older than v1.15 (which used
+/// `installCRDs` instead): `helm template` ignores unknown values rather than
+/// erroring, so an old `chartVersion` silently renders zero CRDs. Checked
+/// here, after parsing, so that misconfiguration surfaces as `Failed` /
+/// `MissingCrds` instead of a cluster reporting `Ready` with cert-manager
+/// Deployments running against no CRDs at all -- a non-functional install
+/// with no error anywhere.
+fn renders_expected_crds(objects: &[DynamicObject]) -> bool {
+    objects
+        .iter()
+        .any(|object| object.types.as_ref().is_some_and(|types| types.kind == "CustomResourceDefinition"))
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum CertManagerReconcileError {
     #[error(transparent)]
@@ -82,6 +98,12 @@ pub enum CertManagerReconcileError {
     Status(#[source] kube::Error),
     #[error("not the leader; standing down")]
     NotLeader,
+    #[error(
+        "chart version {0:?} rendered no CustomResourceDefinition objects; crds.enabled is \
+         forced true but has no effect on charts older than v1.15 (which used installCRDs \
+         instead) -- pin a newer chart version"
+    )]
+    NoCrdsRendered(String),
 }
 
 impl CertManagerReconcileError {
@@ -96,6 +118,7 @@ impl CertManagerReconcileError {
             CertManagerReconcileError::Helm(_) => Some("RenderFailed"),
             CertManagerReconcileError::Manifest(_) => Some("InvalidManifest"),
             CertManagerReconcileError::Apply(_) => Some("ApplyFailed"),
+            CertManagerReconcileError::NoCrdsRendered(_) => Some("MissingCrds"),
             CertManagerReconcileError::Validation(_)
             | CertManagerReconcileError::Status(_)
             | CertManagerReconcileError::NotLeader => None,
@@ -210,6 +233,10 @@ async fn reconcile_inner(
         object_count = objects.len(),
         "parsed and sorted rendered manifests"
     );
+
+    if !renders_expected_crds(&objects) {
+        return Err(CertManagerReconcileError::NoCrdsRendered(chart_version));
+    }
 
     // Everything this reconcile will apply is known now. Persist it before the
     // first apply so a failure, a crash or a leader change can never leave an
@@ -492,5 +519,36 @@ mod tests {
 
         assert_eq!(validation.failure_reason(), None);
         assert_eq!(CertManagerReconcileError::NotLeader.failure_reason(), None);
+    }
+
+    #[test]
+    fn renders_expected_crds_is_false_when_no_crd_is_rendered() {
+        // Live-verified: cert-manager charts older than v1.15 (which used
+        // installCRDs instead of crds.enabled) silently render zero CRDs when
+        // crds.enabled is set, since helm ignores unknown values rather than
+        // erroring. This is the shape that scenario produces.
+        let objects = crate::manifests::parse_manifests(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: cert-manager\n  namespace: cert-manager\n",
+        )
+        .expect("manifest should parse");
+
+        assert!(!renders_expected_crds(&objects));
+    }
+
+    #[test]
+    fn renders_expected_crds_is_true_when_a_crd_is_rendered() {
+        let objects = crate::manifests::parse_manifests(
+            "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: certificates.cert-manager.io\n",
+        )
+        .expect("manifest should parse");
+
+        assert!(renders_expected_crds(&objects));
+    }
+
+    #[test]
+    fn missing_crds_errors_report_missing_crds() {
+        let err = CertManagerReconcileError::NoCrdsRendered("v1.14.7".to_string());
+
+        assert_eq!(err.failure_reason(), Some("MissingCrds"));
     }
 }

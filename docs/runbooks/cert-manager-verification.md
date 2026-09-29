@@ -87,10 +87,13 @@ kubectl delete certmgr default        # returns once the finalizer clears
 kubectl get namespace cert-manager    # NotFound
 ```
 
-Expected: the chart's objects (including its CRDs) are gone. Any
-`Certificate`/`Issuer`/`ClusterIssuer` a person created independently (like
-the smoke test above, if not cleaned up) becomes orphaned: nothing renews it
-anymore.
+Expected: the chart's objects, **including its CRDs**, are gone. Kubernetes
+deletes every instance of a kind when its CRD is deleted, so this destroys
+**every** `Certificate`/`Issuer`/`ClusterIssuer`/`CertificateRequest`/
+`Order`/`Challenge` in the cluster, not just the ones from the smoke test
+above -- confirm the smoke test's own resources were already deleted at the
+end of step 3, but understand that this step is destructive to any other
+cert-manager resources on the cluster too, not just leftovers.
 
 ## When something goes wrong
 
