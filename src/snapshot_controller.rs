@@ -80,8 +80,9 @@ pub enum SnapshotControllerSpecError {
     )]
     HelmValuesSetWebhookEnabled,
     #[error(
-        "spec.helmValues must not set webhook.tls.*: when spec.groupSnapshotsEnabled is true, \
-         TLS is always wired to the self-signed cert-manager Issuer this component creates"
+        "spec.helmValues must not set webhook.tls.*: it is always derived from \
+         spec.groupSnapshotsEnabled -- wired to the self-signed cert-manager Issuer this \
+         component creates when true, left at the chart default when false"
     )]
     HelmValuesSetWebhookTls,
     #[error(
@@ -166,38 +167,37 @@ pub fn validate_snapshot_controller(
 pub fn build_values(spec: &SnapshotControllerSpec) -> serde_json::Value {
     let mut values = spec.helm_values.clone().unwrap_or_else(|| serde_json::json!({}));
 
-    let typed = if spec.group_snapshots_enabled {
-        serde_json::json!({
-            "installCRDs": true,
-            "webhook": {
-                "enabled": true,
-                "tls": {
-                    "autogenerate": false,
-                    "certManagerIssuerRef": {
-                        "name": SNAPSHOT_CONTROLLER_ISSUER_NAME,
-                        "kind": "Issuer",
+    let (webhook_enabled, feature_gates) =
+        if spec.group_snapshots_enabled { (true, "CSIVolumeGroupSnapshot=true") } else { (false, "") };
+
+    let mut typed = serde_json::json!({
+        "installCRDs": true,
+        "webhook": {
+            "enabled": webhook_enabled,
+        },
+        "controller": {
+            "args": {
+                "featureGates": feature_gates,
+            },
+        },
+    });
+
+    if spec.group_snapshots_enabled {
+        crate::pull_through_cache::merge(
+            &mut typed,
+            serde_json::json!({
+                "webhook": {
+                    "tls": {
+                        "autogenerate": false,
+                        "certManagerIssuerRef": {
+                            "name": SNAPSHOT_CONTROLLER_ISSUER_NAME,
+                            "kind": "Issuer",
+                        },
                     },
                 },
-            },
-            "controller": {
-                "args": {
-                    "featureGates": "CSIVolumeGroupSnapshot=true",
-                },
-            },
-        })
-    } else {
-        serde_json::json!({
-            "installCRDs": true,
-            "webhook": {
-                "enabled": false,
-            },
-            "controller": {
-                "args": {
-                    "featureGates": "",
-                },
-            },
-        })
-    };
+            }),
+        );
+    }
 
     crate::pull_through_cache::merge(&mut values, typed);
     values

@@ -88,6 +88,15 @@ dependency on `CertManagerInstallation` at all.
   by searching `kubernetes/cloud-provider-openstack`'s own source,
   2026-09-29). This would need an upstream PR merged into that project, not
   a change on this controller's side.
+- **Per-driver group-snapshot scoping.** `groupSnapshotsEnabled` lives on
+  the cluster-wide `SnapshotController` singleton, one value for the whole
+  cluster — but `CsiDriver` explicitly is not a singleton (a cloud can run
+  several drivers at once). If a future cluster ever runs both a
+  group-snapshot-capable driver and Cinder (which is not) side by side,
+  this flag can't be scoped to just the capable one; turning it on would
+  also re-enable the actively-erroring webhook against Cinder's own
+  `VolumeGroupSnapshot` objects. Not a real constraint today (only one
+  driver, Cinder, exists), so not designed around here.
 - **An airgapped chart source.** Fetched from `https://piraeus.io/helm-charts/`,
   so it needs that egress, same caveat as every other chart-fetching
   component.
