@@ -51,7 +51,10 @@ which that research had leaned toward skipping).
   cert-manager-backed TLS: a namespaced self-signed `Issuer`, not a
   `ClusterIssuer` -- this component applies that `Issuer` itself, tracked in
   its own ledger, not shared with [[cert-manager-2026-09]] (which
-  deliberately configures none).
+  deliberately configures none). This carries an implicit dependency on
+  cert-manager's `cainjector` being enabled and running to populate the
+  conversion webhook's CA bundle -- `CertManagerInstallation`'s `helmValues`
+  passthrough does not force this on.
 - **This is the first component with a hard, same-reconcile dependency on
   another component's CRDs actually being registered**, unlike every prior
   ordering note in this codebase (all of which were "eventually consistent"
@@ -87,10 +90,15 @@ which that research had leaned toward skipping).
   Non-goals. The runbook's live `VolumeSnapshot` smoke test (step 4) has to
   create one by hand for that reason.
 
-**Verification status:** not yet implemented against real code (this memory
-was written alongside the plan). Nothing has been run against an actual
-cluster. Update this entry once Tasks 1-6 are implemented and the runbook is
-run.
+**Verification status:** implemented and code-verified, not yet
+cluster-verified. All six tasks are merged. The full test suite passes (283
+tests, 0 failed, 9 ignored -- up from a 256-test baseline before this slice),
+including the ignored real-chart test in `src/helm.rs`
+(`snapshot_controller_chart_renders_the_shape_the_spec_relies_on`), run with
+`--ignored` against the live `piraeus.io` chart and passing. **Not yet
+verified against a real cluster** -- the runbook
+(`docs/runbooks/snapshot-controller-verification.md`) is written but has not
+been run.
 
 **How to apply:** when bumping the chart version, re-render it
 (`helm template snapshot-controller --repo https://piraeus.io/helm-charts/

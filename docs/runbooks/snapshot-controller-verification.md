@@ -49,12 +49,17 @@ kubectl -n snapshot-controller get issuer snapshot-controller-selfsigned -o json
 kubectl -n snapshot-controller get certificate snapshot-controller-conversion-webhook -o jsonpath='{.status.conditions[0].type}{"="}{.status.conditions[0].status}{"\n"}'
 kubectl -n snapshot-controller get secret snapshot-controller-conversion-webhook
 kubectl get crd volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io -o jsonpath='{.spec.conversion.strategy}{"\n"}'   # Webhook
+kubectl get crd volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io -o jsonpath='{.spec.conversion.webhook.clientConfig.caBundle}{"\n"}'
 ```
 
 Expected: `Ready=True` on both the `Issuer` and the `Certificate`; the TLS
 Secret exists; the group-snapshot CRD's conversion strategy is `Webhook`
 (confirming the chart wired the webhook into the CRD, not just deployed a
-pod). If the `Issuer`/`Certificate` never reach `Ready`, `CertManagerInstallation`
+pod); the `caBundle` value is non-empty (a base64 CA cert) — an empty value
+means cert-manager's `cainjector` isn't running/enabled in the
+`CertManagerInstallation` this component depends on, and is the one thing
+that can silently fail even when the conversion strategy shows `Webhook`. If
+the `Issuer`/`Certificate` never reach `Ready`, `CertManagerInstallation`
 likely isn't actually healthy even though it reports `Ready` (which only
 ever means "manifests applied") — check its own pods.
 
@@ -62,20 +67,6 @@ ever means "manifests applied") — check its own pods.
 
 Requires `CsiDriver` (OpenStack Cinder) `Ready` and an existing, bound PVC
 (`docs/runbooks/csi-driver-openstack-cinder-verification.md`).
-
-```sh
-kubectl apply -f - <<'EOF'
-apiVersion: snapshot.storage.k8s.io/v1
-kind: VolumeSnapshot
-metadata:
-  name: smoketest-snapshot
-  namespace: default
-spec:
-  volumeSnapshotClassName: csi-cinder-snapclass
-  source:
-    persistentVolumeClaimName: <an existing bound PVC's name>
-EOF
-```
 
 `csi-cinder-snapclass` does not exist yet — this component does not create
 any `VolumeSnapshotClass` (typed `VolumeSnapshotClass` support on `CsiDriver`
@@ -89,6 +80,20 @@ metadata:
   name: csi-cinder-snapclass
 driver: cinder.csi.openstack.org
 deletionPolicy: Delete
+EOF
+```
+
+```sh
+kubectl apply -f - <<'EOF'
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: smoketest-snapshot
+  namespace: default
+spec:
+  volumeSnapshotClassName: csi-cinder-snapclass
+  source:
+    persistentVolumeClaimName: <an existing bound PVC's name>
 EOF
 kubectl get volumesnapshot smoketest-snapshot -o jsonpath='{.status.readyToUse}{"\n"}'
 ```
