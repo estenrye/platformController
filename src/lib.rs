@@ -1,6 +1,7 @@
 pub mod ccm_reconciler;
 pub mod cache_reconciler;
 pub mod cert_manager;
+pub mod cert_manager_reconciler;
 pub mod cloud_controller_manager;
 pub mod csi_driver;
 pub mod csi_reconciler;
