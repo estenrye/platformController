@@ -1,6 +1,6 @@
 ---
 name: cert-manager-2026-09
-description: CertManagerInstallation slice, 2026-09-28 - fifth CRD, no provider enum, chart facts confirmed by live rendering (not yet run against a cluster)
+description: CertManagerInstallation slice, 2026-09-28/29 - fifth CRD, no provider enum, live-verified on a real Talos cluster (apply/Ready, namespace admission, self-signed smoke test, delete/cleanup all pass)
 metadata:
   type: project
 ---
@@ -35,8 +35,9 @@ assumed:**
   `cert_manager_namespace_object` sets **no**
   `pod-security.kubernetes.io/*` labels, unlike `tigera-operator` (Calico)
   and `spegel` (both `privileged`, for hostPath/host-network reasons that
-  don't apply here). This is a stated assumption pending the runbook's step
-  2 -- not yet live-verified against Talos's actual admission behavior.
+  don't apply here). Live-verified 2026-09-29 against a real Talos cluster
+  (runbook step 2): no admission rejection, every pod Running under the
+  default `baseline` policy.
 - Like Spegel, the OCI chart prints `Pulled:`/`Digest:` preamble lines to
   stdout; `helm::strip_oci_pull_preamble` already handles this generically,
   no code change needed.
@@ -49,14 +50,44 @@ assumed:**
   component creates no `cert-manager.io` custom resource itself, so there's
   no same-reconcile ordering dependency the way CNI has on the tigera
   operator's own CRDs.
+- **Deleting a `CertManagerInstallation` destroys every cert-manager custom
+  resource in the cluster, not just ones this component manages.** Found in
+  the final PR review (#24): the six `cert-manager.io` CRDs are in the
+  applied-resources ledger (since `crds.enabled` is forced `true`), and
+  Kubernetes deletes every instance of a kind when its CRD is deleted. Fixed
+  by correcting `deploy/README.md` and this runbook to say so plainly
+  (no code change -- deleting the CRDs along with everything else is
+  accepted behavior, just previously mis-documented as safe). Live-verified
+  2026-09-29 (runbook step 4): the cascade is real.
+- **`crds.enabled` silently no-ops on cert-manager charts older than v1.15**
+  (which used `installCRDs` instead) -- helm ignores the unknown value
+  rather than erroring, so a `chartVersion` pinned to an old chart would
+  render zero CRDs while still reporting `Ready`. Fixed in the same review
+  pass: `reconcile_inner` now checks the rendered objects for at least one
+  `CustomResourceDefinition` and fails `Failed`/`MissingCrds` otherwise
+  (`renders_expected_crds` in `src/cert_manager_reconciler.rs`).
 
-**Verification status:** all Rust code (Tasks 1-6) built and the full test
-suite passed in a scratch worktree, including the two `#[ignore]`d
-real-chart tests in `helm.rs` against the live `quay.io` chart. **Nothing
-has been run against an actual cluster yet** -- the namespace-admission
-assumption above, the delete/cleanup behavior, and the self-signed
-`ClusterIssuer`/`Certificate` smoke test are all still open per the
-runbook.
+**Verification status:** fully live-verified. All Rust code built and the
+full test suite passed (twice: once pre-review, once after the review fix
+pass), including the two `#[ignore]`d real-chart tests in `helm.rs` against
+the live `quay.io` chart. Merged via #24 (component) and #25 (the
+`0.1.8` image pin bump needed to actually run it). Live-verified
+2026-09-29 on a real 6-node Talos cluster (controller `0.1.8`, chart
+`v1.16.2`), alongside `CniInstallation`/`CloudControllerManager`/
+`CsiDriver` which stayed `Ready` throughout the controller rollout:
+
+- Apply reached `Ready` in ~9s; all three Deployments Running.
+- Namespace admission held with no `pod-security.kubernetes.io/*` labels
+  (see the bullet above).
+- The self-signed `ClusterIssuer`/`Certificate` smoke test issued a real
+  `kubernetes.io/tls` Secret, `Ready=True` on the first poll -- the webhook
+  and CA injection are genuinely functional, not just "manifests applied".
+- Delete returned once the finalizer cleared; the namespace and all six
+  CRDs were fully gone (confirming the cascade-delete finding above).
+- Cert-manager was redeployed afterward and is running on the cluster as
+  of this writing.
+
+Full steps and exact commands: `docs/runbooks/cert-manager-verification.md`.
 
 **How to apply:** when bumping the chart version, re-render it
 (`helm template cert-manager oci://quay.io/jetstack/charts/cert-manager
