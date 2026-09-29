@@ -2,9 +2,9 @@
 
 Manual acceptance for the `CertManagerInstallation` resource. Needs a real
 cluster (the Talos-in-Docker setup in `tests/integration_talos.rs` is
-enough) with `CniInstallation` already `Ready`. Nothing here has been run
-yet: record what you observe under "Findings to record" at the end, the way
-`pull-through-cache-verification.md` does.
+enough) with `CniInstallation` already `Ready`. Steps 1-4 were all run and
+passed on a live cluster on 2026-09-29; see "Findings to record" at the end
+and `docs/memory/cert-manager-2026-09.md` for the full write-up.
 
 ## 1. Apply and reach Ready
 
@@ -23,9 +23,9 @@ Expected: `Ready`; three pods (`cert-manager`, `cert-manager-webhook`,
 ## 2. Namespace admission under the default (`baseline`) Pod Security Standard
 
 The design assumes cert-manager's pods need no `pod-security.kubernetes.io/*`
-labels on their namespace (confirmed by rendering the chart, not by running
-it against Talos). Confirm the pods actually started with no admission
-rejection and no privilege elevation:
+labels on their namespace -- confirmed both by rendering the chart and, as of
+2026-09-29, by running it against a live Talos cluster. Confirm the pods
+actually started with no admission rejection and no privilege elevation:
 
 ```sh
 kubectl get namespace cert-manager -o jsonpath='{.metadata.labels}{"\n"}'   # no pod-security labels
@@ -108,6 +108,19 @@ cert-manager resources on the cluster too, not just leftovers.
 
 ## Findings to record
 
-To fill in from the first live run: whether the namespace-admission
-assumption in step 2 held, the smoke-test result in step 3, and anything in
-step 4 that differs from "Expected".
+Live-verified 2026-09-29 on a 6-node Talos cluster (3 control-plane, 3
+worker; controller `0.1.8`, chart `v1.16.2`), alongside the other three
+components which stayed `Ready` throughout. All four steps matched
+"Expected" exactly, with no deviations:
+
+- Step 1: `Ready` in ~9s; all three pods Running.
+- Step 2: no `pod-security.kubernetes.io/*` label appeared on the namespace;
+  every pod Running with `runAsNonRoot: true`. The design's assumption held.
+- Step 3: `Ready=True` on the first poll; `smoketest-tls` held real
+  certificate data. The webhook and CA injection are genuinely functional.
+- Step 4: the delete returned once the finalizer cleared, the namespace
+  fully terminated, and all six `cert-manager.io` CRDs were gone -- the
+  cascade-delete behavior documented in this runbook and `deploy/README.md`
+  is real, not theoretical.
+
+Full write-up: `docs/memory/cert-manager-2026-09.md`.
