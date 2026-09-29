@@ -12,6 +12,8 @@ use platform_controller::leader;
 use platform_controller::pull_through_cache::PullThroughCache;
 use platform_controller::reconciler::{error_policy, reconcile_with_finalizer, Context};
 use platform_controller::cache_reconciler;
+use platform_controller::snapshot_controller::SnapshotController;
+use platform_controller::snapshot_controller_reconciler;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
@@ -196,12 +198,41 @@ async fn main() -> anyhow::Result<()> {
         .run(
             cert_manager_reconciler::reconcile_with_finalizer,
             cert_manager_reconciler::error_policy,
-            context,
+            context.clone(),
         )
         .for_each(|result| async move {
             match result {
                 Ok(action) => tracing::debug!(?action, "reconciled cert-manager installation"),
                 Err(err) => tracing::error!(error = %err, "cert-manager installation reconcile failed"),
+            }
+        });
+
+    // The snapshot-controller component gets its own watcher, store and
+    // Controller too, with the same predicate filter and the same Context
+    // (one leader lease).
+    let snapshot_controller_api: Api<SnapshotController> = Api::all(client.clone());
+    let (snapshot_controller_reader, snapshot_controller_writer) = reflector::store();
+    let snapshot_controllers = watcher(snapshot_controller_api, watcher::Config::default())
+        .default_backoff()
+        .reflect(snapshot_controller_writer)
+        .applied_objects()
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
+
+    let snapshot_controller_controller = Controller::for_stream(snapshot_controllers, snapshot_controller_reader)
+        .run(
+            snapshot_controller_reconciler::reconcile_with_finalizer,
+            snapshot_controller_reconciler::error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok(action) => tracing::debug!(?action, "reconciled snapshot controller"),
+                Err(err) => tracing::error!(error = %err, "snapshot controller reconcile failed"),
             }
         });
 
@@ -213,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
         _ = ccm_controller => {}
         _ = csi_controller => {}
         _ = cert_manager_controller => {}
+        _ = snapshot_controller_controller => {}
         // `leader::run` loops forever, so this branch only resolves if it
         // panicked. Exit non-zero and let Kubernetes restart the pod rather than
         // limp on with a permanently stale `is_leader` flag.
@@ -360,6 +392,25 @@ mod tests {
             "spec": {
                 "platformKind": "talos-linux",
                 "chartVersion": "v1.16.2"
+            }
+        }))
+        .expect("installation should deserialize");
+
+        assert_eq!(deletion_requested(&installation), Some(1));
+    }
+
+    #[test]
+    fn deletion_requested_works_for_the_snapshot_controller_kind_too() {
+        let installation: SnapshotController = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "SnapshotController",
+            "metadata": {
+                "name": "default",
+                "deletionTimestamp": "2026-09-29T00:00:00Z"
+            },
+            "spec": {
+                "platformKind": "talos-linux",
+                "chartVersion": "5.3.0"
             }
         }))
         .expect("installation should deserialize");

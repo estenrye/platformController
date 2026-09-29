@@ -9,6 +9,7 @@ pub fn generated_yaml() -> String {
         crate::cloud_controller_manager::CloudControllerManager::crd(),
         crate::csi_driver::CsiDriver::crd(),
         crate::cert_manager::CertManagerInstallation::crd(),
+        crate::snapshot_controller::SnapshotController::crd(),
     ]
     .iter()
     .map(|crd| serde_yaml::to_string(crd).expect("CRD should serialize to YAML"))
