@@ -756,3 +756,114 @@ spec:
     storage: true
     subresources:
       status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: certmanagerinstallations.platform.rye.ninja
+spec:
+  group: platform.rye.ninja
+  names:
+    kind: CertManagerInstallation
+    plural: certmanagerinstallations
+    shortNames:
+    - certmgr
+    singular: certmanagerinstallation
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CertManagerInstallationSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              chartVersion:
+                type: string
+              helmValues:
+                description: |-
+                  Free-form values merged into the chart's values. The controller's own
+                  typed value (`crds.enabled: true`) is overlaid afterwards, so it always
+                  wins.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              platformKind:
+                enum:
+                - talos-linux
+                type: string
+            required:
+            - chartVersion
+            - platformKind
+            type: object
+          status:
+            nullable: true
+            properties:
+              appliedResources:
+                default: []
+                items:
+                  properties:
+                    apiVersion:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      default: ''
+                      type: string
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  type: object
+                type: array
+              chartVersion:
+                default: ''
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                default: 0
+                format: int64
+                type: integer
+              phase:
+                default: Pending
+                enum:
+                - Pending
+                - Installing
+                - Ready
+                - Failed
+                type: string
+            type: object
+        required:
+        - spec
+        title: CertManagerInstallation
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
