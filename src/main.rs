@@ -2,6 +2,8 @@ use futures::StreamExt;
 use kube::runtime::{predicates, reflector, watcher, Controller, Predicate, WatchStreamExt};
 use kube::{Api, Client, Resource};
 use platform_controller::ccm_reconciler;
+use platform_controller::cert_manager::CertManagerInstallation;
+use platform_controller::cert_manager_reconciler;
 use platform_controller::cloud_controller_manager::CloudControllerManager;
 use platform_controller::crd::CniInstallation;
 use platform_controller::csi_driver::CsiDriver;
@@ -166,12 +168,40 @@ async fn main() -> anyhow::Result<()> {
         .run(
             csi_reconciler::reconcile_with_finalizer,
             csi_reconciler::error_policy,
-            context,
+            context.clone(),
         )
         .for_each(|result| async move {
             match result {
                 Ok(action) => tracing::debug!(?action, "reconciled csi driver"),
                 Err(err) => tracing::error!(error = %err, "csi driver reconcile failed"),
+            }
+        });
+
+    // The cert-manager component gets its own watcher, store and Controller
+    // too, with the same predicate filter and the same Context (one leader lease).
+    let cert_manager_api: Api<CertManagerInstallation> = Api::all(client.clone());
+    let (cert_manager_reader, cert_manager_writer) = reflector::store();
+    let cert_manager_installations = watcher(cert_manager_api, watcher::Config::default())
+        .default_backoff()
+        .reflect(cert_manager_writer)
+        .applied_objects()
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
+
+    let cert_manager_controller = Controller::for_stream(cert_manager_installations, cert_manager_reader)
+        .run(
+            cert_manager_reconciler::reconcile_with_finalizer,
+            cert_manager_reconciler::error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok(action) => tracing::debug!(?action, "reconciled cert-manager installation"),
+                Err(err) => tracing::error!(error = %err, "cert-manager installation reconcile failed"),
             }
         });
 
@@ -182,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
         _ = cache_controller => {}
         _ = ccm_controller => {}
         _ = csi_controller => {}
+        _ = cert_manager_controller => {}
         // `leader::run` loops forever, so this branch only resolves if it
         // panicked. Exit non-zero and let Kubernetes restart the pod rather than
         // limp on with a permanently stale `is_leader` flag.
@@ -315,5 +346,24 @@ mod tests {
         .expect("driver should deserialize");
 
         assert_eq!(deletion_requested(&driver), Some(1));
+    }
+
+    #[test]
+    fn deletion_requested_works_for_the_cert_manager_installation_kind_too() {
+        let installation: CertManagerInstallation = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "CertManagerInstallation",
+            "metadata": {
+                "name": "default",
+                "deletionTimestamp": "2026-09-28T00:00:00Z"
+            },
+            "spec": {
+                "platformKind": "talos-linux",
+                "chartVersion": "v1.16.2"
+            }
+        }))
+        .expect("installation should deserialize");
+
+        assert_eq!(deletion_requested(&installation), Some(1));
     }
 }

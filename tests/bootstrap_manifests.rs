@@ -83,6 +83,7 @@ fn crd_yaml_defines_all_platform_resources() {
             "pullthroughcaches.platform.rye.ninja",
             "cloudcontrollermanagers.platform.rye.ninja",
             "csidrivers.platform.rye.ninja",
+            "certmanagerinstallations.platform.rye.ninja",
         ]
     );
 }

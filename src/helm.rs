@@ -27,6 +27,11 @@ pub const CLOUD_PROVIDER_OPENSTACK_CHART_REPO: &str = "https://kubernetes.github
 /// namespace is synthesized.
 pub const CINDER_CSI_NAMESPACE: &str = "kube-system";
 
+/// Namespace the cert-manager chart's namespaced objects belong in. Like
+/// tigera-operator and Spegel, the chart renders no `Namespace` object of its
+/// own (live-verified against chart v1.16.2).
+pub const CERT_MANAGER_NAMESPACE: &str = "cert-manager";
+
 /// Where a Helm chart is fetched from. The two forms invoke `helm template`
 /// differently.
 pub enum ChartSource {
@@ -81,6 +86,17 @@ pub const OPENSTACK_CINDER_CSI_CHART: ChartRef = ChartRef {
         chart: "openstack-cinder-csi",
     },
     namespace: CINDER_CSI_NAMESPACE,
+};
+
+/// The OCI registry cert-manager's chart is published to -- Jetstack's
+/// current recommended distribution channel. The classic
+/// `https://charts.jetstack.io` repo is deprecated.
+pub const CERT_MANAGER_CHART: ChartRef = ChartRef {
+    release: "cert-manager",
+    source: ChartSource::Oci {
+        reference: "oci://quay.io/jetstack/charts/cert-manager",
+    },
+    namespace: CERT_MANAGER_NAMESPACE,
 };
 
 pub fn build_values(calico: &CalicoSpec) -> serde_json::Value {
@@ -369,6 +385,29 @@ mod tests {
                 "--no-hooks".to_string(),
                 "--namespace".to_string(),
                 "spegel".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cert_manager_render_args_use_the_oci_form_and_the_cert_manager_namespace() {
+        let path = std::path::Path::new("/tmp/values.yaml");
+        let args = render_args(&CERT_MANAGER_CHART, "v1.16.2", path);
+
+        assert_eq!(
+            args,
+            vec![
+                "template".to_string(),
+                "cert-manager".to_string(),
+                "oci://quay.io/jetstack/charts/cert-manager".to_string(),
+                "--version".to_string(),
+                "v1.16.2".to_string(),
+                "--values".to_string(),
+                "/tmp/values.yaml".to_string(),
+                "--include-crds".to_string(),
+                "--no-hooks".to_string(),
+                "--namespace".to_string(),
+                "cert-manager".to_string(),
             ]
         );
     }
@@ -806,6 +845,93 @@ mod tests {
 
         // --no-hooks: no hook objects are rendered as live objects.
         assert!(!rendered.contains("helm.sh/hook"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn cert_manager_chart_renders_the_shape_the_spec_relies_on() {
+        let spec = crate::cert_manager::CertManagerInstallationSpec {
+            platform_kind: crate::crd::PlatformKind::TalosLinux,
+            chart_version: "v1.16.2".to_string(),
+            helm_values: None,
+        };
+        let values = crate::cert_manager::build_values(&spec);
+
+        let rendered = render_chart(&CERT_MANAGER_CHART, &spec.chart_version, &values)
+            .await
+            .expect("helm template should succeed");
+        let objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
+
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|o| o.types.as_ref().expect("every rendered object has a type").kind.as_str())
+            .collect();
+
+        // crds.enabled: true is always set (build_values), so the chart's own six
+        // CRDs are always included; this chart renders no Namespace and no Secret.
+        let crd_names: Vec<&str> = objects
+            .iter()
+            .filter(|o| o.types.as_ref().unwrap().kind == "CustomResourceDefinition")
+            .map(|o| o.metadata.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            crd_names,
+            vec![
+                "certificaterequests.cert-manager.io",
+                "certificates.cert-manager.io",
+                "challenges.acme.cert-manager.io",
+                "clusterissuers.cert-manager.io",
+                "issuers.cert-manager.io",
+                "orders.acme.cert-manager.io",
+            ],
+            "{crd_names:?}"
+        );
+        assert!(!kinds.contains(&"Namespace"), "{kinds:?}");
+        assert!(!kinds.contains(&"Secret"), "{kinds:?}");
+
+        // Exactly the controller, webhook and cainjector Deployments.
+        let deployment_names: Vec<&str> = objects
+            .iter()
+            .filter(|o| o.types.as_ref().unwrap().kind == "Deployment")
+            .map(|o| o.metadata.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            {
+                let mut sorted = deployment_names.clone();
+                sorted.sort_unstable();
+                sorted
+            },
+            vec!["cert-manager", "cert-manager-cainjector", "cert-manager-webhook"],
+            "{deployment_names:?}"
+        );
+        assert!(kinds.contains(&"ValidatingWebhookConfiguration"), "{kinds:?}");
+        assert!(kinds.contains(&"MutatingWebhookConfiguration"), "{kinds:?}");
+
+        // No hostPath/hostNetwork anywhere: confirms the synthesized namespace
+        // needs no pod-security.kubernetes.io/* labels, unlike Calico/Spegel.
+        assert!(!rendered.contains("hostPath"), "{rendered}");
+        assert!(!rendered.contains("hostNetwork"), "{rendered}");
+
+        // --no-hooks: no hook objects are rendered as live objects.
+        assert!(!rendered.contains("helm.sh/hook"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access and the helm CLI to be installed"]
+    async fn cert_manager_omitting_crds_enabled_renders_no_crds_by_default() {
+        // Pins the chart-default fact build_values relies on: without the typed
+        // override, this chart ships no CRDs at all (unlike Calico, where CRDs
+        // come from the chart in older versions and from the running operator in
+        // newer ones).
+        let rendered = render_chart(&CERT_MANAGER_CHART, "v1.16.2", &serde_json::json!({}))
+            .await
+            .expect("helm template should succeed");
+        let objects = crate::manifests::parse_manifests(&rendered).expect("manifests should parse");
+
+        assert!(
+            !objects.iter().any(|o| o.types.as_ref().unwrap().kind == "CustomResourceDefinition"),
+            "chart default changed: CRDs now render without crds.enabled"
+        );
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ kubectl wait --for=condition=established --timeout=60s crd/cniinstallations.plat
 kubectl wait --for=condition=established --timeout=60s crd/pullthroughcaches.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/cloudcontrollermanagers.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/csidrivers.platform.rye.ninja
+kubectl wait --for=condition=established --timeout=60s crd/certmanagerinstallations.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```
@@ -58,7 +59,7 @@ Omitting `spec.spegel.registries` mirrors every registry, private ones included.
 `spec.spegel.chartVersion` is the OCI chart tag and has no `v` prefix (`0.7.4`).
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-both CRDs to be Established) *before* rolling the controller image. A controller
+all five CRDs to be Established) *before* rolling the controller image. A controller
 that starts without the `PullThroughCache` CRD logs watch errors for it and
 retries with backoff; it still reconciles `CniInstallation` normally.
 
@@ -88,7 +89,7 @@ reconciles when applied. With external cloud-provider kubelets every node is tai
 the CCM runs on the host network, so it does not need the CNI.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all four CRDs to be Established) *before* rolling the controller image. The new
+all five CRDs to be Established) *before* rolling the controller image. The new
 image's Deployment also tolerates the `uninitialized` taint (`deploy/bootstrap.yaml`);
 without that toleration the controller could not schedule on a cluster whose
 kubelets use an external cloud provider.
@@ -160,11 +161,43 @@ on the regular pod network and has no toleration for the `uninitialized` taint
 even though the reconcile that applies its manifests will succeed regardless.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait
-for all four CRDs to be Established) *before* rolling the controller image.
+for all five CRDs to be Established) *before* rolling the controller image.
 
 **Deleting** a `CsiDriver` removes the chart's objects but does not delete
 already-provisioned Cinder volumes; PVCs or pods still depending on them can be
 left with a stuck detach/unmount.
+
+## Cert-manager (optional)
+
+`examples/cert-manager.yaml` is a `CertManagerInstallation` that installs
+[cert-manager](https://cert-manager.io) on a self-hosted Talos cluster.
+Unlike the other optional components, it needs no cloud-specific
+prerequisite and no user-created Secret: apply it whenever cert-manager
+itself is wanted.
+
+This resource only installs cert-manager -- it does **not** configure any
+`ClusterIssuer`/`Issuer` (self-signed CA, ACME, per-cloud DNS-01 solvers).
+Configure those directly against the running cert-manager once
+`CertManagerInstallation` reports `Ready`; see
+`docs/runbooks/cert-manager-verification.md` for a self-signed smoke test
+that proves the installed chart is actually functional.
+
+`spec.chartVersion` is the Helm chart version (`v1.16.2`). Unlike the
+OpenStack charts, cert-manager's chart and app versions track together and
+both carry the `v` prefix -- do not drop it here.
+
+**Apply order:** after `CniInstallation` is `Ready` (cert-manager's pods run
+on the pod network and need cluster DNS, same reasoning as
+`PullThroughCache`). No dependency on `CloudControllerManager` or
+`CsiDriver`.
+
+**Deleting** a `CertManagerInstallation` removes the chart's objects,
+**including its CRDs** (`certificates.cert-manager.io`,
+`clusterissuers.cert-manager.io`, etc.). Kubernetes deletes every instance
+of a kind when its CRD is deleted, so this destroys **every**
+`Certificate`/`Issuer`/`ClusterIssuer`/`CertificateRequest`/`Order`/
+`Challenge` in the cluster along with it -- not just the ones this resource
+manages. Back up or export anything you need before deleting.
 
 ## Calico node address autodetection
 
