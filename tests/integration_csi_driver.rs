@@ -154,21 +154,28 @@ async fn openstack_cinder_csi_recovers_from_an_immutable_storage_class_parameter
             "retain": { "parameters": { "availability": "integration-test-marker" } }
         } } }
     });
-    drivers
+    let patched = drivers
         .patch("openstack-cinder", &PatchParams::default(), &Patch::Merge(&marker_patch))
         .await
         .expect("should patch the CsiDriver with the marker value");
+    let marker_generation = patched.metadata.generation;
 
+    // status.phase can still read Ready from *before* this patch until the
+    // reconciler actually processes the new generation, so check
+    // observedGeneration too -- otherwise this races ahead on stale status.
     eventually(
-        "CsiDriver reaching Ready again after the immutable-field recovery",
-        Duration::from_secs(60),
+        "CsiDriver reaching Ready again, at the new generation, after the immutable-field recovery",
+        Duration::from_secs(120),
         || async {
             drivers
                 .get("openstack-cinder")
                 .await
                 .ok()
                 .and_then(|driver| driver.status)
-                .is_some_and(|status| matches!(status.phase, Phase::Ready))
+                .is_some_and(|status| {
+                    matches!(status.phase, Phase::Ready)
+                        && Some(status.observed_generation) == marker_generation
+                })
         },
     )
     .await;
@@ -194,22 +201,35 @@ async fn openstack_cinder_csi_recovers_from_an_immutable_storage_class_parameter
             "retain": { "parameters": { "availability": "nova" } }
         } } }
     });
-    drivers
+    let restored = drivers
         .patch("openstack-cinder", &PatchParams::default(), &Patch::Merge(&nova_patch))
         .await
         .expect("should patch the CsiDriver back to the real availability zone");
+    let nova_generation = restored.metadata.generation;
 
     eventually(
-        "CsiDriver reaching Ready after restoring the real availability zone",
-        Duration::from_secs(60),
+        "CsiDriver reaching Ready, at the new generation, after restoring the real availability zone",
+        Duration::from_secs(120),
         || async {
             drivers
                 .get("openstack-cinder")
                 .await
                 .ok()
                 .and_then(|driver| driver.status)
-                .is_some_and(|status| matches!(status.phase, Phase::Ready))
+                .is_some_and(|status| {
+                    matches!(status.phase, Phase::Ready) && Some(status.observed_generation) == nova_generation
+                })
         },
     )
     .await;
+
+    let final_state = storage_classes
+        .get("csi-cinder-sc-delete")
+        .await
+        .expect("csi-cinder-sc-delete should exist after restoring nova");
+    assert_eq!(
+        final_state.parameters.as_ref().and_then(|p| p.get("availability")).map(String::as_str),
+        Some("nova"),
+        "the cluster should end this test back on the real availability zone, not the marker"
+    );
 }
