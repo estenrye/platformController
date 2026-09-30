@@ -306,5 +306,16 @@ webhook infrastructure came up correctly (`Issuer`/`Certificate` both
 `Ready=True`, `cainjector` populated the CA bundle), but every
 `VolumeGroupSnapshot` attempt failed with a conversion-webhook error, and
 separately no CSI driver this controller supports implements the
-group-snapshot RPCs at all — see the Update note above. Full write-up:
-`docs/memory/snapshot-controller-2026-09.md`.
+group-snapshot RPCs at all — see the Update note above.
+
+Upgrading this same cluster from the always-on-webhook state to the
+corrected `groupSnapshotsEnabled: false` default hit a real, previously
+unknown bug: cert-manager's `cainjector` owns a field on the
+`volumegroupsnapshotcontents` CRD via its own field manager, independent of
+this controller's apply, producing a permanent `Failed`/`ApplyFailed` loop
+that needed a one-time manual fix (not a code fix — recovery is documented,
+matching this component's own precedent for the CRD cascade-delete and
+`CsiDriver`'s immutable-`StorageClass.parameters` case). Full write-up and
+the exact remediation commands:
+`docs/memory/snapshot-controller-2026-09.md` and
+`docs/runbooks/snapshot-controller-verification.md`.
