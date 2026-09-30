@@ -1,6 +1,6 @@
 ---
 name: snapshot-controller-2026-09
-description: SnapshotController slice, 2026-09-29 - sixth CRD, resumes the queued csi-snapshot-support sub-project's CRD/controller/webhook half; live-verified on a real Talos cluster; group snapshots made an opt-in, off-by-default toggle after live testing found them non-functional on OpenStack (no driver support, and the conversion webhook itself errors)
+description: SnapshotController slice, 2026-09-29 - sixth CRD, resumes the queued csi-snapshot-support sub-project's CRD/controller/webhook half; live-verified on a real Talos cluster; group snapshots made an opt-in, off-by-default toggle after live testing found them non-functional on OpenStack; upgrading an already-enabled cluster to the corrected default needs a one-time manual fix for a cainjector field-ownership conflict, documented in the runbook
 metadata:
   type: project
 ---
@@ -139,7 +139,8 @@ ignored real-chart tests in `src/helm.rs`
 `snapshot_controller_chart_renders_group_snapshot_support_when_enabled` for
 `true`), both run with `--ignored` against the live `piraeus.io` chart.
 Merged via #27 (component), #28 (the `0.1.9` image pin bump needed to
-actually run it), and #29 (recording the findings below).
+actually run it), #29 (recording the findings below), #30 (the
+`groupSnapshotsEnabled` toggle itself), and #31 (the `0.1.10` image pin).
 
 Live-verified 2026-09-29 on a real 6-node Talos cluster (controller `0.1.9`,
 chart `5.3.0`), alongside `CniInstallation`/`CertManagerInstallation`/
@@ -168,11 +169,41 @@ ran with the webhook forced on (what prompted adding the toggle):
   missing `CREATE_DELETE_GROUP_SNAPSHOT` driver capability (confirmed via
   both the live pod's own startup log and an upstream source search) are
   what prompted the `groupSnapshotsEnabled` toggle and its `false` default.
-- **Not yet run against the corrected code:** the one-Deployment shape
-  `groupSnapshotsEnabled: false` now produces (only verified locally via
-  the ignored real-chart test, not yet against this live cluster), and step
-  5 (delete `SnapshotController`, confirm the six-CRD cascade). The
-  component was left installed and `Ready` rather than torn down.
+
+**Second live-verification pass, same day, after the `0.1.10` correction
+rolled out:** re-confirmed the `groupSnapshotsEnabled: false` default
+produces exactly one Deployment and no Service, as designed. This upgrade
+also hit a real, previously-unknown bug: rolling an already-`Ready`
+`SnapshotController` (which had been running with the webhook forced on)
+onto the corrected code got stuck in a permanent `Failed`/`ApplyFailed`
+loop, because cert-manager's `cainjector` owns
+`volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io`'s
+`spec.conversion.webhook.clientConfig.caBundle` field via its own,
+independent field manager (triggered by the
+`cert-manager.io/inject-ca-from` annotation the old chart render left on
+that CRD) — this controller's own server-side apply can release the fields
+*it* owns when the new render omits `spec.conversion` entirely, but
+`cainjector`'s separately-owned `caBundle` field survives the same apply,
+leaving the object in a combination (`webhookClientConfig` present,
+`strategy` not `Webhook`) the API server rejects outright. A genuine
+chicken-and-egg: `cainjector` would clean up after itself once it noticed
+the annotation gone, but the annotation removal is *part of* the apply that
+never succeeds. Full remediation recipe (a one-time manual break of the
+cycle, confirmed safe since no `VolumeGroupSnapshotContent` instances
+existed):
+`docs/runbooks/snapshot-controller-verification.md`'s "Migrating an
+existing cluster" section. No code fix shipped for this (like the
+immutable-`StorageClass.parameters` case, [[csi-driver-openstack-cinder-2026-09]]):
+recovery is manual and documented, not automated. Only reachable at all by
+a cluster that ran with the webhook on before `groupSnapshotsEnabled`
+existed or was ever set `true` — a fresh install with the default never
+hits it. The orphaned TLS Secret cert-manager leaves behind when its
+`Certificate` is pruned (cert-manager never deletes Secrets on `Certificate`
+delete, to avoid losing certs) was also confirmed and manually cleaned up.
+
+**Not yet run:** step 5 (delete `SnapshotController`, confirm the six-CRD
+cascade). The component was left installed and `Ready` rather than torn
+down.
 
 Full steps and exact commands: `docs/runbooks/snapshot-controller-verification.md`.
 

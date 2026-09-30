@@ -159,15 +159,61 @@ destroys **every** `VolumeSnapshot`/`VolumeSnapshotContent`/
 smoke test's own — confirm the smoke test's own resources were already
 deleted at the end of step 3.
 
+## Migrating an existing cluster from `groupSnapshotsEnabled: true` to `false`
+
+Live-hit on 2026-09-29: if `SnapshotController` was ever `Ready` on this
+cluster with the webhook enabled (either explicitly, or because you deployed
+before this toggle existed, when it was unconditionally on), upgrading to a
+controller version with `groupSnapshotsEnabled: false` gets stuck in a
+permanent `Failed`/`ApplyFailed` loop:
+
+```
+failed to apply CustomResourceDefinition/volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io:
+ApiError: [...] spec.conversion.strategy: Required value, spec.conversion.webhookClientConfig:
+Forbidden: should not be set when strategy is not set to Webhook
+```
+
+**Root cause:** the CRD carries the annotation
+`cert-manager.io/inject-ca-from: snapshot-controller/snapshot-controller-conversion-webhook`,
+which tells cert-manager's `cainjector` to continuously maintain
+`spec.conversion.webhook.clientConfig.caBundle` on this object using its
+*own* field manager, independent of this controller's server-side apply. The
+new render omits `spec.conversion` entirely, so this controller's own apply
+releases the fields *it* owns (`strategy`, `webhook.clientConfig.service`) —
+but `cainjector`'s separately-owned `caBundle` field survives the same
+apply, leaving the object in a state the API server rejects outright
+(`webhookClientConfig` present without `strategy: Webhook`). `cainjector`
+would eventually notice the annotation is gone and clean up after itself,
+but it can't, because this controller's apply — the only thing that would
+remove the annotation — never succeeds in the first place. A one-time manual
+break of that cycle is required:
+
+```sh
+kubectl annotate crd volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io cert-manager.io/inject-ca-from-
+kubectl patch crd volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io --type=json -p='[{"op":"remove","path":"/spec/conversion"}]'
+```
+
+Both commands act only on the CRD's own metadata/spec, never on any
+`VolumeGroupSnapshotContent` instance — confirm none exist first
+(`kubectl get volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io -A`)
+so there's no conversion-strategy risk to real data; this cluster had none.
+After this, the controller's next automatic retry (`error_policy`'s 30s
+backoff) reaches `Ready` and the stale conversion-webhook
+Deployment/Service/Certificate get pruned normally.
+Cert-manager's own `Certificate` deletion does **not** delete the TLS Secret
+it created (standard cert-manager behavior, to avoid losing certs), so that
+Secret is left orphaned in the `snapshot-controller` namespace — harmless,
+but worth a manual `kubectl -n snapshot-controller delete secret
+snapshot-controller-conversion-webhook` for a fully tidy state.
+
 ## When something goes wrong
 
 - `kubectl get snapctl default -o jsonpath='{.status.phase}{"\n"}{.status.conditions[0].reason}{"\n"}{.status.conditions[0].message}{"\n"}'`
   shows `Failed` with a reason (`InvalidChartVersion`, `InvalidHelmValues`,
   `Unsupported`; `RenderFailed` when helm cannot render the chart;
-  `InvalidManifest`; `ApplyFailed` — including the case where
+  `InvalidManifest`; `ApplyFailed` — including both the case where
   `groupSnapshotsEnabled: true` and `CertManagerInstallation` isn't `Ready`
-  yet, since the `Issuer`'s `cert-manager.io/v1` kind isn't registered) and
-  the error text.
+  yet, and the migration case above) and the error text.
 - The ledger (`status.appliedResources`) is saved before anything is
   applied, so deleting the resource after a failed first install still
   removes everything that was created.
@@ -175,17 +221,29 @@ deleted at the end of step 3.
 ## Findings to record
 
 Live-verified 2026-09-29 on a 6-node Talos cluster (3 control-plane, 3
-worker; controller rolled `0.1.8` → `0.1.9`, chart `5.3.0`), alongside
-`CniInstallation`/`CertManagerInstallation`/`CsiDriver` which stayed `Ready`
-throughout:
+worker; controller rolled `0.1.8` → `0.1.9` → `0.1.10`, chart `5.3.0`),
+alongside `CniInstallation`/`CertManagerInstallation`/`CsiDriver` which
+stayed `Ready` throughout every rollout:
 
-- Steps 1-2 (as they now read, `groupSnapshotsEnabled: false`, one pod): not
-  yet re-run against the corrected default -- the live run predates the
-  `groupSnapshotsEnabled` toggle. The controller rollout itself was clean
-  (PDB honored, old pod terminated only after the new replica was ready) and
-  none of the four existing components were disrupted; namespace admission
-  held with no `pod-security.kubernetes.io/*` label and the pod(s) `Running`.
-  Re-confirm the one-pod shape specifically on the next live run.
+- Steps 1-2, re-run against `0.1.10` with the corrected `groupSnapshotsEnabled:
+  false` default: `Ready`; exactly one pod (`snapshot-controller`), no
+  webhook Deployment/Service, matching the design. Namespace admission held
+  with no `pod-security.kubernetes.io/*` label. Both controller rollouts
+  (`0.1.9`→`0.1.10` for this correction) were clean, PDB honored, no
+  disruption to the other four components.
+- **The migration case above was hit for real, not just reasoned about**:
+  this cluster had already run `groupSnapshotsEnabled: true`-equivalent
+  behavior (from before the toggle existed), so rolling to `0.1.10` produced
+  the exact `Failed`/`ApplyFailed` loop the migration section describes.
+  The documented two-command remediation
+  (`kubectl annotate ... cert-manager.io/inject-ca-from-` +
+  `kubectl patch ... --type=json` removing `/spec/conversion`) resolved it
+  on the first attempt; the controller reached `Ready` on its next
+  automatic retry with no further intervention. No `VolumeGroupSnapshot*`
+  instances existed at the time, confirmed before touching the CRD, so
+  there was no data-loss risk. The orphaned TLS Secret
+  (`snapshot-controller-conversion-webhook`) left behind by the pruned
+  `Certificate` was also confirmed and manually deleted.
 - Step 3 (`VolumeSnapshot`): a real `VolumeSnapshot` against a throwaway 1Gi
   Cinder PVC (`csi-cinder-sc-delete`) reached `readyToUse: true` within ~10
   seconds. The underlying `VolumeSnapshotContent` carries a real
