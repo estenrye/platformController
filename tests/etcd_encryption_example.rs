@@ -1,4 +1,4 @@
-use platform_controller::etcd_encryption::EtcdEncryption;
+use platform_controller::etcd_encryption::{EtcdEncryption, RewriteMode};
 use platform_controller::etcd_encryption_reconciler;
 use platform_controller::manifests::parse_manifests;
 
@@ -27,15 +27,9 @@ fn example_is_the_singleton_and_passes_validation() {
 }
 
 #[test]
-fn example_starts_with_every_acknowledgement_false() {
-    let acks = load().spec.acknowledgements;
+fn example_observes_only_by_default() {
+    let spec = load().spec;
 
-    assert!(!acks.kms_config_applied && !acks.plaintext_removed && !acks.kms_reverted && !acks.kms_removed);
-}
-
-#[test]
-fn example_builds_a_plugin_plan() {
-    let plan = platform_controller::kms_provider::kms_plan(&load().spec).expect("plan builds");
-
-    assert_eq!(plan.daemonset_name, "barbican-kms");
+    assert_eq!(spec.rewrite, RewriteMode::Disabled);
+    assert!(!spec.acknowledgements.legacy_providers_removed);
 }

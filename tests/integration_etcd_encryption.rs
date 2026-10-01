@@ -1,69 +1,50 @@
-// Run manually against a real cluster. Reaching AwaitingKmsConfig requires a
-// Ready plugin pod on every control-plane node (its readinessProbe waits for
-// the KMS socket), so in practice this needs valid credentials and a reachable
-// Barbican; on a cluster without one, use the runbook instead. With the controller running and all seven CRDs
-// Established:
+// Run manually against a real cluster whose apiserver already uses a KMS
+// provider (see docs/runbooks/etcd-encryption-verification.md). With the
+// controller running and all seven CRDs Established:
 //
 //   kubectl apply -f examples/etcd-encryption.yaml
 //   cargo test --test integration_etcd_encryption -- --ignored --nocapture
 //
-// This checks only what the controller can do by itself: install the plugin
-// DaemonSet and publish patch 1. It does NOT apply any Talos patch; the rest
-// of the protocol is a manual runbook step
-// (docs/runbooks/etcd-encryption-verification.md). It deletes the resource at
-// the end, which, with no acknowledgement set and the apiserver reporting no
-// KMS provider, removes the plugin immediately.
+// This asserts only that, within 180s, the EtcdEncryption "default" reports at
+// least one status.nodes[] entry, that every entry has a non-empty name and
+// address, and that status.rewrite.total is 0 (the example leaves
+// rewrite: Disabled, so this test never rewrites). It prints each node's
+// verified flag, writer prefix and reason. It does not assert any particular
+// phase. It changes nothing in the cluster apart from the controller's canary
+// Secret in kube-system.
+//
+// Getting a node to `verified` (and a meaningful status at all) requires the
+// controller pod to be able to reach each control-plane node's apiserver at
+// https://<InternalIP>:6443, and the apiserver's serving certificate must
+// accept the server name `kubernetes.default.svc` (unverified). Without that
+// the node is still listed, with verified=false and a "cannot verify" reason,
+// which this test prints; it only fails if no per-node entry appears at all
+// (for example the controller is not running or is not the leader).
 
-use k8s_openapi::api::apps::v1::DaemonSet;
-use kube::api::{Api, DeleteParams};
+use kube::api::Api;
 use kube::Client;
-use platform_controller::etcd_encryption::{EncryptionPhase, EtcdEncryption};
+use platform_controller::etcd_encryption::EtcdEncryption;
 use std::time::Duration;
-
-async fn eventually<F, Fut>(what: &str, timeout: Duration, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if check().await {
-            return;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "{what} did not happen within {timeout:?}");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    }
-}
 
 #[tokio::test]
 #[ignore = "needs a live cluster with the controller running; see the header comment"]
-async fn installs_the_plugin_and_publishes_the_enable_kms_patch() {
+async fn observes_every_control_plane_apiserver() {
     let client = Client::try_default().await.expect("a kubeconfig for the test cluster");
     let encryptions: Api<EtcdEncryption> = Api::all(client.clone());
-    let daemonsets: Api<DaemonSet> = Api::namespaced(client.clone(), "kube-system");
 
-    eventually("the barbican-kms DaemonSet to exist", Duration::from_secs(120), || async {
-        daemonsets.get_opt("barbican-kms").await.unwrap().is_some()
-    })
-    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let status = loop {
+        let current = encryptions.get("default").await.expect("apply examples/etcd-encryption.yaml first");
+        if let Some(status) = current.status.filter(|s| !s.nodes.is_empty()) {
+            break status;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no per-node status within 180s");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
 
-    eventually("the resource to reach AwaitingKmsConfig", Duration::from_secs(300), || async {
-        encryptions
-            .get("default")
-            .await
-            .ok()
-            .and_then(|e| e.status)
-            .is_some_and(|s| s.phase == EncryptionPhase::AwaitingKmsConfig)
-    })
-    .await;
-
-    let status = encryptions.get("default").await.unwrap().status.unwrap();
-    let patch = status.talos_patches.enable_kms.expect("patch 1 is published");
-    assert!(patch.contains("KubeEtcdEncryptionConfig"), "{patch}");
-
-    encryptions.delete("default", &DeleteParams::default()).await.unwrap();
-    eventually("the plugin to be removed on delete", Duration::from_secs(120), || async {
-        daemonsets.get_opt("barbican-kms").await.unwrap().is_none()
-    })
-    .await;
+    for node in &status.nodes {
+        println!("{}: verified={} writer={:?} reason={:?}", node.name, node.verified, node.writer_prefix, node.reason);
+    }
+    assert!(status.nodes.iter().all(|n| !n.name.is_empty() && !n.address.is_empty()));
+    assert_eq!(status.rewrite.total, 0, "this test must never trigger a rewrite");
 }

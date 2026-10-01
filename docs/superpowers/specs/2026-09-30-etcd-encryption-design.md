@@ -1,6 +1,6 @@
 # EtcdEncryption (KMS-backed Secret encryption at rest) on Talos
 
-Status: Implemented, NOT live-verified
+Status: SUPERSEDED by `2026-10-01-etcd-encryption-adopt-design.md` (live testing showed the fresh-install flow does not fit; kept as history)
 Date: 2026-09-30
 
 > **Caveat (read first).** The controller does **not** detect or merge a

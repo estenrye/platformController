@@ -256,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
 
     let etcd_encryption_controller = Controller::for_stream(etcd_encryptions, etcd_encryption_reader)
         .run(
-            etcd_encryption_reconciler::reconcile_with_finalizer,
+            etcd_encryption_reconciler::reconcile,
             etcd_encryption_reconciler::error_policy,
             context,
         )
@@ -458,8 +458,7 @@ mod tests {
             "metadata": { "name": "default" },
             "spec": {
                 "platformKind": "talos-linux",
-                "provider": "barbican",
-                "barbican": { "image": "img:1", "cloudConfigSecretRef": { "name": "cc" } }
+                "kmsProviderName": "barbican"
             }
         }))
         .expect("EtcdEncryption should deserialize");

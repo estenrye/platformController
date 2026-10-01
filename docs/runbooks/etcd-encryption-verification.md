@@ -1,327 +1,465 @@
-# Verifying etcd Secret encryption (Barbican KMS) on Talos
+# Adopting and verifying KMS Secret encryption on Talos
 
-Manual acceptance for the `EtcdEncryption` resource. **EXPERIMENTAL, not
-live-verified**: nothing below has been run against a real cluster, and
-section 7 lists the facts this run must pin down. Do not run it on a cluster
-you care about; read section 8 (Known limitations) first. Needs a real
-Talos cluster on OpenStack with `CniInstallation` already `Ready`. `<cp>` stands for a control-plane node IP;
-`<cp1>`, `<cp2>`, ... for each one in turn.
+Manual acceptance for the `EtcdEncryption` resource (adopt mode, which replaced
+the v0.1.11 fresh-install flow). Needs a real Talos cluster whose apiserver
+already encrypts Secrets through a KMS provider. **EXPERIMENTAL and NOT
+live-verified end to end: do not run it on a cluster you care about.** Every
+command marked "unverified" has not been run against a live cluster. See
+"Findings to record" at the end and `docs/memory/etcd-encryption-2026-09.md`.
 
-How the protocol works, in one paragraph: the controller never holds a Talos
-credential, so it cannot change the apiserver's encryption config. It
-installs the plugin, publishes each Talos patch in `.status.talosPatches`,
-and waits for you to apply it and set the matching `spec.acknowledgements.*`
-flag. It advances only when the acknowledgement **and** its own probes (the
-apiserver's KMS metrics, a canary Secret round trip and, where it matters,
-listing every Secret) agree. There is no `Failed` phase; failures show as
-`Ready=False` with a reason and never move the phase backwards or reset an
-acknowledgement.
+## 0. What this does and does not do
 
-**An acknowledgement only counts if you set it after its patch appeared.**
-The controller records, in `.status.patchGenerations`, the object's
-`metadata.generation` at the write that first published each patch; an
-acknowledgement counts only once the generation is higher (that is, the spec
-was changed after the patch was published). If an acknowledgement was already
-`true` when its patch appeared, it is ignored: apply the patch, then flip the
-acknowledgement to `false` and back to `true` (two `kubectl patch` calls).
-While a later acknowledgement is also set, the `false` step may briefly report
-`InvalidAcknowledgements`; that is harmless and clears on the second call.
+It **observes** each control-plane apiserver, optionally **rewrites** every
+Secret, and **proves per apiserver** that nothing is stored under a legacy
+provider (for example Talos's default secretbox), before telling you it is safe
+to remove that provider.
 
-**Applying a patch "to every control-plane node"** always means, in this
-runbook: one node at a time, and after each node wait until **that node's**
-apiserver has restarted with the new config before touching the next:
+It does **not** install the KMS plugin, enable KMS, publish Talos patches or edit
+your `EncryptionConfiguration`. You do all of that; the controller only reports.
 
-```sh
-date -u +%Y-%m-%dT%H:%M:%SZ                 # note the time, T
-talosctl -n <cpN> patch machineconfig --patch @patchX.yaml
-kubectl -n kube-system get pod kube-apiserver-<cpN-node-name> \
-  -o jsonpath='{.status.startTime}{"\n"}'    # repeat until later than T
-kubectl -n kube-system get pod kube-apiserver-<cpN-node-name>   # Running, 1/1
-```
+Design basis, from running the old controller against a real cluster on
+2026-10-01:
 
-`kubectl get --raw /readyz` is **not** enough: it goes through the load
-balancer to any apiserver, so it does not prove the patched node restarted.
-Set the acknowledgement only after **every** control-plane node is done.
+- The KMS plugin already ran as Talos static pods (`barbican-kms-plugin-<node>`)
+  sharing `/var/lib/kms/kms.sock`.
+- KMS was already configured with Talos's secretbox kept as a read fallback.
+  The apiserver's own metrics showed it:
 
-## 0. Prerequisites
+  ```
+  apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="to_storage",  transformer_prefix="k8s:enc:kms:v2:barbican:"} 1
+  apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:kms:v2:barbican:"} 284
+  apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:secretbox:v1:"} 86
+  apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="key2:"} 86
+  ```
 
-- A Talos cluster, `CniInstallation` `Ready`, the controller running with all
-  seven CRDs Established.
-- A 256-bit AES key in Barbican, and a `cloud.conf` containing both the
-  OpenStack credentials and `[KeyManager] key-id`. **Losing this key makes
-  every Secret unreadable.** Create the Secret (the key must be `cloud.conf`):
+  New writes already used KMS; 86 Secrets were still stored under secretbox. The
+  inner `key2:` prefix is a sub-prefix of the same secretbox operation; the
+  controller counts only top-level (`k8s:enc:`) prefixes.
 
-```sh
-kubectl -n kube-system create secret generic barbican-kms-cloud-config \
-  --from-file=cloud.conf=./cloud.conf
-```
+## 1. Prerequisites
 
-- **Check for an existing encryption provider.** Talos's default
-  `talosctl gen config` already encrypts Secrets with secretbox
-  (`cluster.secretboxEncryptionSecret`). The controller cannot see the
-  machine config, and every patch it generates **replaces** the `providers`
-  list. On each control-plane node:
+1. The apiserver already uses a KMS provider:
 
-```sh
-talosctl -n <cp> get machineconfig -o yaml | grep -n -E 'secretboxEncryptionSecret|aescbcEncryptionSecret|KubeEtcdEncryptionConfig'
-```
+   ```sh
+   kubectl get --raw '/readyz?verbose' | grep kms-providers
+   ```
 
-  If anything matches, the cluster already encrypts Secrets. Before applying
-  **each** patch from this runbook, splice that provider into the patch's
-  `providers` list as a read fallback, **after** the generated entries (and
-  before `identity` if the patch lists it last), exactly as the warning
-  comment at the top of every generated patch says. For secretbox that is an
-  entry like `- secretbox: {keys: [{name: key1, secret: <the existing
-  secret>}]}` (unverified shape: copy the existing provider block verbatim
-  from the machine config). Leaving it out makes every existing Secret
-  unreadable. Keep it in every later patch, including the deletion patches.
+   Expected: `[+]kms-providers ok`.
 
-- A baseline etcd read. `talosctl` has no `etcd get`; read etcd with
-  `etcdctl` using an etcd client certificate and key extracted per the Talos
-  etcd documentation (**the exact commands are unverified**; record what
-  worked in section 7):
+2. A baseline of provider use (the `to_storage` prefix is your target provider):
 
-```sh
-kubectl create secret generic plain-before --from-literal=k=plaintext-marker-7f3a
-etcdctl --endpoints https://<cp>:2379 --cacert etcd-ca.crt \
-  --cert etcd-client.crt --key etcd-client.key \
-  get /registry/secrets/default/plain-before | head -c 200
-# alternative (unverified): take a snapshot and search it
-talosctl -n <cp> etcd snapshot db.snapshot
-grep -a -c plaintext-marker-7f3a db.snapshot
-```
+   ```sh
+   kubectl get --raw /metrics | grep apiserver_storage_transformation_operations_total | grep secrets
+   ```
 
-  Expected without a pre-existing provider: the raw value starts with `k8s`
-  and contains `plaintext-marker-7f3a` (no `k8s:enc:` prefix). If it starts
-  with `k8s:enc:secretbox:` (or another `k8s:enc:` prefix), the cluster
-  already encrypts Secrets: go back to the previous bullet and splice that
-  provider into every patch. A snapshot holds old revisions until etcd is
-  compacted, so the snapshot method can still show plaintext after
-  encryption; prefer `etcdctl get`.
+   Expected: a `to_storage` line whose `transformer_prefix` is
+   `k8s:enc:kms:v2:<name>:`, where `<name>` is the `name` of the kms entry in
+   your EncryptionConfiguration (this becomes `spec.kmsProviderName`).
 
-## 1. Apply and reach `AwaitingKmsConfig`
+3. Take an etcd snapshot before changing anything:
+
+   ```sh
+   talosctl -n <cp> etcd snapshot db.snapshot
+   ```
+
+   Expected: `db.snapshot` written locally.
+
+4. Network: the controller pod must reach every control-plane node's apiserver
+   at `https://<InternalIP>:6443`, and that apiserver's serving certificate must
+   accept the server name `kubernetes.default.svc` (the controller dials the node
+   IP but sets that TLS server name). This is **unverified**; see section 6.
+
+## 2. Migrating from v0.1.11
+
+The schema changed (`provider`, `barbican` and the old acknowledgements were
+removed; `kmsProviderName` is new and required). Order matters: **first deploy
+the new CRD and the new controller image, then delete the old object.**
 
 ```sh
 kubectl apply -f deploy/crd.yaml
 kubectl wait --for=condition=established --timeout=60s crd/etcdencryptions.platform.rye.ninja
-kubectl apply -f deploy/bootstrap.yaml
-kubectl apply -f examples/etcd-encryption.yaml
-kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}'
-kubectl -n kube-system get ds barbican-kms -o wide
-kubectl -n kube-system get pods -l k8s-app=barbican-kms -o wide
-talosctl -n <cp> ls /var/lib/kms/          # repeat per control-plane node; expect kms.sock
+# roll the controller to the new image (edit deploy/bootstrap.yaml's image, apply it)
+kubectl -n platform-system rollout status deployment/platform-controller
+kubectl -n platform-system get deploy platform-controller -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
-Expected: phase passes through `InstallingPlugin` and settles at
-`AwaitingKmsConfig`. The DaemonSet has one Ready pod on **every** control-plane
-node (the controller requires the DaemonSet rollout to be current, with
-observed generation and updated pods, and a Ready pod on every control-plane
-node, not just one; it will sit in `InstallingPlugin` otherwise). `kms.sock`
-exists on each node. `.status.talosPatches.enableKms` is populated.
+Expected: the new image, two ready replicas (adjust the namespace/name if you
+changed them in `deploy/bootstrap.yaml`). If you had scaled the controller to 0,
+scale it back to 2 **with the new image** before the next step
+(`kubectl -n platform-system scale deployment/platform-controller --replicas=2`).
 
-## 2. Patch 1: enable KMS
+Only then:
 
 ```sh
-kubectl get etcdenc default -o jsonpath='{.status.talosPatches.enableKms}' > patch1.yaml
+kubectl delete etcdenc default
+kubectl get etcdenc default
 ```
 
-If section 0 found an existing provider, splice it into `patch1.yaml` now.
-This is the only patch carrying the `extraVolumes` document that mounts
-`/var/lib/kms` into the apiserver; later patches rely on it staying in the
-machine config.
+Expected: the new controller removes the v0.1.11 finalizer
+(`platform.rye.ninja/cleanup`) and the object disappears (`NotFound`).
 
-Apply to every control-plane node, one at a time, waiting for each node's
-apiserver to restart as described at the top of this runbook:
+Then check for v0.1.11 leftovers. Stripping the finalizer **skips** v0.1.11's
+own cleanup, so anything it created is still there:
 
 ```sh
-talosctl -n <cp1> patch machineconfig --patch @patch1.yaml
-# wait for kube-apiserver-<cp1 node> startTime to move past the patch time
-talosctl -n <cp2> patch machineconfig --patch @patch1.yaml
-# ... and so on for every control-plane node
+kubectl -n kube-system get ds barbican-kms
 ```
 
-Then, only after every node is done, acknowledge (if `kmsConfigApplied` was
-already `true`, flip it `false` then `true`):
+Expected: `NotFound`. If it exists, it is the v0.1.11 KMS plugin DaemonSet. Its
+hostPath `/var/lib/kms/` is the **same socket directory your static pods use**.
+If your Talos static pods are the real plugin, remove the DaemonSet carefully
+(`kubectl -n kube-system delete ds barbican-kms`), then on **every**
+control-plane node re-check that KMS still works: `[+]kms-providers ok` in that
+node's `/readyz?verbose` (per node, see 5a Method 1) and the socket still
+present (`talosctl -n <cp> ls /var/lib/kms/`, expected `kms.sock`). Do not
+delete it if it is the only thing serving the socket.
+
+Also find the cloud-config Secret you created for v0.1.11's plugin (the one its
+`spec.barbican.cloudConfigSecretRef` named). It holds OpenStack credentials.
+Leave it or remove it **deliberately**; this controller never touches it.
+
+Why this order: if the v0.1.11 controller is still running when you delete the
+object, deletion starts its multi-step revert protocol (it tries to publish
+revert patches and may re-apply or remove the plugin DaemonSet). Without any
+controller that strips the finalizer (for example scaled to 0, or the old
+image), the object stays `Terminating` indefinitely.
+
+## 3. Apply and observe
 
 ```sh
-kubectl patch etcdenc default --type merge \
-  -p '{"spec":{"acknowledgements":{"kmsConfigApplied":true}}}'
-kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}'
-kubectl get etcdenc default -o jsonpath='{.status.rewrite}{"\n"}'
+kubectl apply -f deploy/crd.yaml
+kubectl wait --for=condition=established --timeout=60s crd/etcdencryptions.platform.rye.ninja
+# run the controller at the new image, then:
+kubectl apply -f examples/etcd-encryption.yaml   # set spec.kmsProviderName first
+kubectl get etcdenc default -o yaml
 ```
 
-Expected: phase moves to `Rewriting` then `AwaitingPlaintextRemoval`;
-`status.rewrite.failed` is `0` and `rewritten` equals `total`. Rewriting runs
-**only while the apiserver reports an active KMS provider**: if it doesn't,
-the phase stays `Rewriting` and the Ready condition message says it is
-waiting for the apiserver to report an active KMS provider before rewriting
-Secrets. In that case check the patch landed on every node and the plugin
-pods are healthy; do not force anything.
+Expected: within a minute `status.phase` and `status.nodes[]` are populated, one
+entry per control-plane node.
 
-## 3. Verify encryption in etcd
+The phase is derived from scratch on every reconcile; nothing is remembered.
+
+| Phase | Meaning |
+|---|---|
+| `Observing` | Cannot yet vouch for the cluster: a node is unverifiable, writers are mixed, the apiserver is not writing with the target, legacy objects remain and `rewrite` is `Disabled`, or reads could not be confirmed. Read the `Ready` condition message. Requeued every 30 s. |
+| `NotConfigured` | No node reports a `kms-providers` readiness check and none writes with the target. The controller does not enable KMS. Requeued every 600 s. |
+| `Migrating` | Every apiserver writes with the target, at least one node completely read legacy objects, and `rewrite: Enabled`: the controller is rewriting every Secret. Requeued every 30 s. |
+| `ReadyToRemoveLegacy` | Every apiserver writes with the target and reads every Secret with zero legacy reads. This is necessary but NOT sufficient to remove a legacy provider: follow the hard gate at the top of section 5. Requeued every 600 s. |
+| `Verified` | As above, **and** you set `acknowledgements.legacyProvidersRemoved: true`, **and** the canary Secret round-tripped. Means "the probes agree and you acknowledged removal", nothing more. `Ready=True`. Requeued every 600 s. |
+
+There is no `Failed` phase. A validation failure (empty `kmsProviderName`, or
+one containing whitespace or `:`) is `Ready=False` with reason `InvalidSpec`;
+an unsupported `platformKind` or a name other than `default` is reason
+`Unsupported`.
+
+Per node (`status.nodes[]`):
+
+- `name`, `address`: the Node and its `InternalIP`. A control-plane node with
+  no `InternalIP` is listed with an empty `address` and reason `node has no
+  InternalIP` (never verified). An entry named `endpoint <address>` is an
+  apiserver registered in the `default/kubernetes` EndpointSlice that matches no
+  discovered control-plane node: it was not checked, so it is never verified and
+  holds the phase at `Observing`.
+- `verified`: true only if the node writes with the target **and** its reader
+  check was complete with zero legacy reads.
+- `writerPrefix`: the top-level prefix the node wrote the canary with; `null`
+  if it could not be determined.
+- `readsByPrefix`: what the node's apiserver decrypted while every Secret was
+  read through it (one uncached GET per Secret), by top-level prefix.
+- `secretsListed`: how many Secrets were read that way (a Secret deleted between
+  the name listing and its GET is not counted).
+- `reason`: empty when clean; otherwise why not.
+
+`status.legacyPrefixes` lists every top-level prefix other than the target that
+was read with a count above zero (for example `k8s:enc:secretbox:v1:`). A read
+reported with an empty prefix (what identity/plaintext presumably reports; not
+yet observed) is also legacy.
+
+`status.conditions[?(@.type=="Ready")]` carries the phase as its reason and
+the derivation's explanation as its message:
 
 ```sh
-etcdctl --endpoints https://<cp>:2379 --cacert etcd-ca.crt \
-  --cert etcd-client.crt --key etcd-client.key \
-  get /registry/secrets/default/plain-before | head -c 120   # unverified, see section 0
+kubectl get etcdenc default -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+kubectl get etcdenc default -o jsonpath='{range .status.nodes[*]}{.name}{"\t"}{.verified}{"\t"}{.writerPrefix}{"\t"}{.reason}{"\n"}{end}'
 ```
 
-Expected: the value now starts with `k8s:enc:kms:v2:barbican:` and
-`plaintext-marker-7f3a` does **not** appear.
+Common reasons:
 
-## 4. Patch 2: remove the identity fallback
+- `cannot verify node X: ...`: the node could not be probed (see section 6).
+  The phase stays `Observing`; the status never claims safe.
+- `NotConfigured` (`no KMS provider is active; this controller does not enable
+  KMS`): nothing configured; do that yourself.
+- `a KMS provider is configured but the apiserver is not writing with <prefix>`:
+  `spec.kmsProviderName` does not match the entry name, or the KMS provider is
+  not listed first.
+- `mixed: some apiservers do not write with the target provider yet`: a rolling
+  apiserver restart; wait. It never starts a rewrite.
+- `legacy objects remain; set rewrite: Enabled to migrate`.
+- `node has no InternalIP` / `an apiserver registered in the kubernetes
+  Endpoints is not a discovered control-plane node`: an apiserver the
+  controller could not check; give the node an `InternalIP` or the
+  `node-role.kubernetes.io/control-plane` label (or find out what that endpoint
+  address is). The phase stays `Observing`.
+- `the apiserver restarted (or exposes no process_start_time_seconds) during
+  the check`: the node's `process_start_time_seconds` changed (or was missing)
+  between snapshots; it retries on the next reconcile.
+- `cannot verify reads on every apiserver; not rewriting` / `cannot verify
+  reads: ...`: a node's reads were not provably complete (fewer objects were
+  decrypted than read) or a GET errored (for example a 500 because a Secret
+  could not be decrypted). The controller deliberately does not
+  rewrite on an unconfirmable read, because it would repeat full rewrites
+  every 30 s without ever being able to confirm.
+
+### Staleness: is the controller actually verifying?
+
+`status.phase` is not a live feed; it is what the last successful reconcile
+wrote. The `Ready` condition's `lastTransitionTime` is refreshed on **every**
+reconcile (it is not only set on a change), so it is the heartbeat:
 
 ```sh
-kubectl get etcdenc default -o jsonpath='{.status.talosPatches.removeIdentity}' > patch2.yaml
-# splice in any pre-existing provider (section 0), then apply node by node,
-# waiting for each node's apiserver to restart (top of this runbook)
-talosctl -n <cp1> patch machineconfig --patch @patch2.yaml
-# ... remaining nodes; acknowledge only after every node is done
-kubectl patch etcdenc default --type merge \
-  -p '{"spec":{"acknowledgements":{"plaintextRemoved":true}}}'
-kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}{.status.conditions}{"\n"}'
+kubectl get etcdenc default -o jsonpath='{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}'
+date -u +%FT%TZ
 ```
 
-Expected: phase `Encrypted`, `Ready=True`, no `Degraded` condition.
-`Encrypted` also requires the apiserver KMS probe, the canary Secret
-(`kube-system/etcd-encryption-canary`) round trip, and listing every Secret
-(each must decrypt) to pass. All of these go through one apiserver behind the
-load balancer, which is why the per-node wait above matters.
+Expected: a timestamp within roughly the last 30 seconds (phases `Observing`,
+`Migrating`) or 10 minutes (`NotConfigured`, `ReadyToRemoveLegacy`,
+`Verified`), plus the duration of a full reconcile. An older timestamp means
+the controller is not verifying (not running, not the leader, or crash-looping):
+treat the phase as **stale** and do not act on it.
 
-## 5. Optional destructive experiment
+A recent timestamp is not enough before removing a provider. The timestamp is
+written when a reconcile **completes** (after every node was verified), so for
+the section 5 gate you need a `lastTransitionTime` **later than the moment you
+took the 5b snapshot** (record `date -u +%FT%TZ` when you take it), with the
+phase still `ReadyToRemoveLegacy`: a reconcile that completed after the
+snapshot, not merely a recent one. Check
+`kubectl -n platform-system logs deploy/platform-controller` and the Lease
+holder.
 
-**Optional. Do not run this on a cluster you care about.** It does **not**
-prove the identity fallback is gone: KMS v2 caches data encryption keys in
-the apiserver, so with the plugin stopped a read of an existing Secret may
-still succeed, and a failed read only shows the plugin is needed, not that
-`identity` was removed. Section 3 (reading etcd) is the real evidence.
+## 4. Migrate
+
+Only once every node writes with the target and `legacyPrefixes` is not empty:
 
 ```sh
-kubectl -n kube-system patch ds barbican-kms \
-  -p '{"spec":{"template":{"spec":{"nodeSelector":{"x":"y"}}}}}'
-kubectl create secret generic new-while-down --from-literal=k=v   # expected to fail
-# a restarted apiserver has no cached key: optionally restart one and read
-kubectl get secret plain-before -o yaml
+kubectl patch etcdenc default --type merge -p '{"spec":{"rewrite":"Enabled"}}'
+kubectl get etcdenc default -o jsonpath='{.status.phase} {.status.rewrite}{"\n"}' -w
 ```
 
-Then restore the plugin **yourself**. The controller does not undo this: its
-server-side apply never removes a `nodeSelector` key owned by another field
-manager (`kubectl patch`), so the DaemonSet stays unschedulable until you
-remove it:
+Expected: `Migrating`; `status.rewrite.total` / `rewritten` rising page by page
+(a restart simply repeats the pass); on a later reconcile, `ReadyToRemoveLegacy`
+once every apiserver reads every Secret with zero legacy reads.
+
+The rewrite re-saves every Secret in the cluster **unchanged** (a `replace`
+with the object just read), so each is stored again through the current write
+provider. A conflict is retried, a missing Secret counts as done, and the
+controller never logs Secret data; it logs the namespace and name only.
+
+It runs only with `rewrite: Enabled`, only in the `Migrating` derivation. It
+needs `get`/`list`/`update` on every Secret in every namespace.
+
+### A Secret that will not rewrite
+
+If a Secret permanently fails to be re-saved (typically an admission webhook
+rejects the update), `status.rewrite.failed` stays above 0, the phase stays
+`Migrating` (the Secret keeps its legacy encoding, so reads stay legacy), and
+the whole cluster-wide rewrite repeats every 30 seconds. Find the failing
+Secrets by namespace/name in the controller log:
 
 ```sh
-kubectl -n kube-system patch ds barbican-kms --type json \
-  -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector/x"}]'
-kubectl -n kube-system get pods -l k8s-app=barbican-kms -o wide   # Ready on every node
-kubectl get secret plain-before -o yaml      # readable
-kubectl delete secret new-while-down --ignore-not-found
+kubectl -n platform-system logs deploy/platform-controller | grep "failed to rewrite secret"
 ```
 
-## 6. Delete protocol
+Expected: lines carrying `namespace=` and `secret=` fields, never data. If
+several replicas run, check the leader's pod. Then either fix the webhook (or
+whatever rejects the update) so the controller's next pass succeeds, or, once
+you have confirmed you can recreate it, back it up first
+(`kubectl get secret <name> -n <ns> -o yaml > backup.yaml`, and store the file
+securely: it holds the Secret's data) and then delete and recreate that Secret
+deliberately. Setting `rewrite: Disabled` stops the **next** pass; a pass
+already in flight runs to the end of its pages first.
 
-Deleting after patch 1 was acknowledged is a multi-step walk; the CR stays
-`Terminating` throughout and the plugin is removed **last**.
+## 5. Remove the legacy provider (your change)
+
+**HARD GATE. Do NOT remove any legacy provider unless ALL of these hold:**
+
+1. `status.phase` is `ReadyToRemoveLegacy`;
+2. the `Ready` condition's `lastTransitionTime` is **later than your 5b
+   snapshot** (section 3, "Staleness": a reconcile completed after the
+   snapshot and still derived `ReadyToRemoveLegacy`);
+3. the 5a quiet-cluster check below passed;
+4. the 5b etcd snapshot confirmation below passed;
+5. your EncryptionConfiguration's `resources:` list encrypts **only `secrets`**
+   with the legacy provider. Inspect it (on Talos, the
+   `KubeEtcdEncryptionConfig` / the apiserver's encryption config): if any other
+   resource (for example `configmaps`) is encrypted with the legacy provider,
+   removing that provider locks those objects out. **This controller checks
+   Secrets only**; its "no SECRET is stored under a legacy provider" says
+   nothing about other resources.
+
+`Observing`, `Migrating`, `NotConfigured` and a stale timestamp all mean **NO**.
+The controller does not remove the provider; you do, after the gate.
+
+### 5a. Confirm the reader check on a quiet cluster
+
+The reader check, per apiserver, pages through the Secret **names** with a
+`limit` (on Kubernetes >= 1.33 such a list may be served from the apiserver's
+watch cache, which decrypts nothing, so it is used for the names only), then
+**GETs every Secret one by one with no `resourceVersion`**. A GET with no
+`resourceVersion` is served from etcd, so the apiserver decrypts every Secret
+under its stored prefix, and the controller counts `from_storage` per prefix
+around those GETs. The check is complete only if the counts sum to at least the
+number of Secrets read. That such a GET bypasses the watch cache comes from
+reading the apiserver's cacher code and is **unverified on a live cluster**;
+this step is what confirms it. Ambient reads by other clients can only inflate
+the counts (and legacy counts only add), so confirm on a quiet cluster and
+**per apiserver**.
+
+Both the metrics and the GETs must hit the **same** apiserver.
+`kubectl get --raw /metrics` and `kubectl get secret` go through the load
+balancer, so they can land on different apiservers and prove nothing per node.
+Query the node's apiserver directly with a service-account token (the
+controller's own service account already may read `/metrics` and Secrets;
+commands unverified):
 
 ```sh
-kubectl delete etcdenc default --wait=false
-kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}'     # RevertingKms
-kubectl get etcdenc default -o jsonpath='{.status.talosPatches.revert}' > revert.yaml
-# splice in any pre-existing provider (section 0); apply node by node,
-# waiting for each node's apiserver to restart; acknowledge after the last
-talosctl -n <cp1> patch machineconfig --patch @revert.yaml
-# ... every control-plane node
-kubectl patch etcdenc default --type merge \
-  -p '{"spec":{"acknowledgements":{"kmsReverted":true}}}'
-kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}{.status.rewrite}{"\n"}'
+TOKEN=$(kubectl -n platform-system create token platform-controller)
+SECRETS=$(kubectl get secrets -A --chunk-size=100 --no-headers -o custom-columns=NS:.metadata.namespace,N:.metadata.name)
+# from a host (or debug pod with curl) that routes to the node IP:
+NODE=<node-ip>
+api() { curl -sk -H "Authorization: Bearer $TOKEN" "https://$NODE:6443$1"; }
+sum() { grep 'apiserver_storage_transformation_operations_total' "$1" | grep 'resource="secrets"' | grep 'transformation_type="from_storage"' | grep 'transformer_prefix="k8s:enc:' | awk '{s+=$NF} END{print s+0}'; }
+api /metrics > before.txt
+READ=0
+while read -r ns n; do
+  code=$(curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "https://$NODE:6443/api/v1/namespaces/$ns/secrets/$n")
+  [ "$code" = 200 ] && READ=$((READ + 1))
+done <<< "$SECRETS"
+api /metrics > after.txt
+grep '^process_start_time_seconds' before.txt after.txt   # must match
+echo "decrypted: $(( $(sum after.txt) - $(sum before.txt) )), read: $READ"
 ```
 
-The `revert` patch lists `identity` first with `kms` still present, so new
-writes go plaintext while old ciphertext stays readable. If you set
-`kmsReverted` before the revert patch appeared (for example before deleting),
-it does not count: flip it `false` then `true` after applying the patch.
-Throughout deletion the controller keeps re-applying the plugin DaemonSet,
-and it rewrites Secrets only while the plugin is Ready on every control-plane
-node. After `kmsReverted`, phase goes `Decrypting` (every Secret is re-saved)
-then `AwaitingKmsRemoval`, and `status.talosPatches.removeKms` appears:
+Expected: the two `process_start_time_seconds` values are identical (otherwise
+the apiserver restarted; repeat), and `decrypted` is **at least** `read` (the
+sum covers the top-level `k8s:enc:` prefixes only, which also excludes the
+inner `key2:`). The GETs return the Secrets' data to `/dev/null`; do not change
+that to a file. If `decrypted` is less than `read`, the GETs were not served
+from etcd: the controller's completeness check will report "cannot verify
+reads" for that node, and you must not rely on it. Record it as finding (c).
+Repeat for **every** control-plane apiserver.
+
+### 5b. Confirm with an etcd snapshot (unverified command)
+
+Metrics are not the final word. Before removing the provider, take a fresh
+snapshot and look at the stored values:
 
 ```sh
-kubectl get etcdenc default -o jsonpath='{.status.talosPatches.removeKms}' > removekms.yaml
-# splice in any pre-existing provider (section 0) first
-talosctl -n <cp1> patch machineconfig --patch @removekms.yaml
-# ... every control-plane node, waiting for each node's apiserver to restart
-kubectl patch etcdenc default --type merge \
-  -p '{"spec":{"acknowledgements":{"kmsRemoved":true}}}'
-kubectl -n kube-system get ds barbican-kms          # eventually NotFound
-kubectl get etcdenc default                         # eventually NotFound
-etcdctl ... get /registry/secrets/default/plain-before | head -c 120   # as in section 3
+talosctl -n <cp> etcd snapshot db.snapshot
 ```
 
-Expected: the DaemonSet disappears last, only after `kmsRemoved` counts (set
-after `removeKms` appeared), the apiserver stops reporting an active KMS
-provider, **and** every Secret can still be listed; the baseline Secret is
-plaintext again in etcd (or under the pre-existing provider's prefix, if you
-spliced one in).
+Then inspect the keys under `/registry/secrets/` for their value prefixes,
+using `etcdctl` or a snapshot reader. The exact command is **unverified**
+(`talosctl etcd get` does not exist); for example, restore the snapshot into a
+scratch `etcd` and run something like
+`etcdctl get --prefix /registry/secrets/ --print-value-only | grep -a -o -E 'k8s:enc:[a-z0-9]+(:v[0-9]+)?:' | sort | uniq -c`.
+Expected: only `k8s:enc:kms:v2:` (your target) prefixes, no
+`k8s:enc:secretbox:`. Also count values that carry **no** `k8s:enc:` prefix at all
+(plaintext/identity): that count must be zero (for example, count the values and
+subtract the ones that match `k8s:enc:`). If any other prefix remains, do not
+remove that provider. Caveat: a snapshot also contains old revisions of keys,
+so a few `secretbox` hits can be historical ghosts, a safe-direction false alarm;
+compare against the latest revision of each key if you can.
 
-Fail-safe behavior to confirm along the way:
+### 5c. Remove the provider, one control-plane node at a time
 
-- **Unreadable probe:** if the apiserver metrics probe cannot be read during
-  deletion (for example, the apiserver is restarting), the controller treats
-  KMS state as unknown and keeps the CR `Terminating`; it never removes the
-  plugin on an unreadable probe. It retries on its own.
-- **Delete early** (`Pending` or `InstallingPlugin`): the plugin is removed
-  immediately only if the apiserver positively reports no KMS provider. If
-  the probe is unreadable or reports KMS active, deletion walks the revert
-  protocol above.
-- **Delete in `AwaitingKmsConfig`:** if you applied patch 1 to **any**
-  control-plane node, set `kmsConfigApplied: true` **before** deleting. That
-  raw value (counted or not) keeps the plugin and walks the revert protocol.
-  Setting it may let the controller advance to `Rewriting` before your delete
-  lands, so first finish applying patch 1 to **every** control-plane node
-  (the cluster is then consistent whichever happens first), then set the
-  acknowledgement, then delete.
-  Without it, the controller relies only on the KMS probe: if it reports no
-  KMS provider (for example the one apiserver it reached was not yet
-  patched), the plugin is removed while a patched apiserver may depend on it.
-  Test both: delete a fresh resource that never reached patch 1, and delete
-  one whose patch 1 was applied and `kmsConfigApplied` set.
+Remove secretbox (and any other legacy provider) from your Talos
+`KubeEtcdEncryptionConfig`, **one control-plane node at a time**. After each
+node, wait until that node's `kube-apiserver-<node>` pod has a start time
+after the patch:
+
+```sh
+kubectl -n kube-system get pod kube-apiserver-<node> -o jsonpath='{.status.startTime}{"\n"}'
+```
+
+Expected: a time later than your `talosctl patch` of that node. Do not use
+`/readyz` for this: it goes through a load balancer and does not prove the
+patched node restarted.
+
+Then acknowledge:
+
+```sh
+kubectl patch etcdenc default --type merge -p '{"spec":{"acknowledgements":{"legacyProvidersRemoved":true}}}'
+kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+```
+
+Expected: `Verified` and `True`. The metrics **cannot prove** the apiserver
+configuration no longer lists the legacy provider; `Verified` means every
+apiserver wrote and read only with the target during the check, the canary
+round-tripped, and you said you removed the legacy providers. If you removed it
+too early the reads would fail (Secrets unreadable); that is why 5a and 5b come
+first and why you keep the snapshot from section 1.
+
+## 6. Troubleshooting
+
+- **`tls: bad certificate` / `certificate is valid for ... not ...`** in a
+  node's `reason`: the apiserver's serving certificate does not accept the
+  server name `kubernetes.default.svc` at a node IP (unverified assumption).
+  Record the exact error and the certificate's SANs as a finding:
+
+  ```sh
+  openssl s_client -connect <node-ip>:6443 </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName
+  ```
+
+  Expected: a SAN list. The status says "cannot verify" for that node and never
+  claims safe; the controller has no workaround until this is fixed in code.
+- **`node has no InternalIP`** or an **`endpoint <address>`** entry: an
+  apiserver the controller did not check. The controller cross-checks the
+  addresses in the `default/kubernetes` EndpointSlice (it needs `list` on
+  `endpointslices.discovery.k8s.io`); every address must belong to a
+  control-plane-labelled Node with that `InternalIP`. Compare
+  `kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o wide`
+  with the node list below.
+- **A node `Unverifiable` / timeout**: reachability. The controller pod must
+  reach `https://<InternalIP>:6443` of every Node labelled
+  `node-role.kubernetes.io/control-plane` (NetworkPolicy, firewall). Check
+  `kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide`. A
+  discovery failure shows as `Ready=False` reason `VerificationFailed`.
+- **Counters "went backwards"** or **"the apiserver restarted"**: an apiserver
+  restarted mid-check (its counters dropped, or its `process_start_time_seconds`
+  changed between snapshots, or it exposes none); the node is not verified for
+  that run and it retries on the next reconcile. If it never clears, check that
+  the node's `/metrics` contains a `process_start_time_seconds` line.
+- **`the canary write was not counted by any provider`**: the canary write did
+  not raise any `to_storage` counter; check the metrics name/labels (finding e).
+- **Phase looks old**: see "Staleness" in section 3.
 
 ## 7. Findings to record
 
-Open verification items from the spec. For each, record the observed value
-here and fix the code if it differed:
+The spec's open items, settled only by running this:
 
-- (a) The exact `apiserver_envelope_encryption_*` metric names seen at
-  `kubectl get --raw /metrics | grep envelope`. Update `KMS_METRIC_PREFIXES`
-  in `src/encryption_probe.rs` if the prefix is wrong; the phase probes
-  depend on it (a wrong prefix leaves the CR stuck at `AwaitingKmsConfig`).
-- (b) Whether Talos needed `cluster.apiServer.extraVolumes` as generated or a
-  different mounting mechanism, the exact accepted shape of the
-  `KubeEtcdEncryptionConfig` KMS block, and whether `talosctl patch
-  machineconfig` accepts the generated two-document patch (the volume patch
-  and the `KubeEtcdEncryptionConfig` document separated by `---`). Correct
-  `src/talos_patches.rs` and its tests if any differed.
-- (c) The image tag that worked (`examples/etcd-encryption.yaml` pins
-  `registry.k8s.io/provider-os/barbican-kms-plugin:v1.36.0` unverified).
-- (d) Whether any admission webhook rejected a no-op Secret `update` during
-  the rewrite (such Secrets are reported as `status.rewrite.failed`).
-- (e) The etcd read method that worked (section 0): how the etcd client
-  certificate and key were obtained on this Talos version, and whether
-  `talosctl etcd snapshot` plus a search is usable.
-- (f) Whether secretbox (or another provider) was already configured, and the
-  exact block spliced into the patches.
+- (a) Did TLS to `https://<node-ip>:6443` with server name
+  `kubernetes.default.svc` work?
+- (b) Is the `kms-providers` readiness line named exactly so on this Talos /
+  Kubernetes version (observed as `[+]kms-providers ok` on 2026-10-01)?
+- (c) Did the per-Secret GETs with no `resourceVersion` read from etcd
+  (section 5a; the reader check's completeness guards this: note any node
+  reported incomplete)?
+- (d) What `transformer_prefix` do plaintext/identity reads report (create an
+  unencrypted object only on a throwaway cluster)?
+- (e) Is a zero-value counter series absent (the parser treats absent as 0)?
+
+Update `src/transformation_metrics.rs` / `src/apiserver_probe.rs` and their
+tests if any differ.
 
 ## 8. Known limitations
 
-- **Existing encryption providers are not detected or merged.** Talos's
-  default config enables secretbox; you must splice it into every patch
-  (section 0). Forgetting makes every existing Secret unreadable.
-- **Key rotation is unsupported.** Changing the Barbican key, `cloud.conf`'s
-  `key-id`, or `spec.barbican.cloudConfigSecretRef` after `Rewriting` started
-  makes Secrets encrypted under the old key unreadable.
-- **New control-plane nodes.** A control-plane node added after `Encrypted`
-  must receive the same patches (patch 1, then patch 2) and have a Ready
-  plugin pod before its apiserver serves traffic.
-- **One apiserver at a time.** Every probe (KMS metrics, canary, listing
-  Secrets) reaches whichever apiserver the load balancer picks; the per-node
-  wait above is what covers the others.
-- **Not live-verified.** See section 7.
+- No plugin installation, no Talos patches, no key management: you own the KMS
+  plugin, the key and the EncryptionConfiguration.
+- The reader check GETs **every** Secret, one request each, on **every**
+  control-plane node on each run (steady state every 10 minutes, active phases
+  every 30 s), which is not cheap on a large cluster (each node's read is
+  bounded at 15 minutes).
+- The apiserver port is fixed at 6443.
+- The reader check is evidence, not proof; confirm with an etcd snapshot (5b).
+- Only Secrets are covered: a legacy provider that also encrypts other
+  resources (see the section 5 gate) is not checked.

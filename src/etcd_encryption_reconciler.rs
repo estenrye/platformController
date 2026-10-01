@@ -1,25 +1,20 @@
+use crate::apiserver_probe::{delete_canary, ApiserverProbe, KubeApiserverProbe};
 use crate::crd::{Condition, PlatformKind};
-use crate::encryption_phase::{cleanup_step, next_phase, CleanupInputs, CleanupStep, PhaseInputs};
+use crate::encryption_verdict::{all_clean, derive, Derivation};
 use crate::etcd_encryption::{
-    effective_acks, Acknowledgements, EncryptionPhase, EtcdEncryption, EtcdEncryptionSpec, EtcdEncryptionSpecError,
-    EtcdEncryptionStatus, PatchGenerations, RewriteProgress, TalosPatches,
+    target_prefix, EncryptionPhase, EtcdEncryption, EtcdEncryptionSpec, EtcdEncryptionSpecError,
+    EtcdEncryptionStatus, RewriteMode, RewriteProgress,
 };
-use crate::kms_provider::{kms_plan, KmsPlan, PLUGIN_NAMESPACE};
-use crate::reconciler::{leader_gate, Context, FINALIZER_NAME, SINGLETON_NAME};
-use crate::secret_rewrite::{rewrite_page, verify_listable, KubeSecretStore, SecretStore, StoreError};
-use k8s_openapi::api::apps::v1::DaemonSet;
-use k8s_openapi::api::core::v1::Node;
-use kube::api::ListParams;
+use crate::secret_rewrite::{rewrite_page, KubeSecretStore};
+use crate::reconciler::{leader_gate, Context, SINGLETON_NAME};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 use std::sync::Arc;
 use std::time::Duration;
 
-const FIELD_MANAGER: &str = "platform-controller";
-const WAITING_REQUEUE: Duration = Duration::from_secs(15);
-const STEADY_REQUEUE: Duration = Duration::from_secs(300);
-/// Upper bound on listing every Secret for the readable gate.
-const LISTABLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The finalizer v0.1.11 added to every EtcdEncryption. This controller adds
+/// none and owns nothing to clean up, so it removes this one (and only this one).
+pub const LEGACY_FINALIZER: &str = "platform.rye.ninja/cleanup";
 
 #[derive(thiserror::Error, Debug)]
 pub enum ValidationError {
@@ -58,21 +53,15 @@ pub fn validate(name: &str, spec: &EtcdEncryptionSpec) -> Result<(), ValidationE
 pub enum EtcdEncryptionReconcileError {
     #[error(transparent)]
     Validation(#[from] ValidationError),
-    #[error(transparent)]
-    Apply(#[from] crate::apply::ApplyError),
     #[error("kubernetes API call failed: {0}")]
     Api(#[source] kube::Error),
-    #[error("secret rewrite failed: {0}")]
-    Store(#[from] StoreError),
+    /// The probe could not be built or the rewrite could not list Secrets.
+    #[error("verification failed: {0}")]
+    Verification(String),
     #[error("failed to update status: {0}")]
     Status(#[source] kube::Error),
     #[error("not the leader; standing down")]
     NotLeader,
-    /// Deletion is deliberately waiting on the operator or a probe. Always an
-    /// `Err`: `kube::runtime::finalizer` strips the finalizer on any `Ok` from
-    /// the Cleanup arm, and the plugin must outlive the apiserver's use of it.
-    #[error("deletion is waiting: {0}")]
-    CleanupBlocked(String),
 }
 
 impl EtcdEncryptionReconcileError {
@@ -80,13 +69,11 @@ impl EtcdEncryptionReconcileError {
     /// overwrite status. Exhaustive on purpose: a new variant forces a decision.
     pub fn failure_reason(&self) -> Option<&'static str> {
         match self {
-            EtcdEncryptionReconcileError::Apply(_) => Some("ApplyFailed"),
             EtcdEncryptionReconcileError::Api(_) => Some("ApiCallFailed"),
-            EtcdEncryptionReconcileError::Store(_) => Some("RewriteFailed"),
+            EtcdEncryptionReconcileError::Verification(_) => Some("VerificationFailed"),
             EtcdEncryptionReconcileError::Validation(_)
             | EtcdEncryptionReconcileError::Status(_)
-            | EtcdEncryptionReconcileError::NotLeader
-            | EtcdEncryptionReconcileError::CleanupBlocked(_) => None,
+            | EtcdEncryptionReconcileError::NotLeader => None,
         }
     }
 }
@@ -102,102 +89,15 @@ pub fn condition(type_: &str, ok: bool, reason: &str, message: &str, generation:
     }
 }
 
-/// A Ready plugin pod must exist on **every** control-plane node, and there
-/// must be at least one: patch 1 triggers a rolling apiserver restart that
-/// needs the socket on each node it lands on.
-/// The DaemonSet controller has observed the current spec and every pod is
-/// on the current revision, so stale pods from a previous image generation
-/// during a rollout never count as ready. Missing values mean not ready.
-pub fn daemonset_rollout_current(
-    generation: Option<i64>,
-    observed_generation: Option<i64>,
-    updated: Option<i32>,
-    desired: i32,
-) -> bool {
-    matches!((generation, observed_generation), (Some(g), Some(o)) if g == o) && updated.unwrap_or(0) == desired
+/// The finalizer list without the v0.1.11 finalizer, or `None` if it is absent.
+pub fn strip_finalizer(finalizers: &[String]) -> Option<Vec<String>> {
+    finalizers
+        .iter()
+        .any(|f| f == LEGACY_FINALIZER)
+        .then(|| finalizers.iter().filter(|f| *f != LEGACY_FINALIZER).cloned().collect())
 }
 
-pub fn daemonset_covers_all_control_plane(desired: i32, ready: i32, control_plane_nodes: usize) -> bool {
-    control_plane_nodes > 0 && desired >= 0 && desired as usize == control_plane_nodes && ready == desired
-}
-
-/// The patches visible once `phase` is reached: additive, never retracted.
-pub fn patches_for(phase: EncryptionPhase, plan: &KmsPlan, current: &TalosPatches) -> TalosPatches {
-    use EncryptionPhase::*;
-    let mut patches = current.clone();
-    if matches!(phase, AwaitingKmsConfig | Rewriting | AwaitingPlaintextRemoval | Encrypted) {
-        patches.enable_kms = Some(crate::talos_patches::enable_kms(plan));
-    }
-    if matches!(phase, AwaitingPlaintextRemoval | Encrypted) {
-        patches.remove_identity = Some(crate::talos_patches::remove_identity(plan));
-    }
-    patches
-}
-
-/// Records `generation` for every patch in `patches` that is published but has
-/// no publication generation yet. Never overwrites one already recorded.
-/// Call it on the status that the publishing write sends, so the patch and its
-/// generation land in the same write. Returns whether anything changed.
-pub fn record_publication(gens: &mut PatchGenerations, patches: &TalosPatches, generation: i64) -> bool {
-    let mut changed = false;
-    let mut record = |published: &mut Option<i64>, patch: &Option<String>| {
-        if patch.is_some() && published.is_none() {
-            *published = Some(generation);
-            changed = true;
-        }
-    };
-    record(&mut gens.enable_kms, &patches.enable_kms);
-    record(&mut gens.remove_identity, &patches.remove_identity);
-    record(&mut gens.revert, &patches.revert);
-    record(&mut gens.remove_kms, &patches.remove_kms);
-    changed
-}
-
-/// The cleanup state machine's inputs. Acks count only after their patch was
-/// published (`effective_acks`), except `kms_config_applied`, which stays the
-/// RAW spec value: it only decides engaged-ness, and there a not-yet-counting
-/// ack must still keep the plugin.
-pub fn cleanup_inputs(
-    phase: EncryptionPhase,
-    raw: Acknowledgements,
-    generation: i64,
-    gens: &PatchGenerations,
-    kms_active: Option<bool>,
-    secrets_readable: bool,
-) -> CleanupInputs {
-    let acks = Acknowledgements { kms_config_applied: raw.kms_config_applied, ..effective_acks(raw, generation, gens) };
-    CleanupInputs { phase, acks, kms_active, secrets_readable }
-}
-
-/// The phase to record while waiting for `kmsReverted`. The phase never
-/// regresses: once decrypting has started (or finished), an ack that does not
-/// count (flipped, or written before `patchGenerations` existed) keeps the
-/// phase and only blocks the next step.
-pub fn revert_wait_phase(current: EncryptionPhase) -> EncryptionPhase {
-    match current {
-        EncryptionPhase::Decrypting | EncryptionPhase::AwaitingKmsRemoval => current,
-        _ => EncryptionPhase::RevertingKms,
-    }
-}
-
-/// Every Secret can be listed (so decrypted) right now. Errors and timeouts
-/// are `false` and logged: this gate only ever blocks.
-async fn probe_secrets_readable(store: &impl SecretStore) -> bool {
-    let deadline = tokio::time::Instant::now() + LISTABLE_TIMEOUT;
-    match tokio::time::timeout_at(deadline, verify_listable(store)).await {
-        Ok(Ok(_)) => true,
-        Ok(Err(err)) => {
-            tracing::warn!(error = %err, "listing every Secret failed; treating Secrets as not all readable");
-            false
-        }
-        Err(_) => {
-            tracing::warn!("listing every Secret timed out; treating Secrets as not all readable");
-            false
-        }
-    }
-}
-
-async fn write_status(
+pub async fn write_status(
     api: &Api<EtcdEncryption>,
     name: &str,
     status: &EtcdEncryptionStatus,
@@ -209,423 +109,234 @@ async fn write_status(
     Ok(())
 }
 
-async fn plugin_ready(client: &kube::Client, plan: &KmsPlan) -> Result<bool, EtcdEncryptionReconcileError> {
-    let daemonsets: Api<DaemonSet> = Api::namespaced(client.clone(), PLUGIN_NAMESPACE);
-    let status = daemonsets
-        .get_opt(&plan.daemonset_name)
-        .await
-        .map_err(EtcdEncryptionReconcileError::Api)?
-        ;
-    let Some(daemonset) = status else { return Ok(false) };
-    let generation = daemonset.metadata.generation;
-    let Some(status) = daemonset.status else { return Ok(false) };
-    if !daemonset_rollout_current(
-        generation,
-        status.observed_generation,
-        status.updated_number_scheduled,
-        status.desired_number_scheduled,
-    ) {
-        return Ok(false);
+/// `Err(NotLeader)` unless this replica still holds the lease. Checked before
+/// every status write: a reconcile can outlive the leadership it started with.
+pub fn still_leader(is_leader: &std::sync::atomic::AtomicBool) -> Result<(), EtcdEncryptionReconcileError> {
+    match leader_gate(is_leader) {
+        Some(_) => Err(EtcdEncryptionReconcileError::NotLeader),
+        None => Ok(()),
     }
-    let nodes: Api<Node> = Api::all(client.clone());
-    let control_plane = nodes
-        .list(&ListParams::default().labels("node-role.kubernetes.io/control-plane"))
-        .await
-        .map_err(EtcdEncryptionReconcileError::Api)?
-        .items
-        .len();
-    Ok(daemonset_covers_all_control_plane(status.desired_number_scheduled, status.number_ready, control_plane))
 }
 
-/// Rewriting while KMS is not the active write provider would store Secrets
-/// under identity, and a later remove-identity patch would make them
-/// unreadable. Only rewrite while the apiserver reports an active KMS provider.
-pub fn should_run_rewrite(phase: EncryptionPhase, kms_active: bool) -> bool {
-    phase == EncryptionPhase::Rewriting && kms_active
+/// `write_status`, but only while still the leader; a standby never writes.
+async fn write_status_as_leader(
+    api: &Api<EtcdEncryption>,
+    name: &str,
+    status: &EtcdEncryptionStatus,
+    is_leader: &std::sync::atomic::AtomicBool,
+) -> Result<(), EtcdEncryptionReconcileError> {
+    still_leader(is_leader)?;
+    write_status(api, name, status).await
 }
 
-/// A probe error is "not yet": it is logged and never advances a phase.
-///
-/// Forward path only. Mapping an error to `false` is the SAFE direction here
-/// (it blocks advancing). `cleanup` must NOT use this: there `false` would
-/// mean "KMS is off, the plugin may be removed", so it uses `Option<bool>`.
-async fn probe_kms_active(client: &kube::Client) -> bool {
-    crate::encryption_probe::kms_active(client).await.unwrap_or_else(|err| {
-        tracing::warn!(error = %err, "KMS metrics probe failed; treating as not active");
-        false
-    })
+/// A CR being deleted gets no probes, no status and no rewrite.
+pub fn being_deleted(obj: &EtcdEncryption) -> bool {
+    obj.metadata.deletion_timestamp.is_some()
 }
 
-/// Rewrites every Secret, writing progress to status after each page.
-/// Returns true only when every Secret was rewritten with zero failures.
+/// Resets status to "cannot vouch for the cluster": never leaves a previously
+/// derived safe phase or old per-node evidence behind.
+pub fn reset_unverified(
+    status: &mut EtcdEncryptionStatus,
+    generation: Option<i64>,
+    reason: &str,
+    message: &str,
+) {
+    status.phase = EncryptionPhase::Observing;
+    status.nodes = vec![];
+    status.legacy_prefixes = vec![];
+    status.rewrite = RewriteProgress::default();
+    status.observed_generation = generation.unwrap_or(0);
+    status.conditions = vec![condition("Ready", false, reason, message, generation)];
+}
+
+/// Active phases are re-checked quickly; settled ones slowly (the reader check
+/// lists every Secret on every control-plane apiserver, so it is not cheap).
+pub fn requeue_for(phase: EncryptionPhase) -> Duration {
+    match phase {
+        EncryptionPhase::Observing | EncryptionPhase::Migrating => Duration::from_secs(30),
+        EncryptionPhase::NotConfigured | EncryptionPhase::ReadyToRemoveLegacy | EncryptionPhase::Verified => {
+            Duration::from_secs(600)
+        }
+    }
+}
+
+/// `Ready` is true only when the cluster is `Verified`.
+pub fn ready_condition_for(derivation: &Derivation, generation: Option<i64>) -> Condition {
+    condition(
+        "Ready",
+        derivation.phase == EncryptionPhase::Verified,
+        &format!("{:?}", derivation.phase),
+        &derivation.reason,
+        generation,
+    )
+}
+
+/// The rewrite runs only when the derivation says so for the `Migrating` phase
+/// AND the spec enables it. `derive` already requires both; this is the second lock.
+pub fn should_run_rewrite(spec: &EtcdEncryptionSpec, derivation: &Derivation) -> bool {
+    derivation.run_rewrite
+        && derivation.phase == EncryptionPhase::Migrating
+        && spec.rewrite == RewriteMode::Enabled
+}
+
+/// Rewrites every Secret, writing progress to status after each page. Failures
+/// are reported by namespace/name only, never by data.
 async fn run_rewrite(
     api: &Api<EtcdEncryption>,
     name: &str,
-    store: &impl SecretStore,
+    store: &KubeSecretStore,
     status: &mut EtcdEncryptionStatus,
-) -> Result<bool, EtcdEncryptionReconcileError> {
+    is_leader: &std::sync::atomic::AtomicBool,
+) -> Result<(), EtcdEncryptionReconcileError> {
     let mut progress = RewriteProgress::default();
     let mut token: Option<String> = None;
     loop {
-        let page = rewrite_page(store, token.as_deref()).await?;
-        progress.total += page.seen;
-        progress.rewritten += page.rewritten;
-        progress.failed += page.failed.len() as u64;
+        still_leader(is_leader)?;
+        let page = rewrite_page(store, token.as_deref())
+            .await
+            .map_err(|err| EtcdEncryptionReconcileError::Verification(err.to_string()))?;
+        progress.total += page.seen as i64;
+        progress.rewritten += page.rewritten as i64;
+        progress.failed += page.failed.len() as i64;
         for key in &page.failed {
-            // Identity only, never data.
             tracing::warn!(namespace = %key.namespace, secret = %key.name, "failed to rewrite secret");
         }
         status.rewrite = progress.clone();
-        write_status(api, name, status).await?;
+        write_status_as_leader(api, name, status, is_leader).await?;
         match page.next {
             Some(next) => token = Some(next),
-            None => break,
+            None => return Ok(()),
         }
     }
-    Ok(progress.failed == 0)
 }
 
 pub async fn reconcile(
     obj: Arc<EtcdEncryption>,
     ctx: Arc<Context>,
 ) -> Result<Action, EtcdEncryptionReconcileError> {
-    let mut progress = crate::ledger::ReconcileProgress::default();
-    let result = reconcile_inner(obj.clone(), ctx.clone(), &mut progress).await;
-    if let Err(err) = &result
-        && let Some(reason) = err.failure_reason()
-    {
-        record_failure(&obj, &ctx, &progress, reason, &err.to_string()).await;
-    }
-    result
-}
-
-/// Best effort. Keeps the phase and every other field: a failure is a
-/// condition, never a regression of the protocol position.
-async fn record_failure(
-    obj: &EtcdEncryption,
-    ctx: &Context,
-    progress: &crate::ledger::ReconcileProgress,
-    reason: &str,
-    message: &str,
-) {
-    let name = obj.name_any();
-    let api: Api<EtcdEncryption> = Api::all(ctx.client.clone());
-    let mut status = obj.status.clone().unwrap_or_default();
-    status.applied_resources = crate::ledger::failure_ledger(&status.applied_resources, progress.desired.as_deref());
-    status.conditions = vec![condition("Ready", false, reason, message, obj.metadata.generation)];
-    if let Err(err) = write_status(&api, &name, &status).await {
-        tracing::warn!(installation = %name, error = %err, "failed to record failure status");
-    }
-}
-
-async fn reconcile_inner(
-    obj: Arc<EtcdEncryption>,
-    ctx: Arc<Context>,
-    progress: &mut crate::ledger::ReconcileProgress,
-) -> Result<Action, EtcdEncryptionReconcileError> {
     if let Some(action) = leader_gate(&ctx.is_leader) {
         return Ok(action);
     }
     let name = obj.name_any();
     let generation = obj.metadata.generation;
     let api: Api<EtcdEncryption> = Api::all(ctx.client.clone());
+
+    // One-time migration: a CR created by v0.1.11 carries a finalizer this
+    // controller no longer handles; leaving it would hang a pending deletion.
+    if let Some(remaining) = strip_finalizer(obj.metadata.finalizers.as_deref().unwrap_or(&[])) {
+        tracing::info!(installation = %name, "removing the v0.1.11 finalizer");
+        let patch = serde_json::json!({ "metadata": { "finalizers": remaining } });
+        api.patch(&name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(patch))
+            .await
+            .map_err(EtcdEncryptionReconcileError::Api)?;
+    }
+    // A CR being deleted must not trigger probes, a status write or a rewrite.
+    if being_deleted(&obj) {
+        return Ok(Action::await_change());
+    }
+
     let mut status = obj.status.clone().unwrap_or_default();
     status.observed_generation = generation.unwrap_or(0);
 
     if let Err(err) = validate(&name, &obj.spec) {
         tracing::warn!(installation = %name, error = %err, "validation failed");
-        status.conditions = vec![condition("Ready", false, err.reason(), &err.to_string(), generation)];
-        write_status(&api, &name, &status).await?;
+        reset_unverified(&mut status, generation, err.reason(), &err.to_string());
+        write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
         return Err(EtcdEncryptionReconcileError::Validation(err));
     }
-    let plan = kms_plan(&obj.spec).map_err(ValidationError::Spec)?;
 
-    // Checkpoint the ledger before the first apply, like every other component.
-    let desired = vec![crate::apply::resource_ref(&plan.daemonset)];
-    progress.desired = Some(desired.clone());
-    if let Some(ledger) = crate::ledger::checkpoint_ledger(&status.applied_resources, &desired) {
-        status.applied_resources = ledger;
-        status.conditions = vec![condition("Ready", false, "Applying", "applying the KMS plugin", generation)];
-        write_status(&api, &name, &status).await?;
-    }
-    crate::apply::apply_object(&ctx.client, &plan.daemonset, FIELD_MANAGER).await?;
-
-    // Gather the facts. Probes only run once they can matter.
-    // An ack counts only if it was set after its patch was published.
-    let mut inputs = PhaseInputs {
-        current: status.phase,
-        acks: effective_acks(obj.spec.acknowledgements, generation.unwrap_or(0), &status.patch_generations),
-        plugin_ready: plugin_ready(&ctx.client, &plan).await?,
-        kms_active: false,
-        canary_ok: false,
-        rewrite_complete: false,
-        secrets_readable: false,
+    let target = target_prefix(&obj.spec.kms_provider_name);
+    let probe = match KubeApiserverProbe::new(ctx.client.clone()) {
+        Ok(probe) => probe,
+        Err(err) => {
+            let message = err.to_string();
+            reset_unverified(&mut status, generation, "VerificationFailed", &message);
+            write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
+            return Err(EtcdEncryptionReconcileError::Verification(message));
+        }
     };
-    if !matches!(inputs.current, EncryptionPhase::Pending | EncryptionPhase::InstallingPlugin) {
-        // Asymmetry with `cleanup`: here a failed probe is `false` (blocks
-        // advancing); in cleanup it is `None` (blocks plugin removal).
-        inputs.kms_active = probe_kms_active(&ctx.client).await;
-    }
-    if matches!(inputs.current, EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted) {
-        inputs.canary_ok = crate::encryption_probe::canary_round_trips(&ctx.client)
-            .await
-            .unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "canary probe failed; treating as not round-tripping");
-                false
-            });
-    }
-    let store = KubeSecretStore::new(ctx.client.clone());
-    if matches!(inputs.current, EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted) {
-        inputs.secrets_readable = probe_secrets_readable(&store).await;
-    }
 
-    // Walk forward as far as the facts allow in one reconcile.
-    loop {
-        if should_run_rewrite(inputs.current, inputs.kms_active) {
-            inputs.rewrite_complete = run_rewrite(&api, &name, &store, &mut status).await?;
+    // Verify every control-plane apiserver. A discovery error is an error, never "no nodes".
+    let evidence = match crate::encryption_verify::verify_cluster(&probe, &target).await {
+        Ok(evidence) => evidence,
+        Err(err) => {
+            reset_unverified(
+                &mut status,
+                generation,
+                "VerificationFailed",
+                &format!("cannot discover or verify the control-plane apiservers: {err}"),
+            );
+            write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
+            return Ok(Action::requeue(requeue_for(EncryptionPhase::Observing)));
         }
-        let next = next_phase(&inputs);
-        if next == inputs.current {
-            break;
-        }
-        tracing::info!(installation = %name, from = ?inputs.current, to = ?next, "phase transition");
-        inputs.current = next;
-        if matches!(next, EncryptionPhase::Rewriting | EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted)
-            && !inputs.kms_active
-        {
-            inputs.kms_active = probe_kms_active(&ctx.client).await;
-        }
-        if matches!(next, EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted) && !inputs.canary_ok {
-            inputs.canary_ok = crate::encryption_probe::canary_round_trips(&ctx.client)
-                .await
-                .unwrap_or_else(|err| {
-                    tracing::warn!(error = %err, "canary probe failed; treating as not round-tripping");
-                    false
-                });
-        }
-        if matches!(next, EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted)
-            && !inputs.secrets_readable
-        {
-            inputs.secrets_readable = probe_secrets_readable(&store).await;
-        }
-    }
-
-    status.phase = inputs.current;
-    status.talos_patches = patches_for(status.phase, &plan, &status.talos_patches);
-    // Same write as the publication: an ack already set now does not count.
-    record_publication(&mut status.patch_generations, &status.talos_patches, generation.unwrap_or(0));
-    let (ready, degraded) = match status.phase {
-        EncryptionPhase::Encrypted => (
-            true,
-            !(inputs.kms_active && inputs.canary_ok && inputs.plugin_ready && inputs.secrets_readable),
-        ),
-        _ => (false, false),
     };
-    let message = if status.phase == EncryptionPhase::Rewriting && !inputs.kms_active {
-        "waiting for the apiserver to report an active KMS provider before rewriting Secrets".to_string()
+
+    // The canary round trip is only worth doing when everything else is clean.
+    let canary_ok = if all_clean(&evidence, &target) && obj.spec.acknowledgements.legacy_providers_removed {
+        probe.canary_round_trip().await.unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "canary round trip failed");
+            false
+        })
     } else {
-        phase_message(status.phase)
+        false
     };
-    status.conditions = vec![condition("Ready", ready && !degraded, &format!("{:?}", status.phase), &message, generation)];
-    if degraded {
-        status.conditions.push(condition(
-            "Degraded",
-            true,
-            "ProbeNegative",
-            "a probe that passed earlier is now failing; the phase is not regressed. Check the plugin pods and the apiserver",
-            generation,
-        ));
-    }
-    write_status(&api, &name, &status).await?;
 
-    Ok(Action::requeue(if status.phase == EncryptionPhase::Encrypted { STEADY_REQUEUE } else { WAITING_REQUEUE }))
-}
+    let derivation = derive(&obj.spec, &evidence, canary_ok);
+    tracing::info!(installation = %name, phase = ?derivation.phase, reason = %derivation.reason, "derived phase");
 
-fn phase_message(phase: EncryptionPhase) -> String {
-    use EncryptionPhase::*;
-    match phase {
-        Pending | InstallingPlugin => "installing the KMS plugin on every control-plane node",
-        AwaitingKmsConfig => "apply status.talosPatches.enableKms with talosctl, then set spec.acknowledgements.kmsConfigApplied",
-        Rewriting => "re-encrypting every Secret through KMS",
-        AwaitingPlaintextRemoval => "apply status.talosPatches.removeIdentity with talosctl, then set spec.acknowledgements.plaintextRemoved",
-        Encrypted => {
-            "Secrets are encrypted at rest through KMS. Established indirectly: the apiserver reports a KMS \
-             provider, a canary Secret round-trips, every Secret can be read, and plaintext removal was \
-             acknowledged; etcd itself cannot be read through the Kubernetes API."
-        }
-        RevertingKms | Decrypting | AwaitingKmsRemoval => "reverting encryption before deletion",
+    status.phase = derivation.phase;
+    status.legacy_prefixes = derivation.legacy_prefixes.clone();
+    status.nodes = derivation.nodes.clone();
+    status.conditions = vec![ready_condition_for(&derivation, generation)];
+    write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
+
+    if should_run_rewrite(&obj.spec, &derivation) {
+        let store = KubeSecretStore::new(ctx.client.clone());
+        run_rewrite(&api, &name, &store, &mut status, &ctx.is_leader).await?;
     }
-    .to_string()
+
+    // The canary is a probe, not state; do not leave it behind once settled.
+    if matches!(
+        derivation.phase,
+        EncryptionPhase::ReadyToRemoveLegacy | EncryptionPhase::Verified
+    ) {
+        delete_canary(&ctx.client).await;
+    }
+
+    Ok(Action::requeue(requeue_for(derivation.phase)))
 }
 
 pub fn error_policy(
     _obj: Arc<EtcdEncryption>,
-    _err: &kube::runtime::finalizer::Error<EtcdEncryptionReconcileError>,
+    _err: &EtcdEncryptionReconcileError,
     _ctx: Arc<Context>,
 ) -> Action {
     Action::requeue(Duration::from_secs(30))
 }
 
-/// Whether this cleanup step may return `Ok`. `kube::runtime::finalizer`
-/// strips the finalizer on any `Ok` from the Cleanup arm, so only
-/// `RemovePlugin` (the last step) may finish; every other step must `Err`.
-pub fn cleanup_may_finish(step: CleanupStep) -> bool {
-    match step {
-        CleanupStep::RemovePlugin => true,
-        CleanupStep::AwaitRevertAck | CleanupStep::Decrypt | CleanupStep::AwaitKmsRemoval => false,
-    }
-}
-
-pub async fn cleanup(
-    obj: Arc<EtcdEncryption>,
-    ctx: Arc<Context>,
-) -> Result<Action, EtcdEncryptionReconcileError> {
-    // Never return Ok from a standby's Cleanup dispatch; see `reconciler::cleanup`.
-    if !ctx.is_leader.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(EtcdEncryptionReconcileError::NotLeader);
-    }
-    let name = obj.name_any();
-    let generation = obj.metadata.generation;
-    let api: Api<EtcdEncryption> = Api::all(ctx.client.clone());
-    let mut status = obj.status.clone().unwrap_or_default();
-    let plan = kms_plan(&obj.spec).map_err(ValidationError::Spec)?;
-    // Asymmetry with the forward path: a failed probe is `None` (unknown),
-    // never `false`. `false` would mean "KMS is off" and permit removing the
-    // plugin while the apiserver may still depend on it.
-    let kms_active = match crate::encryption_probe::kms_active(&ctx.client).await {
-        Ok(v) => Some(v),
-        Err(err) => {
-            tracing::warn!(error = %err, "KMS metrics probe failed; treating as unknown");
-            None
-        }
-    };
-
-    let store = KubeSecretStore::new(ctx.client.clone());
-    // Listing every Secret only matters for the final step.
-    let secrets_readable =
-        status.phase == EncryptionPhase::AwaitingKmsRemoval && probe_secrets_readable(&store).await;
-    let current_generation = generation.unwrap_or(0);
-    let inputs = cleanup_inputs(status.phase, obj.spec.acknowledgements, current_generation, &status.patch_generations, kms_active, secrets_readable);
-    let step = cleanup_step(&inputs);
-    tracing::info!(installation = %name, phase = ?status.phase, ?step, "cleanup step");
-
-    let result: Result<Action, EtcdEncryptionReconcileError> = async {
-        if step != CleanupStep::RemovePlugin {
-            // The apiserver may still need the plugin: keep it applied (a
-            // drifted or deleted DaemonSet is restored) until the last step.
-            crate::apply::apply_object(&ctx.client, &plan.daemonset, FIELD_MANAGER).await?;
-        }
-        match step {
-        CleanupStep::RemovePlugin => {
-            for reference in status.applied_resources.iter().rev() {
-                tracing::info!(kind = %reference.kind, resource = %reference.name, "deleting applied resource");
-                crate::apply::delete_object(&ctx.client, reference).await?;
-            }
-            crate::encryption_probe::delete_canary(&ctx.client).await;
-            Ok(Action::await_change())
-        }
-        CleanupStep::AwaitRevertAck => {
-            status.phase = revert_wait_phase(status.phase);
-            status.talos_patches.revert = Some(crate::talos_patches::revert(&plan));
-            record_publication(&mut status.patch_generations, &status.talos_patches, current_generation);
-            status.conditions = vec![condition("Ready", false, "RevertingKms", "apply status.talosPatches.revert with talosctl, then set spec.acknowledgements.kmsReverted (flip it false then true if it was already set when the patch appeared)", generation)];
-            write_status(&api, &name, &status).await?;
-            Err(EtcdEncryptionReconcileError::CleanupBlocked("waiting for spec.acknowledgements.kmsReverted, set after status.talosPatches.revert was published".to_string()))
-        }
-        CleanupStep::Decrypt => {
-            if !plugin_ready(&ctx.client, &plan).await? {
-                return Err(EtcdEncryptionReconcileError::CleanupBlocked(
-                    "waiting for the KMS plugin to be Ready on every control-plane node before decrypting".to_string(),
-                ));
-            }
-            status.phase = EncryptionPhase::Decrypting;
-            record_publication(&mut status.patch_generations, &status.talos_patches, current_generation);
-            write_status(&api, &name, &status).await?;
-            if run_rewrite(&api, &name, &store, &mut status).await? {
-                status.phase = EncryptionPhase::AwaitingKmsRemoval;
-                status.talos_patches.remove_kms = Some(crate::talos_patches::remove_kms());
-                record_publication(&mut status.patch_generations, &status.talos_patches, current_generation);
-                status.conditions = vec![condition("Ready", false, "AwaitingKmsRemoval", "apply status.talosPatches.removeKms with talosctl, then set spec.acknowledgements.kmsRemoved (flip it false then true if it was already set when the patch appeared)", generation)];
-                write_status(&api, &name, &status).await?;
-                Err(EtcdEncryptionReconcileError::CleanupBlocked("waiting for spec.acknowledgements.kmsRemoved".to_string()))
-            } else {
-                Err(EtcdEncryptionReconcileError::CleanupBlocked("some Secrets could not be rewritten; retrying".to_string()))
-            }
-        }
-        CleanupStep::AwaitKmsRemoval => {
-            // A status written before patchGenerations existed: record the
-            // already-published patches now so their acks can start counting.
-            if record_publication(&mut status.patch_generations, &status.talos_patches, current_generation) {
-                write_status(&api, &name, &status).await?;
-            }
-            Err(EtcdEncryptionReconcileError::CleanupBlocked(
-                "waiting for spec.acknowledgements.kmsRemoved (set after status.talosPatches.removeKms was published), \
-                 for the apiserver to stop reporting a KMS provider, and for every Secret to be readable"
-                    .to_string(),
-            ))
-        }
-    } }
-    .await;
-    enforce_cleanup_gate(step, result)
-}
-
-/// Last line of defence: `kube::runtime::finalizer` strips the finalizer on
-/// any `Ok` from Cleanup, so an `Ok` from any step other than the final one
-/// is converted into a blocking `Err`. Errors pass through unchanged.
-pub fn enforce_cleanup_gate(
-    step: CleanupStep,
-    result: Result<Action, EtcdEncryptionReconcileError>,
-) -> Result<Action, EtcdEncryptionReconcileError> {
-    match result {
-        Ok(_) if !cleanup_may_finish(step) => Err(EtcdEncryptionReconcileError::CleanupBlocked(
-            "internal: cleanup tried to finish before the plugin was safe to remove".to_string(),
-        )),
-        other => other,
-    }
-}
-
-pub async fn reconcile_with_finalizer(
-    obj: Arc<EtcdEncryption>,
-    ctx: Arc<Context>,
-) -> Result<Action, kube::runtime::finalizer::Error<EtcdEncryptionReconcileError>> {
-    if let Some(action) = leader_gate(&ctx.is_leader) {
-        return Ok(action);
-    }
-    let api: Api<EtcdEncryption> = Api::all(ctx.client.clone());
-    kube::runtime::finalizer(&api, FINALIZER_NAME, obj, |event| async move {
-        match event {
-            kube::runtime::finalizer::Event::Apply(obj) => reconcile(obj, ctx).await,
-            kube::runtime::finalizer::Event::Cleanup(obj) => cleanup(obj, ctx).await,
-        }
-    })
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::etcd_encryption::{Acknowledgements, BarbicanSpec, KmsProviderKind, SecretNameRef};
+    use crate::etcd_encryption::{Acknowledgements, RewriteMode};
 
-    fn spec_with(platform_kind: PlatformKind) -> EtcdEncryptionSpec {
+    fn spec() -> EtcdEncryptionSpec {
         EtcdEncryptionSpec {
-            platform_kind,
-            provider: KmsProviderKind::Barbican,
-            barbican: Some(BarbicanSpec {
-                image: "img:1".to_string(),
-                cloud_config_secret_ref: SecretNameRef { name: "cc".to_string() },
-            }),
-            acknowledgements: Default::default(),
+            platform_kind: PlatformKind::TalosLinux,
+            kms_provider_name: "barbican".to_string(),
+            rewrite: RewriteMode::Disabled,
+            acknowledgements: Acknowledgements::default(),
         }
     }
 
     #[test]
     fn accepts_talos_linux_named_default() {
-        assert!(validate("default", &spec_with(PlatformKind::TalosLinux)).is_ok());
+        assert!(validate("default", &spec()).is_ok());
     }
 
     #[test]
     fn rejects_installations_not_named_default() {
-        let err = validate("second", &spec_with(PlatformKind::TalosLinux)).unwrap_err();
+        let err = validate("second", &spec()).unwrap_err();
 
         assert!(matches!(&err, ValidationError::UnsupportedName(name) if name == "second"));
         assert_eq!(err.reason(), "Unsupported");
@@ -633,218 +344,153 @@ mod tests {
 
     #[test]
     fn validate_surfaces_spec_errors_with_their_own_reason() {
-        let mut spec = spec_with(PlatformKind::TalosLinux);
-        spec.acknowledgements.plaintext_removed = true;
+        let mut spec = spec();
+        spec.kms_provider_name = String::new();
 
-        assert_eq!(validate("default", &spec).unwrap_err().reason(), "InvalidAcknowledgements");
+        assert_eq!(validate("default", &spec).unwrap_err().reason(), "InvalidSpec");
     }
 
     #[test]
-    fn plugin_is_ready_only_when_it_covers_every_control_plane_node() {
-        // Review Focus 3.
-        assert!(daemonset_covers_all_control_plane(3, 3, 3));
-        assert!(!daemonset_covers_all_control_plane(2, 2, 3), "scheduled on fewer nodes than exist");
-        assert!(!daemonset_covers_all_control_plane(3, 2, 3), "a pod is not Ready yet");
-        assert!(!daemonset_covers_all_control_plane(0, 0, 0), "no control-plane nodes visible");
-        assert!(!daemonset_covers_all_control_plane(0, 0, 3), "nothing scheduled yet");
+    fn strip_finalizer_removes_only_the_v0_1_11_finalizer() {
+        // Review Focus 5.
+        let finalizers = vec![
+            "platform.rye.ninja/cleanup".to_string(),
+            "other.example/keep".to_string(),
+        ];
+
+        assert_eq!(strip_finalizer(&finalizers), Some(vec!["other.example/keep".to_string()]));
     }
 
     #[test]
-    fn failure_reasons_cover_every_reportable_variant_and_skip_the_rest() {
-        let apply = EtcdEncryptionReconcileError::Apply(crate::apply::ApplyError::KindNotAvailable {
-            api_version: "apps/v1".to_string(),
-            kind: "DaemonSet".to_string(),
-            timeout: std::time::Duration::from_secs(1),
-            detail: "x".to_string(),
-        });
-        assert_eq!(apply.failure_reason(), Some("ApplyFailed"));
-        assert_eq!(
-            EtcdEncryptionReconcileError::Store(crate::secret_rewrite::StoreError("x".to_string())).failure_reason(),
-            Some("RewriteFailed")
-        );
-        assert_eq!(EtcdEncryptionReconcileError::NotLeader.failure_reason(), None);
-        assert_eq!(
-            EtcdEncryptionReconcileError::CleanupBlocked("x".to_string()).failure_reason(),
-            None,
-            "a blocked cleanup is a wait, not a failure to report"
-        );
+    fn strip_finalizer_is_none_when_ours_is_absent() {
+        assert_eq!(strip_finalizer(&["other.example/keep".to_string()]), None);
+        assert_eq!(strip_finalizer(&[]), None);
     }
 
     #[test]
-    fn condition_is_ready_true_only_when_requested() {
-        let ok = condition("Ready", true, "Encrypted", "done", Some(3));
-        let not_ok = condition("Ready", false, "Rewriting", "in progress", Some(3));
+    fn status_writes_require_current_leadership() {
+        // Final review minor: leadership is re-checked before every status write.
+        let leader = std::sync::atomic::AtomicBool::new(true);
+        assert!(still_leader(&leader).is_ok());
+
+        leader.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(still_leader(&leader), Err(EtcdEncryptionReconcileError::NotLeader)));
+    }
+
+    #[test]
+    fn a_cr_being_deleted_stops_before_any_verification() {
+        let mut obj = EtcdEncryption::new("default", spec());
+        assert!(!being_deleted(&obj));
+
+        obj.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(k8s_openapi::jiff::Timestamp::now()));
+        assert!(being_deleted(&obj));
+    }
+
+    #[test]
+    fn condition_is_true_only_when_requested() {
+        let ok = condition("Ready", true, "Verified", "done", Some(3));
+        let not_ok = condition("Ready", false, "Observing", "waiting", Some(3));
 
         assert_eq!((ok.status.as_str(), ok.observed_generation), ("True", Some(3)));
         assert_eq!(not_ok.status, "False");
     }
 
     #[test]
-    fn only_remove_plugin_may_finish_cleanup() {
-        // kube's finalizer strips the finalizer on any Ok from Cleanup.
-        assert!(cleanup_may_finish(CleanupStep::RemovePlugin));
-        assert!(!cleanup_may_finish(CleanupStep::AwaitRevertAck));
-        assert!(!cleanup_may_finish(CleanupStep::Decrypt));
-        assert!(!cleanup_may_finish(CleanupStep::AwaitKmsRemoval));
-    }
-
-    #[test]
-    fn patches_for_a_phase_include_everything_published_so_far() {
-        let plan = crate::kms_provider::kms_plan(&spec_with(PlatformKind::TalosLinux)).unwrap();
-
-        let early = patches_for(EncryptionPhase::AwaitingKmsConfig, &plan, &TalosPatches::default());
-        assert!(early.enable_kms.is_some() && early.remove_identity.is_none());
-
-        let later = patches_for(EncryptionPhase::AwaitingPlaintextRemoval, &plan, &early);
-        assert!(later.enable_kms.is_some() && later.remove_identity.is_some());
-
-        let before = patches_for(EncryptionPhase::InstallingPlugin, &plan, &TalosPatches::default());
-        assert!(before.enable_kms.is_none(), "no patch before the plugin is ready everywhere");
-    }
-
-    #[test]
-    fn cleanup_gate_turns_premature_ok_into_blocked_err() {
-        for step in [CleanupStep::AwaitRevertAck, CleanupStep::Decrypt, CleanupStep::AwaitKmsRemoval] {
-            let gated = enforce_cleanup_gate(step, Ok(Action::await_change()));
-            assert!(matches!(gated, Err(EtcdEncryptionReconcileError::CleanupBlocked(_))), "{step:?}");
-        }
-        assert!(enforce_cleanup_gate(CleanupStep::RemovePlugin, Ok(Action::await_change())).is_ok());
-        let err = enforce_cleanup_gate(
-            CleanupStep::Decrypt,
-            Err(EtcdEncryptionReconcileError::NotLeader),
+    fn failure_reasons_are_reported_only_where_status_may_be_overwritten() {
+        assert_eq!(EtcdEncryptionReconcileError::NotLeader.failure_reason(), None);
+        assert_eq!(
+            EtcdEncryptionReconcileError::Validation(ValidationError::UnsupportedName("x".to_string())).failure_reason(),
+            None,
+            "validation already wrote its own status"
         );
-        assert!(matches!(err, Err(EtcdEncryptionReconcileError::NotLeader)));
+        assert_eq!(
+            EtcdEncryptionReconcileError::Verification("x".to_string()).failure_reason(),
+            Some("VerificationFailed")
+        );
+    }
+
+    use crate::encryption_verdict::Derivation;
+
+    fn derivation(phase: EncryptionPhase) -> Derivation {
+        Derivation {
+            phase,
+            run_rewrite: false,
+            reason: "why".to_string(),
+            nodes: vec![],
+            legacy_prefixes: vec![],
+        }
     }
 
     #[test]
-    fn rewrite_runs_only_in_rewriting_with_kms_active() {
-        assert!(should_run_rewrite(EncryptionPhase::Rewriting, true));
-        assert!(!should_run_rewrite(EncryptionPhase::Rewriting, false));
-        assert!(!should_run_rewrite(EncryptionPhase::AwaitingKmsConfig, true));
-        assert!(!should_run_rewrite(EncryptionPhase::Encrypted, true));
+    fn reset_unverified_clears_every_trace_of_a_safe_phase() {
+        for phase in [EncryptionPhase::Verified, EncryptionPhase::ReadyToRemoveLegacy] {
+            let mut status = EtcdEncryptionStatus {
+                phase,
+                legacy_prefixes: vec!["k8s:enc:secretbox:v1:".to_string()],
+                nodes: vec![Default::default()],
+                rewrite: RewriteProgress { total: 5, rewritten: 4, failed: 1 },
+                ..Default::default()
+            };
+
+            reset_unverified(&mut status, Some(7), "VerificationFailed", "boom");
+
+            assert_eq!(status.phase, EncryptionPhase::Observing);
+            assert!(status.nodes.is_empty() && status.legacy_prefixes.is_empty());
+            assert_eq!(status.rewrite, RewriteProgress::default());
+            assert_eq!(status.observed_generation, 7);
+            assert_eq!(status.conditions.len(), 1);
+            let c = &status.conditions[0];
+            assert_eq!((c.status.as_str(), c.reason.as_str(), c.message.as_str()), ("False", "VerificationFailed", "boom"));
+            assert_eq!(c.observed_generation, Some(7));
+        }
     }
 
     #[test]
-    fn daemonset_rollout_must_be_current() {
-        assert!(daemonset_rollout_current(Some(2), Some(2), Some(3), 3));
-        assert!(!daemonset_rollout_current(Some(2), Some(1), Some(3), 3), "controller has not observed the new spec");
-        assert!(!daemonset_rollout_current(Some(2), Some(2), Some(1), 3), "stale pods from the old revision");
-        assert!(!daemonset_rollout_current(Some(2), Some(2), None, 3));
-        assert!(!daemonset_rollout_current(None, Some(2), Some(3), 3));
-        assert!(!daemonset_rollout_current(Some(2), None, Some(3), 3));
-    }
-
-    const ALL_ACKS: Acknowledgements =
-        Acknowledgements { kms_config_applied: true, plaintext_removed: true, kms_reverted: true, kms_removed: true };
-
-    #[test]
-    fn a_preset_kms_reverted_does_not_skip_publishing_the_revert_patch() {
-        // C1: the operator set kmsReverted before deleting. The revert patch
-        // was never published, so the ack cannot be for it: run the revert
-        // step (publish the patch), never Decrypt.
-        let raw = Acknowledgements { kms_config_applied: true, kms_reverted: true, ..Default::default() };
-        let gens = PatchGenerations { enable_kms: Some(2), remove_identity: Some(3), ..Default::default() };
-
-        let inputs = cleanup_inputs(EncryptionPhase::Encrypted, raw, 7, &gens, Some(true), true);
-
-        assert!(!inputs.acks.kms_reverted);
-        assert_eq!(cleanup_step(&inputs), CleanupStep::AwaitRevertAck);
-    }
-
-    #[test]
-    fn cleanup_engagement_uses_the_raw_kms_config_applied() {
-        // Engaged-ness errs on the safe side: an ack that does not count yet
-        // still means the operator may have applied patch 1.
-        let raw = Acknowledgements { kms_config_applied: true, ..Default::default() };
-
-        let inputs = cleanup_inputs(EncryptionPhase::AwaitingKmsConfig, raw, 5, &PatchGenerations::default(), Some(false), true);
-
-        assert!(inputs.acks.kms_config_applied);
-        assert_eq!(cleanup_step(&inputs), CleanupStep::AwaitRevertAck);
-    }
-
-    #[test]
-    fn cleanup_inputs_count_acks_given_after_their_patches() {
-        let gens = PatchGenerations { enable_kms: Some(2), remove_identity: Some(3), revert: Some(4), remove_kms: Some(5) };
-
-        let inputs = cleanup_inputs(EncryptionPhase::AwaitingKmsRemoval, ALL_ACKS, 6, &gens, Some(false), true);
-
-        assert_eq!(inputs.acks, ALL_ACKS);
-        assert_eq!(cleanup_step(&inputs), CleanupStep::RemovePlugin);
-        let unreadable = cleanup_inputs(EncryptionPhase::AwaitingKmsRemoval, ALL_ACKS, 6, &gens, Some(false), false);
-        assert_eq!(cleanup_step(&unreadable), CleanupStep::AwaitKmsRemoval);
-    }
-
-    #[test]
-    fn publication_records_the_generation_of_each_newly_published_patch_once() {
-        let mut gens = PatchGenerations::default();
-        let patches = TalosPatches { enable_kms: Some("p1".to_string()), ..Default::default() };
-
-        assert!(record_publication(&mut gens, &patches, 3));
-        assert_eq!(gens, PatchGenerations { enable_kms: Some(3), ..Default::default() });
-
-        let more = TalosPatches { remove_identity: Some("p2".to_string()), ..patches };
-        assert!(record_publication(&mut gens, &more, 5));
-        assert_eq!(gens.enable_kms, Some(3), "never overwritten");
-        assert_eq!(gens.remove_identity, Some(5));
-
-        assert!(!record_publication(&mut gens, &more, 9), "nothing new to record");
-        assert_eq!(gens, PatchGenerations { enable_kms: Some(3), remove_identity: Some(5), ..Default::default() });
-    }
-
-    #[test]
-    fn a_preset_plaintext_removed_does_not_walk_to_encrypted() {
-        // I4: plaintextRemoved was already true when the remove-identity patch
-        // was first published (same generation): it does not count.
-        let plan = crate::kms_provider::kms_plan(&spec_with(PlatformKind::TalosLinux)).unwrap();
-        let generation = 4;
-        let mut gens = PatchGenerations { enable_kms: Some(2), ..Default::default() };
-        let patches = patches_for(EncryptionPhase::AwaitingPlaintextRemoval, &plan, &TalosPatches::default());
-        record_publication(&mut gens, &patches, generation);
-
-        let raw = Acknowledgements { kms_config_applied: true, plaintext_removed: true, ..Default::default() };
-        let inputs = PhaseInputs {
-            current: EncryptionPhase::AwaitingPlaintextRemoval,
-            acks: effective_acks(raw, generation, &gens),
-            plugin_ready: true,
-            kms_active: true,
-            canary_ok: true,
-            rewrite_complete: true,
-            secrets_readable: true,
-        };
-        assert_eq!(next_phase(&inputs), EncryptionPhase::AwaitingPlaintextRemoval);
-
-        // After the operator flips it (generation 6), it counts.
-        let later = PhaseInputs { acks: effective_acks(raw, 6, &gens), ..inputs };
-        assert_eq!(next_phase(&later), EncryptionPhase::Encrypted);
-    }
-
-    #[test]
-    fn the_encrypted_message_says_how_encryption_was_established() {
-        let message = phase_message(EncryptionPhase::Encrypted);
-
-        assert!(message.starts_with("Secrets are encrypted at rest through KMS. Established indirectly:"));
-        assert!(message.contains("every Secret can be read"));
-        assert!(message.contains("etcd itself cannot be read through the Kubernetes API"));
-    }
-
-    #[test]
-    fn waiting_for_the_revert_ack_never_regresses_a_deletion_phase() {
+    fn active_phases_requeue_quickly_and_settled_ones_slowly() {
         use EncryptionPhase::*;
-        for phase in [Pending, InstallingPlugin, AwaitingKmsConfig, Rewriting, AwaitingPlaintextRemoval, Encrypted, RevertingKms] {
-            assert_eq!(revert_wait_phase(phase), RevertingKms, "{phase:?}");
-        }
-        assert_eq!(revert_wait_phase(Decrypting), Decrypting);
-        assert_eq!(revert_wait_phase(AwaitingKmsRemoval), AwaitingKmsRemoval);
+        assert_eq!(requeue_for(Observing), Duration::from_secs(30));
+        assert_eq!(requeue_for(Migrating), Duration::from_secs(30));
+        assert_eq!(requeue_for(NotConfigured), Duration::from_secs(600));
+        assert_eq!(requeue_for(ReadyToRemoveLegacy), Duration::from_secs(600));
+        assert_eq!(requeue_for(Verified), Duration::from_secs(600));
     }
 
     #[test]
-    fn reconcile_futures_are_send() {
-        // kube's Controller::run requires Send futures; compile-time check only.
-        fn assert_send<T: Send>(_: &T) {}
-        #[allow(dead_code)]
-        fn check(obj: Arc<EtcdEncryption>, ctx: Arc<Context>) {
-            assert_send(&reconcile_with_finalizer(obj, ctx));
+    fn ready_is_true_only_for_verified() {
+        for (phase, ready) in [
+            (EncryptionPhase::Observing, false),
+            (EncryptionPhase::NotConfigured, false),
+            (EncryptionPhase::Migrating, false),
+            (EncryptionPhase::ReadyToRemoveLegacy, false),
+            (EncryptionPhase::Verified, true),
+        ] {
+            let c = ready_condition_for(&derivation(phase), Some(2));
+
+            assert_eq!(c.status == "True", ready, "{phase:?}");
+            assert_eq!(c.reason, format!("{phase:?}"));
+            assert_eq!(c.message, "why");
         }
+    }
+
+    #[test]
+    fn rewrite_only_runs_when_the_derivation_asks_for_it_and_the_spec_enables_it() {
+        // Review Focus 6: belt and braces on top of derive().
+        let mut spec = spec();
+        let mut d = derivation(EncryptionPhase::Migrating);
+        d.run_rewrite = true;
+
+        spec.rewrite = RewriteMode::Disabled;
+        assert!(!should_run_rewrite(&spec, &d));
+
+        spec.rewrite = RewriteMode::Enabled;
+        assert!(should_run_rewrite(&spec, &d));
+
+        d.run_rewrite = false;
+        assert!(!should_run_rewrite(&spec, &d));
+
+        let mut wrong_phase = derivation(EncryptionPhase::Observing);
+        wrong_phase.run_rewrite = true;
+        assert!(!should_run_rewrite(&spec, &wrong_phase));
     }
 }
