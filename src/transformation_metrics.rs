@@ -62,8 +62,15 @@ pub fn parse_secret_transformations(metrics: &str) -> Transformations {
         if !(prefix.is_empty() || prefix.starts_with(TOP_LEVEL_PREFIX)) {
             continue;
         }
-        let Ok(value) = rest[close + 1..].trim().parse::<f64>() else { continue };
-        *out.entry((direction, prefix)).or_insert(0) += value.round() as i64;
+        let Some(value_str) = rest[close + 1..].split_whitespace().next() else { continue };
+        let Ok(value) = value_str.parse::<f64>() else { continue };
+        if !value.is_finite() || value < 0.0 {
+            continue;
+        }
+        let rounded = value.round() as i64;
+        out.entry((direction, prefix))
+            .and_modify(|v| *v = v.saturating_add(rounded))
+            .or_insert(rounded);
     }
     Transformations(out)
 }
@@ -77,7 +84,8 @@ pub fn delta(before: &Transformations, after: &Transformations) -> Option<Delta>
     }
     let mut out = Delta::default();
     for ((direction, prefix), a) in &after.0 {
-        let d = a - before.0.get(&(*direction, prefix.clone())).copied().unwrap_or(0);
+        let before_val = before.0.get(&(*direction, prefix.clone())).copied().unwrap_or(0);
+        let d = a.saturating_sub(before_val);
         if d > 0 {
             match direction {
                 Direction::FromStorage => out.from_storage.insert(prefix.clone(), d),
@@ -187,5 +195,69 @@ apiserver_storage_transformation_operations_total{resource="secrets",status="Err
         let before = parse_secret_transformations(LIVE);
 
         assert_eq!(delta(&before, &Transformations::default()), None);
+    }
+
+    #[test]
+    fn trailing_timestamp_parses_to_the_right_value() {
+        let line = r#"apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:aescbc:v1:"} 284 1700000000"#;
+
+        assert_eq!(
+            parse_secret_transformations(line).0[&key(Direction::FromStorage, "k8s:enc:aescbc:v1:")],
+            284
+        );
+    }
+
+    #[test]
+    fn scientific_notation_parses_correctly() {
+        let line = r#"apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:aescbc:v1:"} 1e+06"#;
+
+        assert_eq!(
+            parse_secret_transformations(line).0[&key(Direction::FromStorage, "k8s:enc:aescbc:v1:")],
+            1000000
+        );
+    }
+
+    #[test]
+    fn invalid_values_are_ignored_without_panic() {
+        let text = r#"apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:aescbc:v1:"} +Inf
+apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:secretbox:v1:"} NaN
+apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:kms:v2:barbican:"} -42"#;
+
+        let parsed = parse_secret_transformations(text).0;
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn huge_duplicate_values_do_not_panic() {
+        // Use 9.0e18 which is representable as f64 and near i64::MAX when converted
+        let huge = "9.0e18";
+        let line1 = format!(
+            r#"apiserver_storage_transformation_operations_total{{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:aescbc:v1:"}} {}"#,
+            huge
+        );
+        let line2 = format!(
+            r#"apiserver_storage_transformation_operations_total{{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:aescbc:v1:"}} {}"#,
+            huge
+        );
+        let text = format!("{}\n{}", line1, line2);
+
+        // Should not panic; saturating_add prevents overflow
+        let parsed = parse_secret_transformations(&text).0;
+        assert!(parsed.contains_key(&key(Direction::FromStorage, "k8s:enc:aescbc:v1:")));
+        // Value will be saturated at i64::MAX
+        assert_eq!(
+            parsed[&key(Direction::FromStorage, "k8s:enc:aescbc:v1:")],
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn label_value_with_comma_and_brace_parses_correctly() {
+        let line = r#"apiserver_storage_transformation_operations_total{resource="secrets",status="OK",transformation_type="from_storage",transformer_prefix="k8s:enc:a,b}c:"} 42"#;
+
+        assert_eq!(
+            parse_secret_transformations(line).0[&key(Direction::FromStorage, "k8s:enc:a,b}c:")],
+            42
+        );
     }
 }
