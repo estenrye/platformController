@@ -20,13 +20,20 @@ pub struct Reader {
 
 impl Reader {
     /// Every listed object was decrypted at least once. A list served from the
-    /// watch cache decrypts nothing, so it is never complete.
+    /// watch cache decrypts nothing, so it is never complete. Any negative count
+    /// (counter reset during the check) means incomplete.
     pub fn complete(&self) -> bool {
-        self.reads.values().sum::<i64>() >= self.listed
+        if self.reads.values().any(|v| *v < 0) {
+            return false;
+        }
+        self.reads.values().fold(0i64, |a, v| a.saturating_add(*v)) >= self.listed
     }
 
     pub fn legacy_reads(&self, target: &str) -> i64 {
-        self.reads.iter().filter(|(prefix, _)| prefix.as_str() != target).map(|(_, v)| *v).sum()
+        self.reads
+            .iter()
+            .filter(|(prefix, _)| prefix.as_str() != target)
+            .fold(0i64, |a, (_, v)| a.saturating_add(*v))
     }
 }
 
@@ -54,6 +61,7 @@ pub struct Derivation {
 
 fn node_clean(node: &NodeEvidence, target: &str) -> bool {
     node.writer == Writer::Target
+        && node.reader_error.is_none()
         && node.reader.as_ref().is_some_and(|r| r.complete() && r.legacy_reads(target) == 0)
 }
 
@@ -385,5 +393,44 @@ mod tests {
         assert_eq!(n.secrets_listed, 10);
         assert_eq!(n.reads_by_prefix[SECRETBOX], 3);
         assert!(!n.verified);
+    }
+
+    #[test]
+    fn node_with_both_reader_and_reader_error_is_never_clean() {
+        // A node must have no reader_error to be clean, even if reader shows complete and clean.
+        let mut n = clean("a");
+        n.reader_error = Some("network timeout".to_string());
+
+        assert!(!all_clean(&[n.clone()], TARGET));
+        let d = derive(&spec(RewriteMode::Disabled, false), &[n.clone()], false);
+        let node_status = d.nodes.iter().find(|ns| ns.name == "a").unwrap();
+        assert!(!node_status.verified);
+        assert_ne!(d.phase, ReadyToRemoveLegacy);
+        assert_ne!(d.phase, Verified);
+    }
+
+    #[test]
+    fn reader_with_negative_count_is_not_complete() {
+        let mut reads = BTreeMap::new();
+        reads.insert(TARGET.to_string(), 100);
+        reads.insert(SECRETBOX.to_string(), -1); // Counter reset
+
+        let reader_with_negative = Reader { listed: 100, reads };
+        assert!(!reader_with_negative.complete());
+    }
+
+    #[test]
+    fn huge_reader_counts_near_i64_max_do_not_panic() {
+        let mut reads = BTreeMap::new();
+        // Two huge values that would overflow with regular addition
+        reads.insert(TARGET.to_string(), i64::MAX - 100);
+        reads.insert(SECRETBOX.to_string(), i64::MAX - 100);
+
+        let huge_reader = Reader { listed: 100, reads };
+        // Should not panic; saturating_add caps at i64::MAX
+        let total = huge_reader.complete(); // Uses saturating addition internally
+        let legacy = huge_reader.legacy_reads(TARGET); // Also uses saturating addition
+        assert!(total); // Definitely complete
+        assert!(legacy > 0); // Legacy reads are counted
     }
 }

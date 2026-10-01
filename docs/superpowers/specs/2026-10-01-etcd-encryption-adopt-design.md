@@ -125,12 +125,12 @@ The derivation, over the per-node results below:
 4. **Every node's writer is the target provider:**
    - the reader check is complete on every node with **zero legacy reads** →
      `ReadyToRemoveLegacy`, or `Verified` if `legacyProvidersRemoved` is true;
-   - otherwise, if at least one node's reader check is complete with legacy reads
-     and `rewrite: Enabled` → `Migrating` (run one rewrite pass); if the reader
-     check is incomplete or unverifiable on every node, never rewrite (it would
-     repeat full rewrites every 30 s while unable to confirm): `Observing` with
-     "cannot verify reads"; otherwise `Observing` with "legacy objects remain; set
-     `rewrite: Enabled` to migrate".
+   - otherwise, if at least one node's reader check is complete and shows legacy reads > 0,
+     and `rewrite: Enabled` → `Migrating` (run one rewrite pass); if no node's reader check
+     is complete with legacy reads and the cluster is not all-clean, the phase is `Observing`:
+     with reason "cannot verify reads on every apiserver; not rewriting" (when no reader is
+     complete with legacy reads) or "legacy objects remain; set `rewrite: Enabled` to migrate"
+     (when legacy reads were seen but rewrite is Disabled).
 
 `Verified` also requires the canary Secret to round-trip. It means "the probes agree
 and you acknowledged removal", and says it cannot prove the config no longer lists a
@@ -161,6 +161,16 @@ verify" for that node). Per node, bounded by `timeout_at`:
 Concurrent readers only inflate deltas, so the check can wrongly look *worse*
 (extra legacy reads) but not wrongly *clean*: zero legacy reads with a complete count
 is the proof.
+
+**Residual risk:** The completeness check compares the sum of decrypts against the number
+of Secrets listed; ambient Secret reads by other clients on the same apiserver during
+the observation window can inflate the decryption count. The check is evidence, not proof.
+However, the per-node list uses `limit` with no `resourceVersion`, which the apiserver
+delegates to etcd, so the list itself decrypts every object directly from etcd (not the
+watch cache). The runbook must confirm this on a quiet cluster (verify that a limit-paged
+list of all Secrets raises `from_storage` by at least the number listed) and direct the
+operator to confirm with an etcd snapshot that the legacy provider can be dropped before
+removing it from the EncryptionConfiguration.
 
 The reader check lists all Secrets on every control-plane node each time it runs. It
 is the expensive step, so a steady-state reconcile (`ReadyToRemoveLegacy`, `Verified`,
