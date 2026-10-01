@@ -9,6 +9,7 @@ pub struct PhaseInputs {
     /// A Ready plugin pod on every control-plane node.
     pub plugin_ready: bool,
     /// The apiserver reports an active KMS provider.
+    /// A probe error is passed as `false`: this blocks phase advancement without ambiguity.
     pub kms_active: bool,
     /// A canary Secret written and read back round-trips.
     pub canary_ok: bool,
@@ -39,7 +40,10 @@ pub fn next_phase(inputs: &PhaseInputs) -> EncryptionPhase {
 pub struct CleanupInputs {
     pub phase: EncryptionPhase,
     pub acks: Acknowledgements,
-    pub kms_active: bool,
+    /// The apiserver reports an active KMS provider.
+    /// `Some(true)` or `Some(false)` = probe result; `None` = probe failed/unknown.
+    /// A failed probe MUST be `None` (never true): never remove the plugin while its status is unknown.
+    pub kms_active: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +63,11 @@ pub enum CleanupStep {
 /// still depends on it leaves the apiserver unable to read Secrets.
 pub fn cleanup_step(inputs: &CleanupInputs) -> CleanupStep {
     use EncryptionPhase::*;
-    let engaged = !matches!(inputs.phase, Pending | InstallingPlugin)
-        && !(inputs.phase == AwaitingKmsConfig && !inputs.acks.kms_config_applied);
+    let engaged = match inputs.phase {
+        Pending | InstallingPlugin => false,
+        AwaitingKmsConfig => inputs.acks.kms_config_applied || inputs.kms_active != Some(false),
+        _ => true,
+    };
     if !engaged {
         return CleanupStep::RemovePlugin;
     }
@@ -70,7 +77,7 @@ pub fn cleanup_step(inputs: &CleanupInputs) -> CleanupStep {
     if inputs.phase != AwaitingKmsRemoval {
         return CleanupStep::Decrypt;
     }
-    if inputs.acks.kms_removed && !inputs.kms_active {
+    if inputs.acks.kms_removed && inputs.kms_active == Some(false) {
         return CleanupStep::RemovePlugin;
     }
     CleanupStep::AwaitKmsRemoval
@@ -162,16 +169,16 @@ mod tests {
         }
     }
 
-    fn cleanup(phase: EncryptionPhase, acks: Acknowledgements, kms_active: bool) -> CleanupStep {
+    fn cleanup(phase: EncryptionPhase, acks: Acknowledgements, kms_active: Option<bool>) -> CleanupStep {
         cleanup_step(&CleanupInputs { phase, acks, kms_active })
     }
 
     #[test]
     fn nothing_depends_on_the_plugin_before_patch_1_is_acknowledged() {
         let none = Acknowledgements::default();
-        assert_eq!(cleanup(Pending, none, false), CleanupStep::RemovePlugin);
-        assert_eq!(cleanup(InstallingPlugin, none, false), CleanupStep::RemovePlugin);
-        assert_eq!(cleanup(AwaitingKmsConfig, none, false), CleanupStep::RemovePlugin);
+        assert_eq!(cleanup(Pending, none, Some(false)), CleanupStep::RemovePlugin);
+        assert_eq!(cleanup(InstallingPlugin, none, Some(false)), CleanupStep::RemovePlugin);
+        assert_eq!(cleanup(AwaitingKmsConfig, none, Some(false)), CleanupStep::RemovePlugin);
     }
 
     #[test]
@@ -179,7 +186,7 @@ mod tests {
         // Review Focus 5.
         let applied = Acknowledgements { kms_config_applied: true, ..Default::default() };
         for phase in [AwaitingKmsConfig, Rewriting, AwaitingPlaintextRemoval, Encrypted, RevertingKms] {
-            assert_eq!(cleanup(phase, applied, true), CleanupStep::AwaitRevertAck, "{phase:?}");
+            assert_eq!(cleanup(phase, applied, Some(true)), CleanupStep::AwaitRevertAck, "{phase:?}");
         }
     }
 
@@ -187,23 +194,64 @@ mod tests {
     fn once_reverted_the_secrets_are_rewritten_then_kms_removal_is_awaited() {
         let reverted = Acknowledgements { kms_config_applied: true, kms_reverted: true, ..Default::default() };
 
-        assert_eq!(cleanup(RevertingKms, reverted, true), CleanupStep::Decrypt);
-        assert_eq!(cleanup(Decrypting, reverted, true), CleanupStep::Decrypt);
-        assert_eq!(cleanup(AwaitingKmsRemoval, reverted, true), CleanupStep::AwaitKmsRemoval);
+        assert_eq!(cleanup(RevertingKms, reverted, Some(true)), CleanupStep::Decrypt);
+        assert_eq!(cleanup(Decrypting, reverted, Some(true)), CleanupStep::Decrypt);
+        assert_eq!(cleanup(AwaitingKmsRemoval, reverted, Some(true)), CleanupStep::AwaitKmsRemoval);
     }
 
     #[test]
     fn the_plugin_is_removed_only_after_kmsremoved_and_no_kms_provider_is_active() {
         let removed = Acknowledgements { kms_config_applied: true, kms_reverted: true, kms_removed: true, ..Default::default() };
 
-        assert_eq!(cleanup(AwaitingKmsRemoval, removed, true), CleanupStep::AwaitKmsRemoval);
-        assert_eq!(cleanup(AwaitingKmsRemoval, removed, false), CleanupStep::RemovePlugin);
+        assert_eq!(cleanup(AwaitingKmsRemoval, removed, Some(true)), CleanupStep::AwaitKmsRemoval);
+        assert_eq!(cleanup(AwaitingKmsRemoval, removed, Some(false)), CleanupStep::RemovePlugin);
     }
 
     #[test]
     fn kmsremoved_does_not_skip_the_decrypt_step() {
         let removed = Acknowledgements { kms_config_applied: true, kms_reverted: true, kms_removed: true, ..Default::default() };
 
-        assert_eq!(cleanup(Decrypting, removed, false), CleanupStep::Decrypt);
+        assert_eq!(cleanup(Decrypting, removed, Some(false)), CleanupStep::Decrypt);
+    }
+
+    #[test]
+    fn awaiting_kms_config_without_ack_depends_on_kms_probe_state() {
+        let none = Acknowledgements::default();
+        // (a) With kms_active Some(true) and no ack: plugin is engaged, waiting for revert
+        assert_eq!(cleanup(AwaitingKmsConfig, none, Some(true)), CleanupStep::AwaitRevertAck);
+        // (b) With kms_active None (failed/unknown) and no ack: not disengaged, still waiting
+        assert_eq!(cleanup(AwaitingKmsConfig, none, None), CleanupStep::AwaitRevertAck);
+        // (c) With kms_active Some(false) and no ack: disengaged, can remove
+        assert_eq!(cleanup(AwaitingKmsConfig, none, Some(false)), CleanupStep::RemovePlugin);
+    }
+
+    #[test]
+    fn awaiting_kms_removal_fails_safe_on_unknown_kms_probe() {
+        // (d) Even with all acks, if kms_active is None (probe failed), stay in AwaitKmsRemoval
+        let removed = Acknowledgements { kms_config_applied: true, kms_reverted: true, kms_removed: true, ..Default::default() };
+        assert_eq!(cleanup(AwaitingKmsRemoval, removed, None), CleanupStep::AwaitKmsRemoval);
+    }
+
+    #[test]
+    fn rewriting_and_encrypted_with_no_acks_wait_for_revert() {
+        // (e) Even when no acks are set, engaged phases wait for kms_reverted
+        let none = Acknowledgements::default();
+        assert_eq!(cleanup(Rewriting, none, Some(true)), CleanupStep::AwaitRevertAck);
+        assert_eq!(cleanup(Encrypted, none, Some(true)), CleanupStep::AwaitRevertAck);
+    }
+
+    #[test]
+    fn awaiting_kms_removal_without_revert_ack_blocks_removal() {
+        // (f) Even if kms_removed is true, without kms_reverted, stay at AwaitRevertAck
+        let no_revert = Acknowledgements { kms_config_applied: true, kms_removed: true, ..Default::default() };
+        assert_eq!(cleanup(AwaitingKmsRemoval, no_revert, Some(false)), CleanupStep::AwaitRevertAck);
+    }
+
+    #[test]
+    fn unengaged_phases_remove_plugin_even_with_unknown_probe() {
+        // (g) Pending/InstallingPlugin never engaged, remove plugin even if probe is unknown
+        let none = Acknowledgements::default();
+        assert_eq!(cleanup(Pending, none, None), CleanupStep::RemovePlugin);
+        assert_eq!(cleanup(InstallingPlugin, none, None), CleanupStep::RemovePlugin);
     }
 }
