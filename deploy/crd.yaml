@@ -996,3 +996,239 @@ spec:
     storage: true
     subresources:
       status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: etcdencryptions.platform.rye.ninja
+spec:
+  group: platform.rye.ninja
+  names:
+    kind: EtcdEncryption
+    plural: etcdencryptions
+    shortNames:
+    - etcdenc
+    singular: etcdencryption
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for EtcdEncryptionSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              acknowledgements:
+                default:
+                  kmsConfigApplied: false
+                  kmsRemoved: false
+                  kmsReverted: false
+                  plaintextRemoved: false
+                description: |-
+                  The operator's explicit gates in the apply-the-Talos-patch protocol.
+                  Always `false` on first apply; the controller never changes them.
+                properties:
+                  kmsConfigApplied:
+                    default: false
+                    description: Set true after applying the "enable KMS" Talos patch.
+                    type: boolean
+                  kmsRemoved:
+                    default: false
+                    description: 'Deletion only: set true after applying the remove-kms patch.'
+                    type: boolean
+                  kmsReverted:
+                    default: false
+                    description: |-
+                      Deletion only: set true after applying the revert patch (identity
+                      first, kms second).
+                    type: boolean
+                  plaintextRemoved:
+                    default: false
+                    description: Set true after applying the "remove identity" Talos patch.
+                    type: boolean
+                type: object
+              barbican:
+                description: |-
+                  Settings for `provider: barbican`. Must be set when `provider` is
+                  `barbican`.
+                nullable: true
+                properties:
+                  cloudConfigSecretRef:
+                    description: |-
+                      A Secret in `kube-system` holding the whole `cloud.conf` under the key
+                      `cloud.conf` -- OpenStack credentials plus `[KeyManager] key-id`. The
+                      controller never reads it.
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  image:
+                    description: |-
+                      The `barbican-kms-plugin` image, pinned. No default: the controller
+                      does not choose a plugin version for you.
+                    type: string
+                required:
+                - cloudConfigSecretRef
+                - image
+                type: object
+              platformKind:
+                enum:
+                - talos-linux
+                type: string
+              provider:
+                enum:
+                - barbican
+                type: string
+            required:
+            - platformKind
+            - provider
+            type: object
+          status:
+            nullable: true
+            properties:
+              appliedResources:
+                default: []
+                items:
+                  properties:
+                    apiVersion:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      default: ''
+                      type: string
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  type: object
+                type: array
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                default: 0
+                format: int64
+                type: integer
+              patchGenerations:
+                default:
+                  enableKms: null
+                  removeIdentity: null
+                  removeKms: null
+                  revert: null
+                description: |-
+                  The generation at which each patch in `talosPatches` was first
+                  published; see `effective_acks`.
+                properties:
+                  enableKms:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  removeIdentity:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  removeKms:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  revert:
+                    format: int64
+                    nullable: true
+                    type: integer
+                type: object
+              phase:
+                default: Pending
+                enum:
+                - Pending
+                - InstallingPlugin
+                - AwaitingKmsConfig
+                - Rewriting
+                - AwaitingPlaintextRemoval
+                - Encrypted
+                - RevertingKms
+                - Decrypting
+                - AwaitingKmsRemoval
+                type: string
+              rewrite:
+                default:
+                  failed: 0
+                  rewritten: 0
+                  total: 0
+                properties:
+                  failed:
+                    default: 0
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  rewritten:
+                    default: 0
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  total:
+                    default: 0
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                type: object
+              talosPatches:
+                default:
+                  enableKms: null
+                  removeIdentity: null
+                  removeKms: null
+                  revert: null
+                description: |-
+                  Talos machine-config patches the operator applies. `None` until the
+                  protocol reaches the step that needs them; serialized as `null` (not
+                  skipped) so a merge-patch status write can clear one.
+                properties:
+                  enableKms:
+                    nullable: true
+                    type: string
+                  removeIdentity:
+                    nullable: true
+                    type: string
+                  removeKms:
+                    nullable: true
+                    type: string
+                  revert:
+                    nullable: true
+                    type: string
+                type: object
+            type: object
+        required:
+        - spec
+        title: EtcdEncryption
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

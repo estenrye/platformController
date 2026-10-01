@@ -10,11 +10,12 @@ kubectl wait --for=condition=established --timeout=60s crd/cloudcontrollermanage
 kubectl wait --for=condition=established --timeout=60s crd/csidrivers.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/certmanagerinstallations.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/snapshotcontrollers.platform.rye.ninja
+kubectl wait --for=condition=established --timeout=60s crd/etcdencryptions.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```
 
-`crd.yaml` (all four CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
+`crd.yaml` (all of the CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
 contains a `CniInstallation` custom resource, and the API server rejects a custom
 resource whose kind is not yet registered (`no matches for kind "CniInstallation"`).
 Registration is asynchronous: the CRD can exist while its API endpoint is not yet
@@ -60,7 +61,7 @@ Omitting `spec.spegel.registries` mirrors every registry, private ones included.
 `spec.spegel.chartVersion` is the OCI chart tag and has no `v` prefix (`0.7.4`).
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all six CRDs to be Established) *before* rolling the controller image. A controller
+all of the CRDs to be Established) *before* rolling the controller image. A controller
 that starts without the `PullThroughCache` CRD logs watch errors for it and
 retries with backoff; it still reconciles `CniInstallation` normally.
 
@@ -90,7 +91,7 @@ reconciles when applied. With external cloud-provider kubelets every node is tai
 the CCM runs on the host network, so it does not need the CNI.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all six CRDs to be Established) *before* rolling the controller image. The new
+all of the CRDs to be Established) *before* rolling the controller image. The new
 image's Deployment also tolerates the `uninitialized` taint (`deploy/bootstrap.yaml`);
 without that toleration the controller could not schedule on a cluster whose
 kubelets use an external cloud provider.
@@ -162,7 +163,7 @@ on the regular pod network and has no toleration for the `uninitialized` taint
 even though the reconcile that applies its manifests will succeed regardless.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait
-for all six CRDs to be Established) *before* rolling the controller image.
+for all of the CRDs to be Established) *before* rolling the controller image.
 
 **Deleting** a `CsiDriver` removes the chart's objects but does not delete
 already-provisioned Cinder volumes; PVCs or pods still depending on them can be
@@ -257,3 +258,13 @@ that uses it. **Switching an existing cluster** from `cidrs` to
 `kubernetesInternalIP` changes each node's address in Calico: `calico-node`
 restarts and BGP sessions re-establish from the new addresses, so make sure your
 BGP peers accept them first.
+
+## etcd Secret encryption (optional, EXPERIMENTAL)
+
+**EXPERIMENTAL and NOT live-verified: do not use it on a cluster you care about.**
+
+`examples/etcd-encryption.yaml` is an `EtcdEncryption` that encrypts every Secret at rest through an external KMS (OpenStack Barbican today). Unlike the other components it is a **protocol**: on Talos the apiserver's encryption config is part of the machine config, applied through the Talos API, which this controller never uses. The controller installs the KMS plugin, publishes each Talos patch in `.status.talosPatches`, re-encrypts every Secret, and verifies the result; you apply each patch with `talosctl` and acknowledge it in `spec.acknowledgements` (an acknowledgement only counts if set after its patch appeared). See `docs/runbooks/etcd-encryption-verification.md` for the full walk-through.
+
+**Existing encryption is not detected.** Talos's default `talosctl gen config` already encrypts Secrets with secretbox (`cluster.secretboxEncryptionSecret`). The generated patches replace the provider list, so you must splice that provider into every patch as a read fallback (each patch starts with a comment saying where), or every existing Secret becomes unreadable.
+
+**You create and own the KMS key; losing it makes every Secret in the cluster unreadable.** Key rotation (or changing `cloudConfigSecretRef` / the `key-id` once rewriting started) is unsupported. Deleting the resource is multi-step (revert patch, re-save every Secret, remove-KMS patch, only then the plugin goes), so it stays `Terminating` until you acknowledge each step: see "6. Delete protocol" in the runbook.
