@@ -92,8 +92,8 @@ spec:
   only from `cloud.conf`'s `[KeyManager] key-id`, which the controller never
   reads, so a copy on the CR could only contradict it.
 - Only one provider block may be set, and it must match `provider`; otherwise
-  `phase: Failed` with `reason: InvalidSpec`, like the other components.
-- The three `acknowledgements` fields are the operator's explicit gates; they
+  a `Ready=False` condition with `reason: InvalidSpec`, like the other components.
+- The four `acknowledgements` fields are the operator's explicit gates; they
   are the only fields the operator flips as the protocol progresses. They are
   always `false` on first apply.
 
@@ -153,7 +153,9 @@ phase backwards on its own and never un-acknowledges anything.
    the end state was verified, not just "manifests applied"; the status says
    what was verified and how (see Probes).
 
-Deletion adds three phases: `RevertingKms`, `Decrypting`, `AwaitingKmsRemoval`. There is no `Failed` phase: failures are a `Ready=False` condition with a reason, so the protocol position survives them.
+Deletion adds three phases: `RevertingKms`, `Decrypting`,
+`AwaitingKmsRemoval`. There is no `Failed` phase: failures are a `Ready=False`
+condition with a reason, so the protocol position survives them.
 
 A probe going negative after a phase was reached sets a `Degraded` condition
 and a reason; it does not regress the phase or reset an acknowledgement.
@@ -198,12 +200,13 @@ There is no force-delete in this slice.
 
 ### Failure handling
 
-- Bad credentials Secret, missing key, unhealthy plugin: retried `Failed`
-  status with a reason, like the other components. Phases never advance on
-  failure.
+- Bad credentials Secret, missing key, unhealthy plugin: a `Ready=False`
+  condition with a reason, retried like the other components. Phases never
+  advance on failure and the phase never regresses.
 - Validation failures (`platformKind`, provider/block mismatch, empty
-  required fields) are `Failed` with `reason: InvalidSpec` and are not retried
-  until the spec changes.
+  required fields) are a `Ready=False` condition with `reason: InvalidSpec`
+  and are not retried until the spec changes. The phase is not changed and
+  never regresses.
 - Every networked poll uses `tokio::time::timeout_at`, never a bare await
   (see [[wait-for-crd-established]]).
 

@@ -15,7 +15,7 @@ kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```
 
-`crd.yaml` (all four CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
+`crd.yaml` (all of the CRDs) must be applied — and Established — first. `examples/cni-installation.yaml`
 contains a `CniInstallation` custom resource, and the API server rejects a custom
 resource whose kind is not yet registered (`no matches for kind "CniInstallation"`).
 Registration is asynchronous: the CRD can exist while its API endpoint is not yet
@@ -61,7 +61,7 @@ Omitting `spec.spegel.registries` mirrors every registry, private ones included.
 `spec.spegel.chartVersion` is the OCI chart tag and has no `v` prefix (`0.7.4`).
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all six CRDs to be Established) *before* rolling the controller image. A controller
+all of the CRDs to be Established) *before* rolling the controller image. A controller
 that starts without the `PullThroughCache` CRD logs watch errors for it and
 retries with backoff; it still reconciles `CniInstallation` normally.
 
@@ -91,7 +91,7 @@ reconciles when applied. With external cloud-provider kubelets every node is tai
 the CCM runs on the host network, so it does not need the CNI.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait for
-all six CRDs to be Established) *before* rolling the controller image. The new
+all of the CRDs to be Established) *before* rolling the controller image. The new
 image's Deployment also tolerates the `uninitialized` taint (`deploy/bootstrap.yaml`);
 without that toleration the controller could not schedule on a cluster whose
 kubelets use an external cloud provider.
@@ -163,7 +163,7 @@ on the regular pod network and has no toleration for the `uninitialized` taint
 even though the reconcile that applies its manifests will succeed regardless.
 
 **Upgrading an existing install:** apply the new `deploy/crd.yaml` (and wait
-for all six CRDs to be Established) *before* rolling the controller image.
+for all of the CRDs to be Established) *before* rolling the controller image.
 
 **Deleting** a `CsiDriver` removes the chart's objects but does not delete
 already-provisioned Cinder volumes; PVCs or pods still depending on them can be
