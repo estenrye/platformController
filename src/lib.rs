@@ -25,3 +25,4 @@ pub mod secret_rewrite;
 pub mod etcd_encryption_reconciler;
 pub mod transformation_metrics;
 pub mod apiserver_probe;
+pub mod encryption_verify;
