@@ -1,0 +1,48 @@
+# Sample EtcdEncryption for a self-hosted Talos Linux cluster on OpenStack:
+# installs the Barbican KMS plugin, re-encrypts every Secret through KMS, and
+# walks the cluster to "no plaintext Secrets in etcd".
+#
+# The controller cannot change the apiserver's configuration (on Talos that
+# lives in the machine config, applied through the Talos API, which this
+# controller never touches). So this is a protocol: the controller publishes
+# the exact Talos patches in .status.talosPatches, you apply them, and you
+# acknowledge each step below. Full walk-through, including how to verify:
+# docs/runbooks/etcd-encryption-verification.md
+#
+# BEFORE applying this:
+#
+# 1. Create a 256-bit AES key in Barbican and put its id in cloud.conf under
+#    [KeyManager] key-id (see
+#    https://github.com/kubernetes/cloud-provider-openstack/blob/master/docs/barbican-kms-plugin/using-barbican-kms-plugin.md).
+#    The controller never creates, rotates or deletes keys. LOSING THIS KEY
+#    MAKES EVERY SECRET IN THE CLUSTER UNREADABLE.
+#
+# 2. Create the credentials Secret in kube-system. The key MUST be `cloud.conf`:
+#
+#      kubectl -n kube-system create secret generic barbican-kms-cloud-config \
+#        --from-file=cloud.conf=./cloud.conf
+#
+# Then:
+#
+#   kubectl apply -f examples/etcd-encryption.yaml
+#   kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}'
+#
+# Leave every acknowledgement false until the status asks for it.
+apiVersion: platform.rye.ninja/v1alpha1
+kind: EtcdEncryption
+metadata:
+  name: default
+spec:
+  platformKind: talos-linux
+  provider: barbican
+  barbican:
+    # The plugin image, pinned. Match the tag to your Kubernetes/OpenStack
+    # release; this controller does not choose one for you.
+    image: registry.k8s.io/provider-os/barbican-kms-plugin:v1.36.0
+    cloudConfigSecretRef:
+      name: barbican-kms-cloud-config
+  acknowledgements:
+    kmsConfigApplied: false   # true once talosPatches.enableKms is applied
+    plaintextRemoved: false   # true once talosPatches.removeIdentity is applied
+    kmsReverted: false        # deletion only: talosPatches.revert applied
+    kmsRemoved: false         # deletion only: talosPatches.removeKms applied
