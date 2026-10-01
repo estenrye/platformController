@@ -26,3 +26,4 @@ pub mod reconciler;
 pub mod spec_validation;
 pub mod secret_rewrite;
 pub mod encryption_probe;
+pub mod etcd_encryption_reconciler;
