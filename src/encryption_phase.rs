@@ -5,6 +5,8 @@ use crate::etcd_encryption::{Acknowledgements, EncryptionPhase};
 #[derive(Debug, Clone, Copy)]
 pub struct PhaseInputs {
     pub current: EncryptionPhase,
+    /// The EFFECTIVE acknowledgements (`etcd_encryption::effective_acks`):
+    /// an ack counts only if set after its patch was published.
     pub acks: Acknowledgements,
     /// A Ready plugin pod on every control-plane node.
     pub plugin_ready: bool,
@@ -15,6 +17,9 @@ pub struct PhaseInputs {
     pub canary_ok: bool,
     /// Every Secret was rewritten with zero failures.
     pub rewrite_complete: bool,
+    /// Every Secret can be listed (and therefore decrypted) through the
+    /// apiserver right now. A listing error is passed as `false`.
+    pub secrets_readable: bool,
 }
 
 /// One forward step. Never regresses: a probe going negative after a phase was
@@ -28,7 +33,10 @@ pub fn next_phase(inputs: &PhaseInputs) -> EncryptionPhase {
         AwaitingKmsConfig if inputs.kms_active && inputs.acks.kms_config_applied => Rewriting,
         Rewriting if inputs.rewrite_complete => AwaitingPlaintextRemoval,
         AwaitingPlaintextRemoval
-            if inputs.acks.plaintext_removed && inputs.kms_active && inputs.canary_ok =>
+            if inputs.acks.plaintext_removed
+                && inputs.kms_active
+                && inputs.canary_ok
+                && inputs.secrets_readable =>
         {
             Encrypted
         }
@@ -39,11 +47,17 @@ pub fn next_phase(inputs: &PhaseInputs) -> EncryptionPhase {
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupInputs {
     pub phase: EncryptionPhase,
+    /// Effective acknowledgements, except `kms_config_applied`, which is the
+    /// RAW spec value (see `etcd_encryption_reconciler::cleanup_inputs`).
     pub acks: Acknowledgements,
     /// The apiserver reports an active KMS provider.
     /// `Some(true)` or `Some(false)` = probe result; `None` = probe failed/unknown.
     /// A failed probe MUST be `None` (never true): never remove the plugin while its status is unknown.
     pub kms_active: Option<bool>,
+    /// Every Secret can be listed (and therefore decrypted) through the
+    /// apiserver right now. A listing error is passed as `false`: it never
+    /// permits plugin removal.
+    pub secrets_readable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,10 +75,24 @@ pub enum CleanupStep {
 /// Which deletion step to run. The finalizer must keep returning an error for
 /// every step except `RemovePlugin`: removing the plugin while the apiserver
 /// still depends on it leaves the apiserver unable to read Secrets.
+///
+/// Engaged-ness (does the apiserver possibly depend on the plugin?) errs on
+/// the safe side:
+/// - `Pending` / `InstallingPlugin`: engaged unless the apiserver positively
+///   reports no KMS provider (`kms_active == Some(false)`). The operator may
+///   have applied a patch out of band; an unreadable probe keeps the plugin.
+/// - `AwaitingKmsConfig`: engaged if `kmsConfigApplied` is set (the RAW spec
+///   value, not the effective one) or the probe does not say "no KMS".
+/// - every later phase: engaged.
+///
+/// `acks` other than `kms_config_applied` must be the effective ones (see
+/// `etcd_encryption::effective_acks`). The plugin is removed at the end only
+/// when `kmsRemoved` counts, the apiserver reports no KMS provider, and every
+/// Secret can be read.
 pub fn cleanup_step(inputs: &CleanupInputs) -> CleanupStep {
     use EncryptionPhase::*;
     let engaged = match inputs.phase {
-        Pending | InstallingPlugin => false,
+        Pending | InstallingPlugin => inputs.kms_active != Some(false),
         AwaitingKmsConfig => inputs.acks.kms_config_applied || inputs.kms_active != Some(false),
         _ => true,
     };
@@ -77,7 +105,7 @@ pub fn cleanup_step(inputs: &CleanupInputs) -> CleanupStep {
     if inputs.phase != AwaitingKmsRemoval {
         return CleanupStep::Decrypt;
     }
-    if inputs.acks.kms_removed && inputs.kms_active == Some(false) {
+    if inputs.acks.kms_removed && inputs.kms_active == Some(false) && inputs.secrets_readable {
         return CleanupStep::RemovePlugin;
     }
     CleanupStep::AwaitKmsRemoval
@@ -96,6 +124,7 @@ mod tests {
             kms_active: false,
             canary_ok: false,
             rewrite_complete: false,
+            secrets_readable: false,
         }
     }
 
@@ -141,9 +170,32 @@ mod tests {
         assert_eq!(next_phase(&base), AwaitingPlaintextRemoval);
         assert_eq!(next_phase(&PhaseInputs { kms_active: true, ..base }), AwaitingPlaintextRemoval);
         assert_eq!(next_phase(&PhaseInputs { canary_ok: true, ..base }), AwaitingPlaintextRemoval);
-        assert_eq!(next_phase(&PhaseInputs { kms_active: true, canary_ok: true, ..base }), Encrypted);
-        let no_ack = PhaseInputs { kms_active: true, canary_ok: true, acks: Acknowledgements::default(), ..base };
+        assert_eq!(
+            next_phase(&PhaseInputs { kms_active: true, canary_ok: true, secrets_readable: true, ..base }),
+            Encrypted
+        );
+        let no_ack = PhaseInputs {
+            kms_active: true,
+            canary_ok: true,
+            secrets_readable: true,
+            acks: Acknowledgements::default(),
+            ..base
+        };
         assert_eq!(next_phase(&no_ack), AwaitingPlaintextRemoval);
+    }
+
+    #[test]
+    fn plaintext_removal_is_not_encrypted_while_any_secret_is_unreadable() {
+        let acks = Acknowledgements { kms_config_applied: true, plaintext_removed: true, ..Default::default() };
+        let unreadable = PhaseInputs {
+            acks,
+            kms_active: true,
+            canary_ok: true,
+            secrets_readable: false,
+            ..inputs(AwaitingPlaintextRemoval)
+        };
+
+        assert_eq!(next_phase(&unreadable), AwaitingPlaintextRemoval);
     }
 
     #[test]
@@ -163,14 +215,16 @@ mod tests {
                 kms_active: true,
                 canary_ok: true,
                 rewrite_complete: true,
+                secrets_readable: true,
                 ..inputs(phase)
             };
             assert_eq!(next_phase(&all_true), phase);
         }
     }
 
+    /// Secrets readable: the gate under test elsewhere is the protocol itself.
     fn cleanup(phase: EncryptionPhase, acks: Acknowledgements, kms_active: Option<bool>) -> CleanupStep {
-        cleanup_step(&CleanupInputs { phase, acks, kms_active })
+        cleanup_step(&CleanupInputs { phase, acks, kms_active, secrets_readable: true })
     }
 
     #[test]
@@ -248,10 +302,27 @@ mod tests {
     }
 
     #[test]
-    fn unengaged_phases_remove_plugin_even_with_unknown_probe() {
-        // (g) Pending/InstallingPlugin never engaged, remove plugin even if probe is unknown
+    fn pending_and_installing_are_engaged_unless_the_apiserver_reports_no_kms() {
+        // (g) The operator may have applied a patch out of band before the
+        // phase caught up: only a positive "no KMS provider" frees the plugin.
         let none = Acknowledgements::default();
-        assert_eq!(cleanup(Pending, none, None), CleanupStep::RemovePlugin);
-        assert_eq!(cleanup(InstallingPlugin, none, None), CleanupStep::RemovePlugin);
+        for phase in [Pending, InstallingPlugin] {
+            assert_eq!(cleanup(phase, none, None), CleanupStep::AwaitRevertAck, "{phase:?} unknown probe");
+            assert_eq!(cleanup(phase, none, Some(true)), CleanupStep::AwaitRevertAck, "{phase:?} KMS active");
+            assert_eq!(cleanup(phase, none, Some(false)), CleanupStep::RemovePlugin, "{phase:?} KMS off");
+        }
+    }
+
+    #[test]
+    fn the_plugin_is_not_removed_while_any_secret_is_unreadable() {
+        let removed = Acknowledgements { kms_config_applied: true, kms_reverted: true, kms_removed: true, ..Default::default() };
+        let step = cleanup_step(&CleanupInputs {
+            phase: AwaitingKmsRemoval,
+            acks: removed,
+            kms_active: Some(false),
+            secrets_readable: false,
+        });
+
+        assert_eq!(step, CleanupStep::AwaitKmsRemoval);
     }
 }

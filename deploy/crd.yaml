@@ -1137,6 +1137,33 @@ spec:
                 default: 0
                 format: int64
                 type: integer
+              patchGenerations:
+                default:
+                  enableKms: null
+                  removeIdentity: null
+                  removeKms: null
+                  revert: null
+                description: |-
+                  The generation at which each patch in `talosPatches` was first
+                  published; see `effective_acks`.
+                properties:
+                  enableKms:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  removeIdentity:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  removeKms:
+                    format: int64
+                    nullable: true
+                    type: integer
+                  revert:
+                    format: int64
+                    nullable: true
+                    type: integer
+                type: object
               phase:
                 default: Pending
                 enum:

@@ -1,12 +1,12 @@
 use crate::crd::{Condition, PlatformKind};
 use crate::encryption_phase::{cleanup_step, next_phase, CleanupInputs, CleanupStep, PhaseInputs};
 use crate::etcd_encryption::{
-    EncryptionPhase, EtcdEncryption, EtcdEncryptionSpec, EtcdEncryptionSpecError, EtcdEncryptionStatus,
-    RewriteProgress, TalosPatches,
+    effective_acks, Acknowledgements, EncryptionPhase, EtcdEncryption, EtcdEncryptionSpec, EtcdEncryptionSpecError,
+    EtcdEncryptionStatus, PatchGenerations, RewriteProgress, TalosPatches,
 };
 use crate::kms_provider::{kms_plan, KmsPlan, PLUGIN_NAMESPACE};
 use crate::reconciler::{leader_gate, Context, FINALIZER_NAME, SINGLETON_NAME};
-use crate::secret_rewrite::{rewrite_page, KubeSecretStore, SecretStore, StoreError};
+use crate::secret_rewrite::{rewrite_page, verify_listable, KubeSecretStore, SecretStore, StoreError};
 use k8s_openapi::api::apps::v1::DaemonSet;
 use k8s_openapi::api::core::v1::Node;
 use kube::api::ListParams;
@@ -18,6 +18,8 @@ use std::time::Duration;
 const FIELD_MANAGER: &str = "platform-controller";
 const WAITING_REQUEUE: Duration = Duration::from_secs(15);
 const STEADY_REQUEUE: Duration = Duration::from_secs(300);
+/// Upper bound on listing every Secret for the readable gate.
+const LISTABLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(thiserror::Error, Debug)]
 pub enum ValidationError {
@@ -130,6 +132,69 @@ pub fn patches_for(phase: EncryptionPhase, plan: &KmsPlan, current: &TalosPatche
         patches.remove_identity = Some(crate::talos_patches::remove_identity(plan));
     }
     patches
+}
+
+/// Records `generation` for every patch in `patches` that is published but has
+/// no publication generation yet. Never overwrites one already recorded.
+/// Call it on the status that the publishing write sends, so the patch and its
+/// generation land in the same write. Returns whether anything changed.
+pub fn record_publication(gens: &mut PatchGenerations, patches: &TalosPatches, generation: i64) -> bool {
+    let mut changed = false;
+    let mut record = |published: &mut Option<i64>, patch: &Option<String>| {
+        if patch.is_some() && published.is_none() {
+            *published = Some(generation);
+            changed = true;
+        }
+    };
+    record(&mut gens.enable_kms, &patches.enable_kms);
+    record(&mut gens.remove_identity, &patches.remove_identity);
+    record(&mut gens.revert, &patches.revert);
+    record(&mut gens.remove_kms, &patches.remove_kms);
+    changed
+}
+
+/// The cleanup state machine's inputs. Acks count only after their patch was
+/// published (`effective_acks`), except `kms_config_applied`, which stays the
+/// RAW spec value: it only decides engaged-ness, and there a not-yet-counting
+/// ack must still keep the plugin.
+pub fn cleanup_inputs(
+    phase: EncryptionPhase,
+    raw: Acknowledgements,
+    generation: i64,
+    gens: &PatchGenerations,
+    kms_active: Option<bool>,
+    secrets_readable: bool,
+) -> CleanupInputs {
+    let acks = Acknowledgements { kms_config_applied: raw.kms_config_applied, ..effective_acks(raw, generation, gens) };
+    CleanupInputs { phase, acks, kms_active, secrets_readable }
+}
+
+/// The phase to record while waiting for `kmsReverted`. The phase never
+/// regresses: once decrypting has started (or finished), an ack that does not
+/// count (flipped, or written before `patchGenerations` existed) keeps the
+/// phase and only blocks the next step.
+pub fn revert_wait_phase(current: EncryptionPhase) -> EncryptionPhase {
+    match current {
+        EncryptionPhase::Decrypting | EncryptionPhase::AwaitingKmsRemoval => current,
+        _ => EncryptionPhase::RevertingKms,
+    }
+}
+
+/// Every Secret can be listed (so decrypted) right now. Errors and timeouts
+/// are `false` and logged: this gate only ever blocks.
+async fn probe_secrets_readable(store: &impl SecretStore) -> bool {
+    let deadline = tokio::time::Instant::now() + LISTABLE_TIMEOUT;
+    match tokio::time::timeout_at(deadline, verify_listable(store)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "listing every Secret failed; treating Secrets as not all readable");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("listing every Secret timed out; treating Secrets as not all readable");
+            false
+        }
+    }
 }
 
 async fn write_status(
@@ -286,13 +351,15 @@ async fn reconcile_inner(
     crate::apply::apply_object(&ctx.client, &plan.daemonset, FIELD_MANAGER).await?;
 
     // Gather the facts. Probes only run once they can matter.
+    // An ack counts only if it was set after its patch was published.
     let mut inputs = PhaseInputs {
         current: status.phase,
-        acks: obj.spec.acknowledgements,
+        acks: effective_acks(obj.spec.acknowledgements, generation.unwrap_or(0), &status.patch_generations),
         plugin_ready: plugin_ready(&ctx.client, &plan).await?,
         kms_active: false,
         canary_ok: false,
         rewrite_complete: false,
+        secrets_readable: false,
     };
     if !matches!(inputs.current, EncryptionPhase::Pending | EncryptionPhase::InstallingPlugin) {
         // Asymmetry with `cleanup`: here a failed probe is `false` (blocks
@@ -307,9 +374,12 @@ async fn reconcile_inner(
                 false
             });
     }
+    let store = KubeSecretStore::new(ctx.client.clone());
+    if matches!(inputs.current, EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted) {
+        inputs.secrets_readable = probe_secrets_readable(&store).await;
+    }
 
     // Walk forward as far as the facts allow in one reconcile.
-    let store = KubeSecretStore::new(ctx.client.clone());
     loop {
         if should_run_rewrite(inputs.current, inputs.kms_active) {
             inputs.rewrite_complete = run_rewrite(&api, &name, &store, &mut status).await?;
@@ -333,12 +403,22 @@ async fn reconcile_inner(
                     false
                 });
         }
+        if matches!(next, EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted)
+            && !inputs.secrets_readable
+        {
+            inputs.secrets_readable = probe_secrets_readable(&store).await;
+        }
     }
 
     status.phase = inputs.current;
     status.talos_patches = patches_for(status.phase, &plan, &status.talos_patches);
+    // Same write as the publication: an ack already set now does not count.
+    record_publication(&mut status.patch_generations, &status.talos_patches, generation.unwrap_or(0));
     let (ready, degraded) = match status.phase {
-        EncryptionPhase::Encrypted => (true, !(inputs.kms_active && inputs.canary_ok && inputs.plugin_ready)),
+        EncryptionPhase::Encrypted => (
+            true,
+            !(inputs.kms_active && inputs.canary_ok && inputs.plugin_ready && inputs.secrets_readable),
+        ),
         _ => (false, false),
     };
     let message = if status.phase == EncryptionPhase::Rewriting && !inputs.kms_active {
@@ -368,7 +448,11 @@ fn phase_message(phase: EncryptionPhase) -> String {
         AwaitingKmsConfig => "apply status.talosPatches.enableKms with talosctl, then set spec.acknowledgements.kmsConfigApplied",
         Rewriting => "re-encrypting every Secret through KMS",
         AwaitingPlaintextRemoval => "apply status.talosPatches.removeIdentity with talosctl, then set spec.acknowledgements.plaintextRemoved",
-        Encrypted => "Secrets are encrypted at rest through KMS; verified by apiserver probes",
+        Encrypted => {
+            "Secrets are encrypted at rest through KMS. Established indirectly: the apiserver reports a KMS \
+             provider, a canary Secret round-trips, every Secret can be read, and plaintext removal was \
+             acknowledged; etcd itself cannot be read through the Kubernetes API."
+        }
         RevertingKms | Decrypting | AwaitingKmsRemoval => "reverting encryption before deletion",
     }
     .to_string()
@@ -416,10 +500,22 @@ pub async fn cleanup(
         }
     };
 
-    let step = cleanup_step(&CleanupInputs { phase: status.phase, acks: obj.spec.acknowledgements, kms_active });
+    let store = KubeSecretStore::new(ctx.client.clone());
+    // Listing every Secret only matters for the final step.
+    let secrets_readable =
+        status.phase == EncryptionPhase::AwaitingKmsRemoval && probe_secrets_readable(&store).await;
+    let current_generation = generation.unwrap_or(0);
+    let inputs = cleanup_inputs(status.phase, obj.spec.acknowledgements, current_generation, &status.patch_generations, kms_active, secrets_readable);
+    let step = cleanup_step(&inputs);
     tracing::info!(installation = %name, phase = ?status.phase, ?step, "cleanup step");
 
-    let result: Result<Action, EtcdEncryptionReconcileError> = async { match step {
+    let result: Result<Action, EtcdEncryptionReconcileError> = async {
+        if step != CleanupStep::RemovePlugin {
+            // The apiserver may still need the plugin: keep it applied (a
+            // drifted or deleted DaemonSet is restored) until the last step.
+            crate::apply::apply_object(&ctx.client, &plan.daemonset, FIELD_MANAGER).await?;
+        }
+        match step {
         CleanupStep::RemovePlugin => {
             for reference in status.applied_resources.iter().rev() {
                 tracing::info!(kind = %reference.kind, resource = %reference.name, "deleting applied resource");
@@ -429,29 +525,45 @@ pub async fn cleanup(
             Ok(Action::await_change())
         }
         CleanupStep::AwaitRevertAck => {
-            status.phase = EncryptionPhase::RevertingKms;
+            status.phase = revert_wait_phase(status.phase);
             status.talos_patches.revert = Some(crate::talos_patches::revert(&plan));
-            status.conditions = vec![condition("Ready", false, "RevertingKms", "apply status.talosPatches.revert with talosctl, then set spec.acknowledgements.kmsReverted", generation)];
+            record_publication(&mut status.patch_generations, &status.talos_patches, current_generation);
+            status.conditions = vec![condition("Ready", false, "RevertingKms", "apply status.talosPatches.revert with talosctl, then set spec.acknowledgements.kmsReverted (flip it false then true if it was already set when the patch appeared)", generation)];
             write_status(&api, &name, &status).await?;
-            Err(EtcdEncryptionReconcileError::CleanupBlocked("waiting for spec.acknowledgements.kmsReverted".to_string()))
+            Err(EtcdEncryptionReconcileError::CleanupBlocked("waiting for spec.acknowledgements.kmsReverted, set after status.talosPatches.revert was published".to_string()))
         }
         CleanupStep::Decrypt => {
+            if !plugin_ready(&ctx.client, &plan).await? {
+                return Err(EtcdEncryptionReconcileError::CleanupBlocked(
+                    "waiting for the KMS plugin to be Ready on every control-plane node before decrypting".to_string(),
+                ));
+            }
             status.phase = EncryptionPhase::Decrypting;
+            record_publication(&mut status.patch_generations, &status.talos_patches, current_generation);
             write_status(&api, &name, &status).await?;
-            let store = KubeSecretStore::new(ctx.client.clone());
             if run_rewrite(&api, &name, &store, &mut status).await? {
                 status.phase = EncryptionPhase::AwaitingKmsRemoval;
                 status.talos_patches.remove_kms = Some(crate::talos_patches::remove_kms());
-                status.conditions = vec![condition("Ready", false, "AwaitingKmsRemoval", "apply status.talosPatches.removeKms with talosctl, then set spec.acknowledgements.kmsRemoved", generation)];
+                record_publication(&mut status.patch_generations, &status.talos_patches, current_generation);
+                status.conditions = vec![condition("Ready", false, "AwaitingKmsRemoval", "apply status.talosPatches.removeKms with talosctl, then set spec.acknowledgements.kmsRemoved (flip it false then true if it was already set when the patch appeared)", generation)];
                 write_status(&api, &name, &status).await?;
                 Err(EtcdEncryptionReconcileError::CleanupBlocked("waiting for spec.acknowledgements.kmsRemoved".to_string()))
             } else {
                 Err(EtcdEncryptionReconcileError::CleanupBlocked("some Secrets could not be rewritten; retrying".to_string()))
             }
         }
-        CleanupStep::AwaitKmsRemoval => Err(EtcdEncryptionReconcileError::CleanupBlocked(
-            "waiting for spec.acknowledgements.kmsRemoved and for the apiserver to stop reporting a KMS provider".to_string(),
-        )),
+        CleanupStep::AwaitKmsRemoval => {
+            // A status written before patchGenerations existed: record the
+            // already-published patches now so their acks can start counting.
+            if record_publication(&mut status.patch_generations, &status.talos_patches, current_generation) {
+                write_status(&api, &name, &status).await?;
+            }
+            Err(EtcdEncryptionReconcileError::CleanupBlocked(
+                "waiting for spec.acknowledgements.kmsRemoved (set after status.talosPatches.removeKms was published), \
+                 for the apiserver to stop reporting a KMS provider, and for every Secret to be readable"
+                    .to_string(),
+            ))
+        }
     } }
     .await;
     enforce_cleanup_gate(step, result)
@@ -492,7 +604,7 @@ pub async fn reconcile_with_finalizer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::etcd_encryption::{BarbicanSpec, KmsProviderKind, SecretNameRef};
+    use crate::etcd_encryption::{Acknowledgements, BarbicanSpec, KmsProviderKind, SecretNameRef};
 
     fn spec_with(platform_kind: PlatformKind) -> EtcdEncryptionSpec {
         EtcdEncryptionSpec {
@@ -620,6 +732,110 @@ mod tests {
         assert!(!daemonset_rollout_current(Some(2), Some(2), None, 3));
         assert!(!daemonset_rollout_current(None, Some(2), Some(3), 3));
         assert!(!daemonset_rollout_current(Some(2), None, Some(3), 3));
+    }
+
+    const ALL_ACKS: Acknowledgements =
+        Acknowledgements { kms_config_applied: true, plaintext_removed: true, kms_reverted: true, kms_removed: true };
+
+    #[test]
+    fn a_preset_kms_reverted_does_not_skip_publishing_the_revert_patch() {
+        // C1: the operator set kmsReverted before deleting. The revert patch
+        // was never published, so the ack cannot be for it: run the revert
+        // step (publish the patch), never Decrypt.
+        let raw = Acknowledgements { kms_config_applied: true, kms_reverted: true, ..Default::default() };
+        let gens = PatchGenerations { enable_kms: Some(2), remove_identity: Some(3), ..Default::default() };
+
+        let inputs = cleanup_inputs(EncryptionPhase::Encrypted, raw, 7, &gens, Some(true), true);
+
+        assert!(!inputs.acks.kms_reverted);
+        assert_eq!(cleanup_step(&inputs), CleanupStep::AwaitRevertAck);
+    }
+
+    #[test]
+    fn cleanup_engagement_uses_the_raw_kms_config_applied() {
+        // Engaged-ness errs on the safe side: an ack that does not count yet
+        // still means the operator may have applied patch 1.
+        let raw = Acknowledgements { kms_config_applied: true, ..Default::default() };
+
+        let inputs = cleanup_inputs(EncryptionPhase::AwaitingKmsConfig, raw, 5, &PatchGenerations::default(), Some(false), true);
+
+        assert!(inputs.acks.kms_config_applied);
+        assert_eq!(cleanup_step(&inputs), CleanupStep::AwaitRevertAck);
+    }
+
+    #[test]
+    fn cleanup_inputs_count_acks_given_after_their_patches() {
+        let gens = PatchGenerations { enable_kms: Some(2), remove_identity: Some(3), revert: Some(4), remove_kms: Some(5) };
+
+        let inputs = cleanup_inputs(EncryptionPhase::AwaitingKmsRemoval, ALL_ACKS, 6, &gens, Some(false), true);
+
+        assert_eq!(inputs.acks, ALL_ACKS);
+        assert_eq!(cleanup_step(&inputs), CleanupStep::RemovePlugin);
+        let unreadable = cleanup_inputs(EncryptionPhase::AwaitingKmsRemoval, ALL_ACKS, 6, &gens, Some(false), false);
+        assert_eq!(cleanup_step(&unreadable), CleanupStep::AwaitKmsRemoval);
+    }
+
+    #[test]
+    fn publication_records_the_generation_of_each_newly_published_patch_once() {
+        let mut gens = PatchGenerations::default();
+        let patches = TalosPatches { enable_kms: Some("p1".to_string()), ..Default::default() };
+
+        assert!(record_publication(&mut gens, &patches, 3));
+        assert_eq!(gens, PatchGenerations { enable_kms: Some(3), ..Default::default() });
+
+        let more = TalosPatches { remove_identity: Some("p2".to_string()), ..patches };
+        assert!(record_publication(&mut gens, &more, 5));
+        assert_eq!(gens.enable_kms, Some(3), "never overwritten");
+        assert_eq!(gens.remove_identity, Some(5));
+
+        assert!(!record_publication(&mut gens, &more, 9), "nothing new to record");
+        assert_eq!(gens, PatchGenerations { enable_kms: Some(3), remove_identity: Some(5), ..Default::default() });
+    }
+
+    #[test]
+    fn a_preset_plaintext_removed_does_not_walk_to_encrypted() {
+        // I4: plaintextRemoved was already true when the remove-identity patch
+        // was first published (same generation): it does not count.
+        let plan = crate::kms_provider::kms_plan(&spec_with(PlatformKind::TalosLinux)).unwrap();
+        let generation = 4;
+        let mut gens = PatchGenerations { enable_kms: Some(2), ..Default::default() };
+        let patches = patches_for(EncryptionPhase::AwaitingPlaintextRemoval, &plan, &TalosPatches::default());
+        record_publication(&mut gens, &patches, generation);
+
+        let raw = Acknowledgements { kms_config_applied: true, plaintext_removed: true, ..Default::default() };
+        let inputs = PhaseInputs {
+            current: EncryptionPhase::AwaitingPlaintextRemoval,
+            acks: effective_acks(raw, generation, &gens),
+            plugin_ready: true,
+            kms_active: true,
+            canary_ok: true,
+            rewrite_complete: true,
+            secrets_readable: true,
+        };
+        assert_eq!(next_phase(&inputs), EncryptionPhase::AwaitingPlaintextRemoval);
+
+        // After the operator flips it (generation 6), it counts.
+        let later = PhaseInputs { acks: effective_acks(raw, 6, &gens), ..inputs };
+        assert_eq!(next_phase(&later), EncryptionPhase::Encrypted);
+    }
+
+    #[test]
+    fn the_encrypted_message_says_how_encryption_was_established() {
+        let message = phase_message(EncryptionPhase::Encrypted);
+
+        assert!(message.starts_with("Secrets are encrypted at rest through KMS. Established indirectly:"));
+        assert!(message.contains("every Secret can be read"));
+        assert!(message.contains("etcd itself cannot be read through the Kubernetes API"));
+    }
+
+    #[test]
+    fn waiting_for_the_revert_ack_never_regresses_a_deletion_phase() {
+        use EncryptionPhase::*;
+        for phase in [Pending, InstallingPlugin, AwaitingKmsConfig, Rewriting, AwaitingPlaintextRemoval, Encrypted, RevertingKms] {
+            assert_eq!(revert_wait_phase(phase), RevertingKms, "{phase:?}");
+        }
+        assert_eq!(revert_wait_phase(Decrypting), Decrypting);
+        assert_eq!(revert_wait_phase(AwaitingKmsRemoval), AwaitingKmsRemoval);
     }
 
     #[test]

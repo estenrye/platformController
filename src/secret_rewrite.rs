@@ -86,6 +86,25 @@ pub async fn rewrite_page<S: SecretStore>(
     Ok(outcome)
 }
 
+/// Lists every Secret, page by page, without writing anything. A list returns
+/// whole objects, so the apiserver must decrypt each one: a Secret that no
+/// configured provider can read fails the listing. Returns how many Secrets
+/// were listed; any error (including one on a later page) is an `Err`.
+/// Like every apiserver call here it reaches one apiserver behind the load
+/// balancer, so it is evidence, not proof, for the whole control plane.
+pub async fn verify_listable<S: SecretStore>(store: &S) -> Result<u64, StoreError> {
+    let mut count = 0u64;
+    let mut token: Option<String> = None;
+    loop {
+        let page = store.list_page(token.as_deref()).await?;
+        count += page.keys.len() as u64;
+        match page.next {
+            Some(next) => token = Some(next),
+            None => return Ok(count),
+        }
+    }
+}
+
 const PAGE_SIZE: u32 = 100;
 
 pub struct KubeSecretStore {
@@ -157,6 +176,9 @@ mod tests {
         gone: HashSet<String>,
         denied: HashSet<String>,
         touched: Mutex<Vec<String>>,
+        /// A listing starting at this offset fails (a Secret that cannot be
+        /// decrypted makes the apiserver fail the whole list).
+        list_fails_at: Option<usize>,
     }
 
     impl FakeStore {
@@ -168,6 +190,9 @@ mod tests {
     impl SecretStore for FakeStore {
         async fn list_page(&self, token: Option<&str>) -> Result<SecretPage, StoreError> {
             let start: usize = token.map(|t| t.parse().unwrap()).unwrap_or(0);
+            if self.list_fails_at == Some(start) {
+                return Err(StoreError("Internal error occurred: unable to transform key".to_string()));
+            }
             let end = (start + self.page_size).min(self.keys.len());
             Ok(SecretPage {
                 keys: self.keys[start..end].to_vec(),
@@ -258,6 +283,26 @@ mod tests {
         assert_eq!(outcome.rewritten, 2);
         assert_eq!(outcome.failed, vec![key("b")]);
         assert_eq!(*store.touched.lock().unwrap(), ["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn verify_listable_pages_through_every_secret_without_touching_any() {
+        let store = FakeStore::with(&["a", "b", "c", "d", "e"], 2);
+
+        assert_eq!(verify_listable(&store).await.unwrap(), 5);
+        assert!(store.touched.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_listable_fails_if_any_page_cannot_be_listed() {
+        let store = FakeStore { list_fails_at: Some(2), ..FakeStore::with(&["a", "b", "c"], 2) };
+
+        assert!(verify_listable(&store).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_listable_on_an_empty_cluster_is_zero() {
+        assert_eq!(verify_listable(&FakeStore::with(&[], 10)).await.unwrap(), 0);
     }
 
     #[tokio::test]

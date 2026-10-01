@@ -96,6 +96,39 @@ pub struct TalosPatches {
     pub remove_kms: Option<String>,
 }
 
+/// `metadata.generation` at the status write that FIRST published each Talos
+/// patch. Set once (only while `None`) and never overwritten. An
+/// acknowledgement only counts if the object's generation is strictly greater:
+/// the ack must have been set after the patch it acknowledges was visible.
+/// Serialized as `null` when unset, like `TalosPatches`.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchGenerations {
+    #[serde(default)]
+    pub enable_kms: Option<i64>,
+    #[serde(default)]
+    pub remove_identity: Option<i64>,
+    #[serde(default)]
+    pub revert: Option<i64>,
+    #[serde(default)]
+    pub remove_kms: Option<i64>,
+}
+
+/// The acknowledgements that count. Each is true only when the raw ack is true
+/// AND its patch was published at a generation strictly below `generation`.
+/// An ack that was already true when its patch was first published (same
+/// generation) does not count; the operator must flip it false then true
+/// (any later spec change bumps the generation) after applying the patch.
+pub fn effective_acks(acks: Acknowledgements, generation: i64, gens: &PatchGenerations) -> Acknowledgements {
+    let after = |published: Option<i64>| published.is_some_and(|g| generation > g);
+    Acknowledgements {
+        kms_config_applied: acks.kms_config_applied && after(gens.enable_kms),
+        plaintext_removed: acks.plaintext_removed && after(gens.remove_identity),
+        kms_reverted: acks.kms_reverted && after(gens.revert),
+        kms_removed: acks.kms_removed && after(gens.remove_kms),
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RewriteProgress {
@@ -120,6 +153,10 @@ pub struct EtcdEncryptionStatus {
     pub conditions: Vec<Condition>,
     #[serde(default)]
     pub talos_patches: TalosPatches,
+    /// The generation at which each patch in `talosPatches` was first
+    /// published; see `effective_acks`.
+    #[serde(default)]
+    pub patch_generations: PatchGenerations,
     #[serde(default)]
     pub rewrite: RewriteProgress,
 }
@@ -277,6 +314,63 @@ mod tests {
         let json = serde_json::to_value(EtcdEncryptionStatus::default()).unwrap();
 
         assert_eq!(json["talosPatches"]["enableKms"], serde_json::Value::Null);
+        assert_eq!(json["patchGenerations"]["enableKms"], serde_json::Value::Null);
         assert_eq!(json["phase"], "Pending");
+    }
+
+    #[test]
+    fn a_status_without_patch_generations_deserializes_to_none() {
+        let status: EtcdEncryptionStatus = serde_json::from_value(serde_json::json!({ "phase": "Encrypted" })).unwrap();
+
+        assert_eq!(status.patch_generations, PatchGenerations::default());
+    }
+
+    const ALL_ACKS: Acknowledgements =
+        Acknowledgements { kms_config_applied: true, plaintext_removed: true, kms_reverted: true, kms_removed: true };
+
+    #[test]
+    fn an_ack_for_an_unpublished_patch_is_never_effective() {
+        assert_eq!(effective_acks(ALL_ACKS, 99, &PatchGenerations::default()), Acknowledgements::default());
+    }
+
+    #[test]
+    fn an_ack_already_set_when_its_patch_was_published_is_not_effective() {
+        // The patch was published by the write at generation 4, which already
+        // carried the ack: the operator cannot have applied the patch first.
+        let gens = PatchGenerations { revert: Some(4), ..Default::default() };
+
+        assert!(!effective_acks(ALL_ACKS, 4, &gens).kms_reverted);
+    }
+
+    #[test]
+    fn an_ack_set_at_a_later_generation_is_effective() {
+        let gens = PatchGenerations { enable_kms: Some(2), remove_identity: Some(3), revert: Some(4), remove_kms: Some(5) };
+
+        assert_eq!(effective_acks(ALL_ACKS, 6, &gens), ALL_ACKS);
+        let partial = effective_acks(ALL_ACKS, 4, &gens);
+        assert_eq!(
+            partial,
+            Acknowledgements { kms_config_applied: true, plaintext_removed: true, kms_reverted: false, kms_removed: false }
+        );
+    }
+
+    #[test]
+    fn flipping_a_preset_ack_after_publication_makes_it_count() {
+        let gens = PatchGenerations { enable_kms: Some(2), ..Default::default() };
+        let set = Acknowledgements { kms_config_applied: true, ..Default::default() };
+
+        // Generation 2: published while already true -> not effective.
+        assert!(!effective_acks(set, 2, &gens).kms_config_applied);
+        // Generation 3: flipped false -> not effective (the raw value is false).
+        assert!(!effective_acks(Acknowledgements::default(), 3, &gens).kms_config_applied);
+        // Generation 4: flipped back true -> effective.
+        assert!(effective_acks(set, 4, &gens).kms_config_applied);
+    }
+
+    #[test]
+    fn a_false_ack_is_never_made_effective() {
+        let gens = PatchGenerations { enable_kms: Some(1), remove_identity: Some(1), revert: Some(1), remove_kms: Some(1) };
+
+        assert_eq!(effective_acks(Acknowledgements::default(), 9, &gens), Acknowledgements::default());
     }
 }
