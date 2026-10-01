@@ -1,6 +1,6 @@
 # EtcdEncryption: adopt an existing KMS setup (observe, migrate, verify)
 
-Status: Draft, awaiting review
+Status: Implemented, NOT live-verified
 Date: 2026-10-01
 Supersedes: `2026-09-30-etcd-encryption-design.md` (the fresh-install flow shipped in v0.1.11)
 
@@ -71,6 +71,12 @@ spec:
     legacyProvidersRemoved: false   # you set true after removing the legacy providers
 ```
 
+- `status.phase` is read leniently: any value this version does not know (every
+  v0.1.11 phase, such as `AwaitingKmsConfig`), `null` or another shape becomes
+  `Observing`, so a leftover v0.1.11 object deserializes, its finalizer can be stripped,
+  and the phase is re-derived on the next reconcile. Serialization and the CRD schema
+  are unchanged. Other old status fields (`appliedResources`, `talosPatches`,
+  `patchGenerations`) are ignored; old `rewrite` (`u64` counters) still fits.
 - `kmsProviderName` is required: non-empty, no whitespace, no `:`. It is deserialized
   with a default of `""` and rejected at validation (`InvalidSpec`), so a CR left over
   from v0.1.11 (which has no such field) is reported instead of breaking the watcher.
@@ -100,7 +106,7 @@ status:
     secretsListed: 370
     reason: ""
   rewrite: {total: 0, rewritten: 0, failed: 0}     # all i64 (u64 emits a CRD format warning)
-  conditions: [Ready, Degraded]
+  conditions: [Ready]                              # Ready=True only when Verified
 ```
 
 All counters are `i64`.
@@ -143,7 +149,23 @@ The controller discovers the control-plane apiservers from the Nodes labelled
 client per node from the in-cluster config, with `cluster_url` overridden and the TLS
 server name set to `kubernetes.default.svc` (the apiserver's serving certificate
 probably does not list node IPs; this is unverified and a failure is simply "cannot
-verify" for that node). Per node, bounded by `timeout_at`:
+verify" for that node).
+
+Discovery must not silently miss an apiserver:
+
+- **No InternalIP:** a control-plane-labelled node without an `InternalIP` is kept
+  with an empty address and is `Unverifiable` ("node has no InternalIP") without any
+  network call.
+- **Endpoint cross-check:** after verifying the discovered nodes, the controller lists
+  the `default/kubernetes` EndpointSlices (label `kubernetes.io/service-name=kubernetes`)
+  and, for every endpoint address that matches no discovered node's address (compared
+  as IP addresses when both parse, so `fd00::11` equals `fd00:0:0:0:0:0:0:11`; string
+  equality otherwise), adds a synthetic node `endpoint <address>` that is `Unverifiable`
+  ("an apiserver registered in the kubernetes Endpoints is not a discovered
+  control-plane node"). A failure to list the EndpointSlices is an error, like a
+  discovery failure, never "nothing to check".
+
+Per node, bounded by `timeout_at`:
 
 1. **Readiness:** `GET /readyz?verbose`; record whether a `kms-providers` check is present and ok.
 2. **Writer check:** snapshot `apiserver_storage_transformation_operations_total`
@@ -152,27 +174,48 @@ verify" for that node). Per node, bounded by `timeout_at`:
    *writes* with: writer is the target only if the target prefix rose and no other
    top-level prefix did. A negative delta (counter reset by an apiserver restart
    mid-check) is "cannot verify".
-3. **Reader check:** snapshot, **list every Secret with a `limit`** (so the apiserver
-   reads from etcd, not its watch cache, and decrypts each object), snapshot. The
+3. **Reader check:** snapshot, **read every Secret from etcd**, snapshot. The Secret
+   names are paged with a `limit` (on Kubernetes >= 1.33 such a list may be served
+   from the watch cache, which decrypts nothing, so it supplies names only), then
+   each Secret is fetched with a **GET with no `resourceVersion`**, which the
+   apiserver's cacher serves from storage, so each Secret is decrypted under its
+   stored prefix. The object is dropped at once (never logged or returned). A 404
+   (deleted since listed) is skipped and not counted; any other GET error (including
+   a 500 from a decryption failure) makes the reader check fail (`reader_error`),
+   never clean. Each GET is bounded; the whole read is bounded at 15 minutes. The
    `from_storage` delta by top-level prefix is `readsByPrefix`. The check is
-   *complete* only if the deltas sum to at least the number of Secrets listed (every
+   *complete* only if the deltas sum to at least the number of Secrets read (every
    object was decrypted) — otherwise "cannot verify".
+4. **Restart detection:** every `/metrics` snapshot also records the
+   `process_start_time_seconds` gauge. The two writer snapshots must carry the same,
+   present value, else the writer is "cannot verify" ("the apiserver restarted (or
+   exposes no process_start_time_seconds) during the check"); the two reader
+   snapshots must too, **and** must equal the writer's, else the reader check fails.
+   This catches a restart whose counters only rose after it (a negative delta alone
+   would miss it).
 
 Concurrent readers only inflate deltas, so the check can wrongly look *worse*
 (extra legacy reads) but not wrongly *clean*: zero legacy reads with a complete count
 is the proof.
 
 **Residual risk:** The completeness check compares the sum of decrypts against the number
-of Secrets listed; ambient Secret reads by other clients on the same apiserver during
+of Secrets read; ambient Secret reads by other clients on the same apiserver during
 the observation window can inflate the decryption count. The check is evidence, not proof.
-However, the per-node list uses `limit` with no `resourceVersion`, which the apiserver
-delegates to etcd, so the list itself decrypts every object directly from etcd (not the
-watch cache). The runbook must confirm this on a quiet cluster (verify that a limit-paged
-list of all Secrets raises `from_storage` by at least the number listed) and direct the
-operator to confirm with an etcd snapshot that the legacy provider can be dropped before
-removing it from the EncryptionConfiguration.
+However, the reader does not rely on a list: it GETs each Secret with no
+`resourceVersion`, which the apiserver serves from etcd, so every Secret is itself
+decrypted under its stored prefix and a legacy-stored Secret always adds a legacy read
+(ambient reads can only add, never mask one). That an uncached GET bypasses the watch
+cache is from the apiserver's cacher code and is unverified live. The runbook must
+confirm it on a quiet cluster, per apiserver (per-Secret GETs raise `from_storage` by at
+least the number read), and direct the operator to confirm with an etcd snapshot that
+the legacy provider can be dropped before removing it from the EncryptionConfiguration.
 
-The reader check lists all Secrets on every control-plane node each time it runs. It
+**Scope:** the evidence covers Secrets only. The `ReadyToRemoveLegacy`/`Verified`
+reasons say "no SECRET is stored under a legacy provider"; the runbook's removal gate
+makes the operator check that no other resource in the EncryptionConfiguration uses
+the legacy provider.
+
+The reader check GETs every Secret on every control-plane node each time it runs. It
 is the expensive step, so a steady-state reconcile (`ReadyToRemoveLegacy`, `Verified`,
 `NotConfigured`) requeues every 10 minutes and an active one (`Observing`,
 `Migrating`) every 30 seconds.
@@ -196,7 +239,10 @@ is written to `status.rewrite` per page. A restart simply repeats the pass.
   a probe error to a "safe" or "Verified" result.
 - Validation failures are a `Ready=False` condition with a reason (no `Failed` phase).
 - Standby replicas gate on the leader flag like every other component and never
-  write status.
+  write status; leadership is re-checked before every status write (a reconcile can
+  outlive its leadership).
+- A CR being deleted gets no probes, status write or rewrite: after the one-time
+  finalizer strip the reconcile stops.
 - Every networked call uses `tokio::time::timeout_at`.
 
 ### No finalizer; migrating the v0.1.11 object
@@ -220,7 +266,8 @@ untouched and keep their finalizers.
   one-time finalizer strip), `main.rs` (run the controller without the finalizer
   wrapper), `deploy/crd.yaml`, the example, README section, runbook, spec, memory.
 - **RBAC ledger** (`docs/memory/rbac-cluster-admin-tradeoff.md`): drop `daemonsets`;
-  keep `get/list/update` on every Secret, add `list` on `nodes`, `get` on
+  keep `get/list/update` on every Secret, add `list` on `nodes`, `list` on
+  `endpointslices.discovery.k8s.io`, `get` on
   `nonResourceURLs: /metrics` and `/readyz`, and canary `create/patch/get/delete` on one
   Secret in `kube-system`.
 
@@ -232,7 +279,8 @@ untouched and keep their finalizers.
   writers and "deltas below the Secret count"), spec validation (including the
   empty-`kmsProviderName` leftover-CR case) and node-target derivation.
 - Orchestration against an in-memory fake of an `ApiserverProbe` trait (`readyz`,
-  `metrics`, `canary_write`, `list_all_secrets`, per node), covering every
+  `metrics`, `canary_write`, `list_all_secrets`, per node, and
+  `apiserver_endpoint_addresses`), covering every
   derivation outcome and that an erroring node never yields `ReadyToRemoveLegacy`.
 - The existing rewrite-loop tests stay.
 - The real per-node client, the TLS server-name override and the live metrics are
@@ -247,9 +295,9 @@ Settled only by the runbook on a real cluster:
    TLS server name when dialled at a node IP.
 2. The exact name and presence of the `kms-providers` readiness check on the
    Kubernetes version Talos ships (observed as `[+]kms-providers ok` on 2026-10-01).
-3. That a paginated list with `limit` and no `resourceVersion` reads from etcd rather
-   than the watch cache on that Kubernetes version (the completeness check on the
-   delta guards this: a cache-served list would sum to fewer decrypts than Secrets).
+3. That a GET with no `resourceVersion` reads from etcd rather than the watch cache on
+   that Kubernetes version (the completeness check on the delta guards this: cache-served
+   reads would sum to fewer decrypts than Secrets read).
 4. What `transformer_prefix` an identity (plaintext) read reports (not observed; the
    design treats the empty prefix as legacy).
 5. Whether a counter series is absent when its value is zero (the parser treats absent

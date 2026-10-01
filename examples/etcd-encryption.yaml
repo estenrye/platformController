@@ -11,8 +11,13 @@
 # EXPERIMENTAL: not yet verified against a live cluster. Not for clusters you
 # care about.
 #
-# If this cluster ran EtcdEncryption v0.1.11, delete the old object and apply this
-# one: the schema changed (provider, barbican and the acknowledgements were removed).
+# If this cluster ran EtcdEncryption v0.1.11 (the schema changed: provider,
+# barbican and the acknowledgements were removed), order matters: FIRST apply the
+# new CRD and roll the controller to the new image, THEN `kubectl delete etcdenc
+# default` (the new controller strips the v0.1.11 finalizer), then apply this
+# file. Deleting first, while the v0.1.11 controller runs, starts its revert
+# protocol. Then check for v0.1.11 leftovers (kube-system/barbican-kms DaemonSet,
+# its cloud-config Secret): runbook section 2.
 #
 #   kubectl apply -f examples/etcd-encryption.yaml
 #   kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}'

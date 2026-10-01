@@ -98,6 +98,26 @@ kubectl get etcdenc default
 Expected: the new controller removes the v0.1.11 finalizer
 (`platform.rye.ninja/cleanup`) and the object disappears (`NotFound`).
 
+Then check for v0.1.11 leftovers. Stripping the finalizer **skips** v0.1.11's
+own cleanup, so anything it created is still there:
+
+```sh
+kubectl -n kube-system get ds barbican-kms
+```
+
+Expected: `NotFound`. If it exists, it is the v0.1.11 KMS plugin DaemonSet. Its
+hostPath `/var/lib/kms/` is the **same socket directory your static pods use**.
+If your Talos static pods are the real plugin, remove the DaemonSet carefully
+(`kubectl -n kube-system delete ds barbican-kms`), then on **every**
+control-plane node re-check that KMS still works: `[+]kms-providers ok` in that
+node's `/readyz?verbose` (per node, see 5a Method 1) and the socket still
+present (`talosctl -n <cp> ls /var/lib/kms/`, expected `kms.sock`). Do not
+delete it if it is the only thing serving the socket.
+
+Also find the cloud-config Secret you created for v0.1.11's plugin (the one its
+`spec.barbican.cloudConfigSecretRef` named). It holds OpenStack credentials.
+Leave it or remove it **deliberately**; this controller never touches it.
+
 Why this order: if the v0.1.11 controller is still running when you delete the
 object, deletion starts its multi-step revert protocol (it tries to publish
 revert patches and may re-apply or remove the plugin DaemonSet). Without any
@@ -134,14 +154,20 @@ an unsupported `platformKind` or a name other than `default` is reason
 
 Per node (`status.nodes[]`):
 
-- `name`, `address`: the Node and its `InternalIP`.
+- `name`, `address`: the Node and its `InternalIP`. A control-plane node with
+  no `InternalIP` is listed with an empty `address` and reason `node has no
+  InternalIP` (never verified). An entry named `endpoint <address>` is an
+  apiserver registered in the `default/kubernetes` EndpointSlice that matches no
+  discovered control-plane node: it was not checked, so it is never verified and
+  holds the phase at `Observing`.
 - `verified`: true only if the node writes with the target **and** its reader
   check was complete with zero legacy reads.
 - `writerPrefix`: the top-level prefix the node wrote the canary with; `null`
   if it could not be determined.
-- `readsByPrefix`: what the node's apiserver decrypted while listing every
-  Secret, by top-level prefix.
-- `secretsListed`: how many Secrets that list returned.
+- `readsByPrefix`: what the node's apiserver decrypted while every Secret was
+  read through it (one uncached GET per Secret), by top-level prefix.
+- `secretsListed`: how many Secrets were read that way (a Secret deleted between
+  the name listing and its GET is not counted).
 - `reason`: empty when clean; otherwise why not.
 
 `status.legacyPrefixes` lists every top-level prefix other than the target that
@@ -169,9 +195,18 @@ Common reasons:
 - `mixed: some apiservers do not write with the target provider yet`: a rolling
   apiserver restart; wait. It never starts a rewrite.
 - `legacy objects remain; set rewrite: Enabled to migrate`.
+- `node has no InternalIP` / `an apiserver registered in the kubernetes
+  Endpoints is not a discovered control-plane node`: an apiserver the
+  controller could not check; give the node an `InternalIP` or the
+  `node-role.kubernetes.io/control-plane` label (or find out what that endpoint
+  address is). The phase stays `Observing`.
+- `the apiserver restarted (or exposes no process_start_time_seconds) during
+  the check`: the node's `process_start_time_seconds` changed (or was missing)
+  between snapshots; it retries on the next reconcile.
 - `cannot verify reads on every apiserver; not rewriting` / `cannot verify
-  reads: ...`: a node's list was not provably complete (fewer objects were
-  decrypted than listed) or errored. The controller deliberately does not
+  reads: ...`: a node's reads were not provably complete (fewer objects were
+  decrypted than read) or a GET errored (for example a 500 because a Secret
+  could not be decrypted). The controller deliberately does not
   rewrite on an unconfirmable read, because it would repeat full rewrites
   every 30 s without ever being able to confirm.
 
@@ -190,7 +225,14 @@ Expected: a timestamp within roughly the last 30 seconds (phases `Observing`,
 `Migrating`) or 10 minutes (`NotConfigured`, `ReadyToRemoveLegacy`,
 `Verified`), plus the duration of a full reconcile. An older timestamp means
 the controller is not verifying (not running, not the leader, or crash-looping):
-treat the phase as **stale** and do not act on it. Check
+treat the phase as **stale** and do not act on it.
+
+A recent timestamp is not enough before removing a provider. The timestamp is
+written when a reconcile **completes** (after every node was verified), so for
+the section 5 gate you need a `lastTransitionTime` **later than the moment you
+took the 5b snapshot** (record `date -u +%FT%TZ` when you take it), with the
+phase still `ReadyToRemoveLegacy`: a reconcile that completed after the
+snapshot, not merely a recent one. Check
 `kubectl -n platform-system logs deploy/platform-controller` and the Lease
 holder.
 
@@ -233,68 +275,78 @@ whatever rejects the update) so the controller's next pass succeeds, or, once
 you have confirmed you can recreate it, back it up first
 (`kubectl get secret <name> -n <ns> -o yaml > backup.yaml`, and store the file
 securely: it holds the Secret's data) and then delete and recreate that Secret
-deliberately. Setting `rewrite: Disabled` stops the repeating passes.
+deliberately. Setting `rewrite: Disabled` stops the **next** pass; a pass
+already in flight runs to the end of its pages first.
 
 ## 5. Remove the legacy provider (your change)
 
 **HARD GATE. Do NOT remove any legacy provider unless ALL of these hold:**
 
 1. `status.phase` is `ReadyToRemoveLegacy`;
-2. the `Ready` condition's `lastTransitionTime` is recent (section 3,
-   "Staleness"; a stale timestamp means the controller is not verifying);
+2. the `Ready` condition's `lastTransitionTime` is **later than your 5b
+   snapshot** (section 3, "Staleness": a reconcile completed after the
+   snapshot and still derived `ReadyToRemoveLegacy`);
 3. the 5a quiet-cluster check below passed;
-4. the 5b etcd snapshot confirmation below passed.
+4. the 5b etcd snapshot confirmation below passed;
+5. your EncryptionConfiguration's `resources:` list encrypts **only `secrets`**
+   with the legacy provider. Inspect it (on Talos, the
+   `KubeEtcdEncryptionConfig` / the apiserver's encryption config): if any other
+   resource (for example `configmaps`) is encrypted with the legacy provider,
+   removing that provider locks those objects out. **This controller checks
+   Secrets only**; its "no SECRET is stored under a legacy provider" says
+   nothing about other resources.
 
 `Observing`, `Migrating`, `NotConfigured` and a stale timestamp all mean **NO**.
 The controller does not remove the provider; you do, after the gate.
 
 ### 5a. Confirm the reader check on a quiet cluster
 
-The reader check lists every Secret with a `limit` and no `resourceVersion`,
-so the apiserver reads from etcd (not its watch cache) and decrypts every
-object, and counts `from_storage` per prefix. The check is evidence, not
-proof: ambient reads by other clients can inflate the counts. Confirm the
-assumption on a quiet cluster (or by reading the counters twice around a list)
-and **per apiserver**.
+The reader check, per apiserver, pages through the Secret **names** with a
+`limit` (on Kubernetes >= 1.33 such a list may be served from the apiserver's
+watch cache, which decrypts nothing, so it is used for the names only), then
+**GETs every Secret one by one with no `resourceVersion`**. A GET with no
+`resourceVersion` is served from etcd, so the apiserver decrypts every Secret
+under its stored prefix, and the controller counts `from_storage` per prefix
+around those GETs. The check is complete only if the counts sum to at least the
+number of Secrets read. That such a GET bypasses the watch cache comes from
+reading the apiserver's cacher code and is **unverified on a live cluster**;
+this step is what confirms it. Ambient reads by other clients can only inflate
+the counts (and legacy counts only add), so confirm on a quiet cluster and
+**per apiserver**.
 
-`kubectl get --raw /metrics` goes through the load balancer, so before and after
-can come from different apiservers and prove nothing. Two ways to be per-node
-(commands unverified):
-
-Method 1: query the node's apiserver directly with a service-account token
-(the controller's own service account already may read `/metrics`):
+Both the metrics and the GETs must hit the **same** apiserver.
+`kubectl get --raw /metrics` and `kubectl get secret` go through the load
+balancer, so they can land on different apiservers and prove nothing per node.
+Query the node's apiserver directly with a service-account token (the
+controller's own service account already may read `/metrics` and Secrets;
+commands unverified):
 
 ```sh
 TOKEN=$(kubectl -n platform-system create token platform-controller)
-# from a throwaway pod (or `kubectl debug node/<cp>` / a host with a route to the node):
-kubectl run metrics-probe --rm -i --restart=Never --image=curlimages/curl --command -- \
-  curl -sk -H "Authorization: Bearer $TOKEN" https://<node-ip>:6443/metrics
-```
-
-Method 2: stay with `kubectl get --raw /metrics` and repeat the before/list/after
-cycle until both snapshots demonstrably come from the same apiserver process:
-`process_start_time_seconds` is unique per apiserver process, so it must be
-identical in the two snapshots.
-
-Per node, a before/list/after cycle (shown with `kubectl get --raw`; substitute
-the Method 1 curl for a specific node):
-
-```sh
-snap() { kubectl get --raw /metrics > "$1"; }
+SECRETS=$(kubectl get secrets -A --chunk-size=100 --no-headers -o custom-columns=NS:.metadata.namespace,N:.metadata.name)
+# from a host (or debug pod with curl) that routes to the node IP:
+NODE=<node-ip>
+api() { curl -sk -H "Authorization: Bearer $TOKEN" "https://$NODE:6443$1"; }
 sum() { grep 'apiserver_storage_transformation_operations_total' "$1" | grep 'resource="secrets"' | grep 'transformation_type="from_storage"' | grep 'transformer_prefix="k8s:enc:' | awk '{s+=$NF} END{print s+0}'; }
-SECRETS=$(kubectl get secrets -A --no-headers | wc -l)
-snap before.txt
-kubectl get secrets -A --chunk-size=100 -o name > /dev/null
-snap after.txt
+api /metrics > before.txt
+READ=0
+while read -r ns n; do
+  code=$(curl -sk -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "https://$NODE:6443/api/v1/namespaces/$ns/secrets/$n")
+  [ "$code" = 200 ] && READ=$((READ + 1))
+done <<< "$SECRETS"
+api /metrics > after.txt
 grep '^process_start_time_seconds' before.txt after.txt   # must match
-echo "decrypted: $(( $(sum after.txt) - $(sum before.txt) )), listed: $SECRETS"
+echo "decrypted: $(( $(sum after.txt) - $(sum before.txt) )), read: $READ"
 ```
 
-Expected: `decrypted` is **at least** `listed` (the sum covers the top-level
-`k8s:enc:` prefixes only, which also excludes the inner `key2:`). If it is less,
-the list was served from the watch cache, the controller's completeness check
-will report "cannot verify reads" for that node, and you must not rely on it.
-Repeat for every control-plane apiserver.
+Expected: the two `process_start_time_seconds` values are identical (otherwise
+the apiserver restarted; repeat), and `decrypted` is **at least** `read` (the
+sum covers the top-level `k8s:enc:` prefixes only, which also excludes the
+inner `key2:`). The GETs return the Secrets' data to `/dev/null`; do not change
+that to a file. If `decrypted` is less than `read`, the GETs were not served
+from etcd: the controller's completeness check will report "cannot verify
+reads" for that node, and you must not rely on it. Record it as finding (c).
+Repeat for **every** control-plane apiserver.
 
 ### 5b. Confirm with an etcd snapshot (unverified command)
 
@@ -360,13 +412,23 @@ first and why you keep the snapshot from section 1.
 
   Expected: a SAN list. The status says "cannot verify" for that node and never
   claims safe; the controller has no workaround until this is fixed in code.
+- **`node has no InternalIP`** or an **`endpoint <address>`** entry: an
+  apiserver the controller did not check. The controller cross-checks the
+  addresses in the `default/kubernetes` EndpointSlice (it needs `list` on
+  `endpointslices.discovery.k8s.io`); every address must belong to a
+  control-plane-labelled Node with that `InternalIP`. Compare
+  `kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o wide`
+  with the node list below.
 - **A node `Unverifiable` / timeout**: reachability. The controller pod must
   reach `https://<InternalIP>:6443` of every Node labelled
   `node-role.kubernetes.io/control-plane` (NetworkPolicy, firewall). Check
   `kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide`. A
   discovery failure shows as `Ready=False` reason `VerificationFailed`.
-- **Counters "went backwards"**: an apiserver restarted mid-check; the node is
-  unverifiable for that run and it retries on the next reconcile.
+- **Counters "went backwards"** or **"the apiserver restarted"**: an apiserver
+  restarted mid-check (its counters dropped, or its `process_start_time_seconds`
+  changed between snapshots, or it exposes none); the node is not verified for
+  that run and it retries on the next reconcile. If it never clears, check that
+  the node's `/metrics` contains a `process_start_time_seconds` line.
 - **`the canary write was not counted by any provider`**: the canary write did
   not raise any `to_storage` counter; check the metrics name/labels (finding e).
 - **Phase looks old**: see "Staleness" in section 3.
@@ -379,8 +441,9 @@ The spec's open items, settled only by running this:
   `kubernetes.default.svc` work?
 - (b) Is the `kms-providers` readiness line named exactly so on this Talos /
   Kubernetes version (observed as `[+]kms-providers ok` on 2026-10-01)?
-- (c) Did the limit-paged list read from etcd (section 5a; the reader check's
-  completeness guards this: note any node reported incomplete)?
+- (c) Did the per-Secret GETs with no `resourceVersion` read from etcd
+  (section 5a; the reader check's completeness guards this: note any node
+  reported incomplete)?
 - (d) What `transformer_prefix` do plaintext/identity reads report (create an
   unencrypted object only on a throwaway cluster)?
 - (e) Is a zero-value counter series absent (the parser treats absent as 0)?
@@ -392,9 +455,11 @@ tests if any differ.
 
 - No plugin installation, no Talos patches, no key management: you own the KMS
   plugin, the key and the EncryptionConfiguration.
-- The reader check lists **all** Secrets on **every** control-plane node on each
-  run (steady state every 10 minutes, active phases every 30 s), which is not
-  cheap on a large cluster.
+- The reader check GETs **every** Secret, one request each, on **every**
+  control-plane node on each run (steady state every 10 minutes, active phases
+  every 30 s), which is not cheap on a large cluster (each node's read is
+  bounded at 15 minutes).
 - The apiserver port is fixed at 6443.
 - The reader check is evidence, not proof; confirm with an etcd snapshot (5b).
-- Only Secrets are covered.
+- Only Secrets are covered: a legacy provider that also encrypts other
+  resources (see the section 5 gate) is not checked.
