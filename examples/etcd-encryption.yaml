@@ -1,60 +1,35 @@
-# Sample EtcdEncryption for a self-hosted Talos Linux cluster on OpenStack:
-# installs the Barbican KMS plugin, re-encrypts every Secret through KMS, and
-# walks the cluster to "no plaintext Secrets in etcd".
+# Sample EtcdEncryption for a Talos Linux cluster whose apiserver already uses a
+# KMS provider (for example the Barbican plugin run as Talos static pods).
 #
-# EXPERIMENTAL, NOT LIVE-VERIFIED. DO NOT USE ON A CLUSTER YOU CARE ABOUT.
+# This controller does NOT install the KMS plugin, enable KMS, or edit your
+# apiserver's EncryptionConfiguration. It observes each control-plane apiserver,
+# can rewrite every Secret through the target provider, and proves per apiserver
+# that nothing is left under a legacy provider (e.g. Talos's default secretbox)
+# before telling you it is safe to remove it. See
+# docs/runbooks/etcd-encryption-verification.md.
 #
-# EXISTING ENCRYPTION IS NOT DETECTED: Talos's default `talosctl gen config`
-# already encrypts Secrets with secretbox (cluster.secretboxEncryptionSecret).
-# Every generated patch replaces the provider list; splice that provider into
-# each patch as a read fallback (the comment atop each patch says where), or
-# every existing Secret becomes unreadable. Key rotation (or changing
-# cloudConfigSecretRef / the key-id once rewriting started) is unsupported.
-# Deleting is multi-step: see "6. Delete protocol" in the runbook below.
+# EXPERIMENTAL: not yet verified against a live cluster. Not for clusters you
+# care about.
 #
-# The controller cannot change the apiserver's configuration (on Talos that
-# lives in the machine config, applied through the Talos API, which this
-# controller never touches). So this is a protocol: the controller publishes
-# the exact Talos patches in .status.talosPatches, you apply them, and you
-# acknowledge each step below. Full walk-through, including how to verify:
-# docs/runbooks/etcd-encryption-verification.md
-#
-# BEFORE applying this:
-#
-# 1. Create a 256-bit AES key in Barbican and put its id in cloud.conf under
-#    [KeyManager] key-id (see
-#    https://github.com/kubernetes/cloud-provider-openstack/blob/master/docs/barbican-kms-plugin/using-barbican-kms-plugin.md).
-#    The controller never creates, rotates or deletes keys. LOSING THIS KEY
-#    MAKES EVERY SECRET IN THE CLUSTER UNREADABLE.
-#
-# 2. Create the credentials Secret in kube-system. The key MUST be `cloud.conf`:
-#
-#      kubectl -n kube-system create secret generic barbican-kms-cloud-config \
-#        --from-file=cloud.conf=./cloud.conf
-#
-# Then:
+# If this cluster ran EtcdEncryption v0.1.11, delete the old object and apply this
+# one: the schema changed (provider, barbican and the acknowledgements were removed).
 #
 #   kubectl apply -f examples/etcd-encryption.yaml
 #   kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}'
-#
-# Leave every acknowledgement false until the status asks for it. An
-# acknowledgement only counts if set AFTER its patch appeared in
-# .status.talosPatches; if one was already true, flip it false then true.
 apiVersion: platform.rye.ninja/v1alpha1
 kind: EtcdEncryption
 metadata:
   name: default
 spec:
   platformKind: talos-linux
-  provider: barbican
-  barbican:
-    # The plugin image, pinned. Match the tag to your Kubernetes/OpenStack
-    # release; this controller does not choose one for you.
-    image: registry.k8s.io/provider-os/barbican-kms-plugin:v1.36.0
-    cloudConfigSecretRef:
-      name: barbican-kms-cloud-config
+  # The `name` of the kms entry in your apiserver's EncryptionConfiguration. The
+  # target storage prefix is k8s:enc:kms:v2:<name>:.
+  kmsProviderName: barbican
+  # Disabled (default) only observes. Set Enabled to let the controller rewrite
+  # every Secret, once every apiserver writes with the target provider.
+  rewrite: Disabled
   acknowledgements:
-    kmsConfigApplied: false   # true once talosPatches.enableKms is applied
-    plaintextRemoved: false   # true once talosPatches.removeIdentity is applied
-    kmsReverted: false        # deletion only: talosPatches.revert applied
-    kmsRemoved: false         # deletion only: talosPatches.removeKms applied
+    # Set true after you remove the legacy providers (e.g. secretbox) from the
+    # apiserver's EncryptionConfiguration. Metrics cannot prove this; it is your
+    # statement, and Verified means "the probes agree and you acknowledged it".
+    legacyProvidersRemoved: false
