@@ -25,3 +25,4 @@ pub mod snapshot_controller_reconciler;
 pub mod reconciler;
 pub mod spec_validation;
 pub mod secret_rewrite;
+pub mod encryption_probe;

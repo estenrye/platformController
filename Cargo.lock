@@ -1261,6 +1261,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "schemars",
