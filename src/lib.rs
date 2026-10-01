@@ -10,6 +10,7 @@ pub mod calico;
 pub mod cidr;
 pub mod crd;
 pub mod crds;
+pub mod etcd_encryption;
 pub mod helm;
 pub mod leader;
 pub mod ledger;

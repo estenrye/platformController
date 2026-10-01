@@ -10,6 +10,7 @@ kubectl wait --for=condition=established --timeout=60s crd/cloudcontrollermanage
 kubectl wait --for=condition=established --timeout=60s crd/csidrivers.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/certmanagerinstallations.platform.rye.ninja
 kubectl wait --for=condition=established --timeout=60s crd/snapshotcontrollers.platform.rye.ninja
+kubectl wait --for=condition=established --timeout=60s crd/etcdencryptions.platform.rye.ninja
 kubectl apply -f deploy/bootstrap.yaml
 kubectl apply -f examples/cni-installation.yaml
 ```

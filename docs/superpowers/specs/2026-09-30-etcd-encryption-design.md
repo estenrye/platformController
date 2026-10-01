@@ -75,11 +75,11 @@ spec:
     image: registry.k8s.io/provider-os/barbican-kms-plugin:<tag>  # required, pinned, no default
     cloudConfigSecretRef:
       name: barbican-kms-cloud-config   # required; Secret in kube-system, key cloud.conf
-    keyId: <barbican-key-uuid>          # required; a 256-bit AES key you created
   acknowledgements:
     kmsConfigApplied: false   # set true after applying Talos patch 1
     plaintextRemoved: false   # set true after applying Talos patch 2
     kmsReverted: false        # set true after applying the revert patch (deletion only)
+    kmsRemoved: false         # set true after applying the remove-kms patch (deletion only)
 ```
 
 - `image` is pinned explicitly with no default, the same convention as every
@@ -88,12 +88,9 @@ spec:
   credentials plus the `[KeyManager] key-id` the plugin reads from
   `cloud.conf`. As with `CloudControllerManager`, the controller references the
   Secret by name only; it never reads its contents and nothing secret appears
-  in the CR or its status. `keyId` is on the spec because the controller needs
-  it to build the Talos patch's provider block and to give the operator a
-  checkable value; the plugin's own copy lives in `cloud.conf`. (Barbican's
-  KMS v2 provider name and socket do not embed the key ID; whether `keyId`
-  must also appear in `cloud.conf`, and how the two are reconciled, is
-  confirmed during live verification — see Open verification items.)
+  in the CR or its status. There is no `keyId` field: the plugin reads the key
+  only from `cloud.conf`'s `[KeyManager] key-id`, which the controller never
+  reads, so a copy on the CR could only contradict it.
 - Only one provider block may be set, and it must match `provider`; otherwise
   `phase: Failed` with `reason: InvalidSpec`, like the other components.
 - The three `acknowledgements` fields are the operator's explicit gates; they
@@ -156,6 +153,8 @@ phase backwards on its own and never un-acknowledges anything.
    the end state was verified, not just "manifests applied"; the status says
    what was verified and how (see Probes).
 
+Deletion adds three phases: `RevertingKms`, `Decrypting`, `AwaitingKmsRemoval`. There is no `Failed` phase: failures are a `Ready=False` condition with a reason, so the protocol position survives them.
+
 A probe going negative after a phase was reached sets a `Degraded` condition
 and a reason; it does not regress the phase or reset an acknowledgement.
 
@@ -185,12 +184,15 @@ The finalizer has two modes:
   or `AwaitingKmsConfig` with `kmsConfigApplied: false`): delete the
   DaemonSet and finish. Nothing depends on the plugin.
 - **After patch 1 is acknowledged** (any later phase): the CR stays
-  `Terminating`. The controller publishes `status.talosPatches.revert` (the
-  patch back to `identity`-only), rewrites all Secrets after the revert is
-  applied so no ciphertext is left that only the plugin can read, and removes
-  the DaemonSet only once `kmsReverted` is `true` and the probe confirms no
-  KMS provider is active. Removing the plugin earlier would leave the
-  apiserver unable to read Secrets.
+  `Terminating` and the controller walks three steps, never returning success
+  from the finalizer until the plugin is safe to remove. (1) `RevertingKms`:
+  publish `status.talosPatches.revert`, a patch listing `identity` **first**
+  and `kms` second, so new writes are plaintext while KMS can still read old
+  ciphertext; wait for `kmsReverted`. (2) `Decrypting`: rewrite every Secret;
+  then `AwaitingKmsRemoval`: publish `status.talosPatches.removeKms` (identity
+  only) and wait for `kmsRemoved` **and** a probe showing no KMS provider
+  active. (3) Remove the DaemonSet. Going straight to `identity`-only would
+  make every KMS-encrypted Secret unreadable.
 
 There is no force-delete in this slice.
 
@@ -241,7 +243,6 @@ live runbook must confirm before the slice is called verified:
    the `KubeEtcdEncryptionConfig` KMS provider block on the Talos version in
    use. The Talos reference page documents only a secretbox example; KMS
    specifics come from the guides listed in the original request.
-3. The Barbican plugin's image reference and tag, and how `keyId` and
-   `cloud.conf`'s `[KeyManager] key-id` relate (above).
+3. The Barbican plugin's image reference and tag.
 4. Whether any admission webhook or controller in a typical cluster rejects a
    no-op `update` of a Secret (affects the rewrite's failure accounting).
