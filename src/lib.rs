@@ -11,6 +11,7 @@ pub mod cidr;
 pub mod crd;
 pub mod crds;
 pub mod etcd_encryption;
+pub mod encryption_verdict;
 pub mod helm;
 pub mod leader;
 pub mod ledger;

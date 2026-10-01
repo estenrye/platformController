@@ -125,9 +125,12 @@ The derivation, over the per-node results below:
 4. **Every node's writer is the target provider:**
    - the reader check is complete on every node with **zero legacy reads** →
      `ReadyToRemoveLegacy`, or `Verified` if `legacyProvidersRemoved` is true;
-   - otherwise legacy objects remain (or the check is incomplete) → `Migrating`
-     if `rewrite: Enabled` (run one rewrite pass), else `Observing` with the message
-     "legacy objects remain; set `rewrite: Enabled` to migrate".
+   - otherwise, if at least one node's reader check is complete with legacy reads
+     and `rewrite: Enabled` → `Migrating` (run one rewrite pass); if the reader
+     check is incomplete or unverifiable on every node, never rewrite (it would
+     repeat full rewrites every 30 s while unable to confirm): `Observing` with
+     "cannot verify reads"; otherwise `Observing` with "legacy objects remain; set
+     `rewrite: Enabled` to migrate".
 
 `Verified` also requires the canary Secret to round-trip. It means "the probes agree
 and you acknowledged removal", and says it cannot prove the config no longer lists a
