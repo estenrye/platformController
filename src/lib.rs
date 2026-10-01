@@ -11,6 +11,8 @@ pub mod cidr;
 pub mod crd;
 pub mod crds;
 pub mod etcd_encryption;
+pub mod kms_provider;
+pub mod kms_barbican;
 pub mod helm;
 pub mod leader;
 pub mod ledger;
