@@ -84,10 +84,23 @@ pub struct RewriteProgress {
     pub failed: i64,
 }
 
+/// Reads `status.phase` leniently: a phase this version does not know (every
+/// v0.1.11 phase, such as `AwaitingKmsConfig`), `null`, or any other shape is
+/// `Observing`. A strict read would make a leftover v0.1.11 object
+/// undeserializable, the watcher would fail, and its finalizer would never be
+/// stripped. `Observing` claims nothing; the phase is re-derived every reconcile.
+fn lenient_phase<'de, D>(deserializer: D) -> Result<EncryptionPhase, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EtcdEncryptionStatus {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_phase")]
     pub phase: EncryptionPhase,
     #[serde(default)]
     pub observed_generation: i64,
@@ -192,6 +205,97 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// A whole object as v0.1.11 stored it: old spec, the v0.1.11 finalizer,
+    /// a pending deletion, and an old status carrying `phase`.
+    fn v0_1_11_object(phase: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "EtcdEncryption",
+            "metadata": {
+                "name": "default",
+                "uid": "0b5d6c1e-0000-4000-8000-000000000001",
+                "resourceVersion": "12345",
+                "generation": 4,
+                "creationTimestamp": "2026-09-01T00:00:00Z",
+                "deletionTimestamp": "2026-10-01T00:00:00Z",
+                "deletionGracePeriodSeconds": 0,
+                "finalizers": ["platform.rye.ninja/cleanup"]
+            },
+            "spec": {
+                "platformKind": "talos-linux",
+                "provider": "barbican",
+                "barbican": { "image": "registry.example/barbican-kms:1.0", "cloudConfigSecretRef": { "name": "cloud-config" } },
+                "acknowledgements": {
+                    "kmsConfigApplied": true,
+                    "plaintextRemoved": false,
+                    "kmsReverted": false,
+                    "kmsRemoved": false
+                }
+            },
+            "status": {
+                "phase": phase,
+                "observedGeneration": 4,
+                "appliedResources": [
+                    { "apiVersion": "apps/v1", "kind": "DaemonSet", "namespace": "kube-system", "name": "barbican-kms" }
+                ],
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "AwaitingKmsConfig",
+                    "message": "apply the Talos patch",
+                    "lastTransitionTime": "2026-09-01T00:00:00Z",
+                    "observedGeneration": 4
+                }],
+                "talosPatches": { "enableKms": "machine: {}", "removeIdentity": null, "revert": null, "removeKms": null },
+                "patchGenerations": { "enableKms": 2, "removeIdentity": null, "revert": null, "removeKms": null },
+                "rewrite": { "total": 12, "rewritten": 11, "failed": 1 }
+            }
+        })
+    }
+
+    #[test]
+    fn a_whole_v0_1_11_object_deserializes_with_every_old_phase() {
+        // Final review C1: an unknown old phase must not break the watcher,
+        // or the v0.1.11 finalizer is never stripped and the delete hangs.
+        for phase in [
+            "Pending",
+            "InstallingPlugin",
+            "AwaitingKmsConfig",
+            "Rewriting",
+            "AwaitingPlaintextRemoval",
+            "Encrypted",
+            "RevertingKms",
+            "Decrypting",
+            "AwaitingKmsRemoval",
+        ] {
+            let obj: EtcdEncryption = serde_json::from_value(v0_1_11_object(phase))
+                .unwrap_or_else(|e| panic!("v0.1.11 object with phase {phase} must deserialize: {e}"));
+
+            let status = obj.status.as_ref().expect("status kept");
+            assert_eq!(status.phase, EncryptionPhase::Observing, "{phase}");
+            assert_eq!(status.rewrite, RewriteProgress { total: 12, rewritten: 11, failed: 1 });
+            assert_eq!(validate_etcd_encryption(&obj.spec), Err(EtcdEncryptionSpecError::EmptyKmsProviderName));
+            assert!(obj.metadata.deletion_timestamp.is_some());
+            assert_eq!(
+                crate::etcd_encryption_reconciler::strip_finalizer(obj.metadata.finalizers.as_deref().unwrap_or(&[])),
+                Some(vec![]),
+                "{phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_phases_still_deserialize_and_a_null_phase_is_observing() {
+        for phase in ["Observing", "NotConfigured", "Migrating", "ReadyToRemoveLegacy", "Verified"] {
+            let status: EtcdEncryptionStatus = serde_json::from_value(serde_json::json!({ "phase": phase })).unwrap();
+            assert_eq!(serde_json::to_value(status.phase).unwrap(), phase);
+        }
+        let status: EtcdEncryptionStatus = serde_json::from_value(serde_json::json!({ "phase": null })).unwrap();
+        assert_eq!(status.phase, EncryptionPhase::Observing);
+        let status: EtcdEncryptionStatus = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(status.phase, EncryptionPhase::Observing);
     }
 
     #[test]
