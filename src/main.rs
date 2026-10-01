@@ -8,6 +8,8 @@ use platform_controller::cloud_controller_manager::CloudControllerManager;
 use platform_controller::crd::CniInstallation;
 use platform_controller::csi_driver::CsiDriver;
 use platform_controller::csi_reconciler;
+use platform_controller::etcd_encryption::EtcdEncryption;
+use platform_controller::etcd_encryption_reconciler;
 use platform_controller::leader;
 use platform_controller::pull_through_cache::PullThroughCache;
 use platform_controller::reconciler::{error_policy, reconcile_with_finalizer, Context};
@@ -227,12 +229,41 @@ async fn main() -> anyhow::Result<()> {
         .run(
             snapshot_controller_reconciler::reconcile_with_finalizer,
             snapshot_controller_reconciler::error_policy,
-            context,
+            context.clone(),
         )
         .for_each(|result| async move {
             match result {
                 Ok(action) => tracing::debug!(?action, "reconciled snapshot controller"),
                 Err(err) => tracing::error!(error = %err, "snapshot controller reconcile failed"),
+            }
+        });
+
+    // The etcd-encryption component gets its own watcher, store and
+    // Controller too, with the same predicate filter and the same Context
+    // (one leader lease).
+    let etcd_encryption_api: Api<EtcdEncryption> = Api::all(client.clone());
+    let (etcd_encryption_reader, etcd_encryption_writer) = reflector::store();
+    let etcd_encryptions = watcher(etcd_encryption_api, watcher::Config::default())
+        .default_backoff()
+        .reflect(etcd_encryption_writer)
+        .applied_objects()
+        .predicate_filter(
+            predicates::generation
+                .combine(deletion_requested)
+                .combine(predicates::finalizers),
+            Default::default(),
+        );
+
+    let etcd_encryption_controller = Controller::for_stream(etcd_encryptions, etcd_encryption_reader)
+        .run(
+            etcd_encryption_reconciler::reconcile_with_finalizer,
+            etcd_encryption_reconciler::error_policy,
+            context,
+        )
+        .for_each(|result| async move {
+            match result {
+                Ok(action) => tracing::debug!(?action, "reconciled etcd encryption"),
+                Err(err) => tracing::error!(error = %err, "etcd encryption reconcile failed"),
             }
         });
 
@@ -245,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
         _ = csi_controller => {}
         _ = cert_manager_controller => {}
         _ = snapshot_controller_controller => {}
+        _ = etcd_encryption_controller => {}
         // `leader::run` loops forever, so this branch only resolves if it
         // panicked. Exit non-zero and let Kubernetes restart the pod rather than
         // limp on with a permanently stale `is_leader` flag.
@@ -416,5 +448,29 @@ mod tests {
         .expect("installation should deserialize");
 
         assert_eq!(deletion_requested(&installation), Some(1));
+    }
+
+    #[test]
+    fn deletion_requested_works_for_the_etcd_encryption_kind_too() {
+        let mut object: EtcdEncryption = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.rye.ninja/v1alpha1",
+            "kind": "EtcdEncryption",
+            "metadata": { "name": "default" },
+            "spec": {
+                "platformKind": "talos-linux",
+                "provider": "barbican",
+                "barbican": { "image": "img:1", "cloudConfigSecretRef": { "name": "cc" } }
+            }
+        }))
+        .expect("EtcdEncryption should deserialize");
+
+        assert_eq!(deletion_requested(&object), None);
+
+        object.metadata.deletion_timestamp = Some(
+            serde_json::from_value(serde_json::json!("2026-09-30T00:00:00Z"))
+                .expect("timestamp should deserialize"),
+        );
+
+        assert_eq!(deletion_requested(&object), Some(1));
     }
 }
