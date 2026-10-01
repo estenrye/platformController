@@ -97,7 +97,7 @@ spec:
                     app: platform-controller
       containers:
         - name: platform-controller
-          image: estenrye/platform-controller:0.1.10
+          image: estenrye/platform-controller:0.1.12
           imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG
