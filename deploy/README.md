@@ -258,3 +258,9 @@ that uses it. **Switching an existing cluster** from `cidrs` to
 `kubernetesInternalIP` changes each node's address in Calico: `calico-node`
 restarts and BGP sessions re-establish from the new addresses, so make sure your
 BGP peers accept them first.
+
+## etcd Secret encryption (optional)
+
+`examples/etcd-encryption.yaml` is an `EtcdEncryption` that encrypts every Secret at rest through an external KMS (OpenStack Barbican today). Unlike the other components it is a **protocol**: on Talos the apiserver's encryption config is part of the machine config, applied through the Talos API, which this controller never uses. The controller installs the KMS plugin, publishes each Talos patch in `.status.talosPatches`, re-encrypts every Secret, and verifies the result; you apply each patch with `talosctl` and acknowledge it in `spec.acknowledgements`. See `docs/runbooks/etcd-encryption-verification.md` for the full walk-through.
+
+**You create and own the KMS key; losing it makes every Secret in the cluster unreadable.** Deleting the resource after the first patch is applied is also a multi-step process (it must re-save every Secret as plaintext before the plugin can go), so it stays `Terminating` until you acknowledge each step.
