@@ -1,7 +1,11 @@
+use crate::apiserver_probe::{delete_canary, ApiserverProbe, KubeApiserverProbe};
 use crate::crd::{Condition, PlatformKind};
+use crate::encryption_verdict::{all_clean, derive, Derivation};
 use crate::etcd_encryption::{
-    EncryptionPhase, EtcdEncryption, EtcdEncryptionSpec, EtcdEncryptionSpecError, EtcdEncryptionStatus,
+    target_prefix, EncryptionPhase, EtcdEncryption, EtcdEncryptionSpec, EtcdEncryptionSpecError,
+    EtcdEncryptionStatus, RewriteMode, RewriteProgress,
 };
+use crate::secret_rewrite::{rewrite_page, KubeSecretStore};
 use crate::reconciler::{leader_gate, Context, SINGLETON_NAME};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
@@ -105,6 +109,65 @@ pub async fn write_status(
     Ok(())
 }
 
+/// Active phases are re-checked quickly; settled ones slowly (the reader check
+/// lists every Secret on every control-plane apiserver, so it is not cheap).
+pub fn requeue_for(phase: EncryptionPhase) -> Duration {
+    match phase {
+        EncryptionPhase::Observing | EncryptionPhase::Migrating => Duration::from_secs(30),
+        EncryptionPhase::NotConfigured | EncryptionPhase::ReadyToRemoveLegacy | EncryptionPhase::Verified => {
+            Duration::from_secs(600)
+        }
+    }
+}
+
+/// `Ready` is true only when the cluster is `Verified`.
+pub fn ready_condition_for(derivation: &Derivation, generation: Option<i64>) -> Condition {
+    condition(
+        "Ready",
+        derivation.phase == EncryptionPhase::Verified,
+        &format!("{:?}", derivation.phase),
+        &derivation.reason,
+        generation,
+    )
+}
+
+/// The rewrite runs only when the derivation says so for the `Migrating` phase
+/// AND the spec enables it. `derive` already requires both; this is the second lock.
+pub fn should_run_rewrite(spec: &EtcdEncryptionSpec, derivation: &Derivation) -> bool {
+    derivation.run_rewrite
+        && derivation.phase == EncryptionPhase::Migrating
+        && spec.rewrite == RewriteMode::Enabled
+}
+
+/// Rewrites every Secret, writing progress to status after each page. Failures
+/// are reported by namespace/name only, never by data.
+async fn run_rewrite(
+    api: &Api<EtcdEncryption>,
+    name: &str,
+    store: &KubeSecretStore,
+    status: &mut EtcdEncryptionStatus,
+) -> Result<(), EtcdEncryptionReconcileError> {
+    let mut progress = RewriteProgress::default();
+    let mut token: Option<String> = None;
+    loop {
+        let page = rewrite_page(store, token.as_deref())
+            .await
+            .map_err(|err| EtcdEncryptionReconcileError::Verification(err.to_string()))?;
+        progress.total += page.seen as i64;
+        progress.rewritten += page.rewritten as i64;
+        progress.failed += page.failed.len() as i64;
+        for key in &page.failed {
+            tracing::warn!(namespace = %key.namespace, secret = %key.name, "failed to rewrite secret");
+        }
+        status.rewrite = progress.clone();
+        write_status(api, name, status).await?;
+        match page.next {
+            Some(next) => token = Some(next),
+            None => return Ok(()),
+        }
+    }
+}
+
 pub async fn reconcile(
     obj: Arc<EtcdEncryption>,
     ctx: Arc<Context>,
@@ -139,16 +202,60 @@ pub async fn reconcile(
         return Err(EtcdEncryptionReconcileError::Validation(err));
     }
 
-    status.phase = EncryptionPhase::Observing;
-    status.conditions = vec![condition(
-        "Ready",
-        false,
-        "Observing",
-        "spec is valid; apiserver verification is not wired up yet",
-        generation,
-    )];
+    let target = target_prefix(&obj.spec.kms_provider_name);
+    let probe = KubeApiserverProbe::new(ctx.client.clone())
+        .map_err(|err| EtcdEncryptionReconcileError::Verification(err.to_string()))?;
+
+    // Verify every control-plane apiserver. A discovery error is an error, never "no nodes".
+    let evidence = match crate::encryption_verify::verify_cluster(&probe, &target).await {
+        Ok(evidence) => evidence,
+        Err(err) => {
+            status.conditions = vec![condition(
+                "Ready",
+                false,
+                "Observing",
+                &format!("cannot discover or verify the control-plane apiservers: {err}"),
+                generation,
+            )];
+            status.phase = EncryptionPhase::Observing;
+            write_status(&api, &name, &status).await?;
+            return Ok(Action::requeue(requeue_for(EncryptionPhase::Observing)));
+        }
+    };
+
+    // The canary round trip is only worth doing when everything else is clean.
+    let canary_ok = if all_clean(&evidence, &target) && obj.spec.acknowledgements.legacy_providers_removed {
+        probe.canary_round_trip().await.unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "canary round trip failed");
+            false
+        })
+    } else {
+        false
+    };
+
+    let derivation = derive(&obj.spec, &evidence, canary_ok);
+    tracing::info!(installation = %name, phase = ?derivation.phase, reason = %derivation.reason, "derived phase");
+
+    status.phase = derivation.phase;
+    status.legacy_prefixes = derivation.legacy_prefixes.clone();
+    status.nodes = derivation.nodes.clone();
+    status.conditions = vec![ready_condition_for(&derivation, generation)];
     write_status(&api, &name, &status).await?;
-    Ok(Action::requeue(Duration::from_secs(30)))
+
+    if should_run_rewrite(&obj.spec, &derivation) {
+        let store = KubeSecretStore::new(ctx.client.clone());
+        run_rewrite(&api, &name, &store, &mut status).await?;
+    }
+
+    // The canary is a probe, not state; do not leave it behind once settled.
+    if matches!(
+        derivation.phase,
+        EncryptionPhase::ReadyToRemoveLegacy | EncryptionPhase::Verified
+    ) {
+        delete_canary(&ctx.client).await;
+    }
+
+    Ok(Action::requeue(requeue_for(derivation.phase)))
 }
 
 pub fn error_policy(
@@ -232,5 +339,65 @@ mod tests {
             EtcdEncryptionReconcileError::Verification("x".to_string()).failure_reason(),
             Some("VerificationFailed")
         );
+    }
+
+    use crate::encryption_verdict::Derivation;
+
+    fn derivation(phase: EncryptionPhase) -> Derivation {
+        Derivation {
+            phase,
+            run_rewrite: false,
+            reason: "why".to_string(),
+            nodes: vec![],
+            legacy_prefixes: vec![],
+        }
+    }
+
+    #[test]
+    fn active_phases_requeue_quickly_and_settled_ones_slowly() {
+        use EncryptionPhase::*;
+        assert_eq!(requeue_for(Observing), Duration::from_secs(30));
+        assert_eq!(requeue_for(Migrating), Duration::from_secs(30));
+        assert_eq!(requeue_for(NotConfigured), Duration::from_secs(600));
+        assert_eq!(requeue_for(ReadyToRemoveLegacy), Duration::from_secs(600));
+        assert_eq!(requeue_for(Verified), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn ready_is_true_only_for_verified() {
+        for (phase, ready) in [
+            (EncryptionPhase::Observing, false),
+            (EncryptionPhase::NotConfigured, false),
+            (EncryptionPhase::Migrating, false),
+            (EncryptionPhase::ReadyToRemoveLegacy, false),
+            (EncryptionPhase::Verified, true),
+        ] {
+            let c = ready_condition_for(&derivation(phase), Some(2));
+
+            assert_eq!(c.status == "True", ready, "{phase:?}");
+            assert_eq!(c.reason, format!("{phase:?}"));
+            assert_eq!(c.message, "why");
+        }
+    }
+
+    #[test]
+    fn rewrite_only_runs_when_the_derivation_asks_for_it_and_the_spec_enables_it() {
+        // Review Focus 6: belt and braces on top of derive().
+        let mut spec = spec();
+        let mut d = derivation(EncryptionPhase::Migrating);
+        d.run_rewrite = true;
+
+        spec.rewrite = RewriteMode::Disabled;
+        assert!(!should_run_rewrite(&spec, &d));
+
+        spec.rewrite = RewriteMode::Enabled;
+        assert!(should_run_rewrite(&spec, &d));
+
+        d.run_rewrite = false;
+        assert!(!should_run_rewrite(&spec, &d));
+
+        let mut wrong_phase = derivation(EncryptionPhase::Observing);
+        wrong_phase.run_rewrite = true;
+        assert!(!should_run_rewrite(&spec, &wrong_phase));
     }
 }
