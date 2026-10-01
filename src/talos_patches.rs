@@ -12,6 +12,20 @@ fn identity() -> Value {
     json!({ "identity": {} })
 }
 
+/// Prepended to every patch. Talos's default `talosctl gen config` already
+/// encrypts Secrets with secretbox; replacing `providers` without it would
+/// make every existing Secret unreadable, and the controller cannot see the
+/// machine config to merge it.
+const EXISTING_PROVIDER_WARNING: &str = "\
+# WARNING: if this cluster already encrypts Secrets (Talos's default
+# `talosctl gen config` enables secretbox, cluster.secretboxEncryptionSecret),
+# add that provider to `providers` as a read fallback AFTER the entries below
+# (before `identity` if present), or existing Secrets become unreadable.
+# The controller cannot see or merge it for you.
+";
+
+/// `with_socket_volume` only for patch 1: the machine config keeps the
+/// volume afterwards, and re-applying it would append a duplicate entry.
 fn render(providers: Vec<Value>, with_socket_volume: bool) -> String {
     let encryption = json!({
         "apiVersion": "v1alpha1",
@@ -22,7 +36,7 @@ fn render(providers: Vec<Value>, with_socket_volume: bool) -> String {
     });
     let encryption = serde_yaml::to_string(&encryption).expect("patch serializes to YAML");
     if !with_socket_volume {
-        return encryption;
+        return format!("{EXISTING_PROVIDER_WARNING}{encryption}");
     }
     let volume = json!({
         "cluster": { "apiServer": { "extraVolumes": [
@@ -30,24 +44,24 @@ fn render(providers: Vec<Value>, with_socket_volume: bool) -> String {
         ] } },
     });
     let volume = serde_yaml::to_string(&volume).expect("patch serializes to YAML");
-    format!("{volume}---\n{encryption}")
+    format!("{EXISTING_PROVIDER_WARNING}{volume}---\n{encryption}")
 }
 
 /// Patch 1: KMS first (new writes are encrypted), identity second (existing
-/// plaintext stays readable).
+/// plaintext stays readable). The only patch carrying the socket volume.
 pub fn enable_kms(plan: &KmsPlan) -> String {
     render(vec![plan.provider_block(), identity()], true)
 }
 
 /// Patch 2: KMS only -- plaintext is no longer accepted.
 pub fn remove_identity(plan: &KmsPlan) -> String {
-    render(vec![plan.provider_block()], true)
+    render(vec![plan.provider_block()], false)
 }
 
 /// Deletion step 1: identity first (new writes are plaintext) but KMS kept so
 /// existing ciphertext stays readable until every Secret is rewritten.
 pub fn revert(plan: &KmsPlan) -> String {
-    render(vec![identity(), plan.provider_block()], true)
+    render(vec![identity(), plan.provider_block()], false)
 }
 
 /// Deletion step 2, only after every Secret was rewritten plaintext.
@@ -123,22 +137,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kms_bearing_patches_mount_the_socket_dir_into_the_apiserver() {
-        for patch in [enable_kms(&plan()), remove_identity(&plan()), revert(&plan())] {
-            let volumes = patch
-                .split("---\n")
-                .map(|d| serde_yaml::from_str::<serde_json::Value>(d).unwrap())
-                .find_map(|d| d["cluster"]["apiServer"]["extraVolumes"].as_array().cloned())
-                .expect("has an extraVolumes document");
+    fn extra_volumes(patch: &str) -> Option<Vec<serde_json::Value>> {
+        patch
+            .split("---\n")
+            .map(|d| serde_yaml::from_str::<serde_json::Value>(d).unwrap())
+            .find_map(|d| d["cluster"]["apiServer"]["extraVolumes"].as_array().cloned())
+    }
 
-            assert_eq!(volumes[0]["hostPath"], "/var/lib/kms");
-            assert_eq!(volumes[0]["mountPath"], "/var/lib/kms");
+    #[test]
+    fn only_enable_kms_mounts_the_socket_dir_into_the_apiserver() {
+        let volumes = extra_volumes(&enable_kms(&plan())).expect("enable_kms has an extraVolumes document");
+
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["hostPath"], "/var/lib/kms");
+        assert_eq!(volumes[0]["mountPath"], "/var/lib/kms");
+    }
+
+    #[test]
+    fn later_patches_do_not_repeat_the_volume_the_machine_config_already_has() {
+        // Applying the volume document a second time would append a duplicate
+        // extraVolumes entry to the machine config.
+        for (name, patch) in [("remove_identity", remove_identity(&plan())), ("revert", revert(&plan())), ("remove_kms", remove_kms())] {
+            assert!(!patch.contains("extraVolumes"), "{name}");
+            assert_eq!(patch.split("---\n").count(), 1, "{name} is a single document");
         }
     }
 
     #[test]
-    fn remove_kms_has_no_volume_document() {
-        assert!(!remove_kms().contains("extraVolumes"));
+    fn every_patch_starts_with_the_existing_provider_warning_and_still_parses() {
+        for patch in [enable_kms(&plan()), remove_identity(&plan()), revert(&plan()), remove_kms()] {
+            assert!(patch.starts_with("# WARNING: if this cluster already encrypts Secrets"), "{patch}");
+            assert!(patch.contains("cluster.secretboxEncryptionSecret"));
+            assert!(patch.contains("The controller cannot see or merge it for you."));
+            for doc in patch.split("---\n") {
+                serde_yaml::from_str::<serde_json::Value>(doc).expect("each document parses");
+            }
+            assert!(!provider_order(&patch).is_empty());
+        }
     }
 }

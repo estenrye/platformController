@@ -8,7 +8,8 @@ const DAEMONSET_NAME: &str = "barbican-kms";
 /// from typed fields. Shape taken from upstream
 /// `manifests/barbican-kms/ds.yaml` (2026-09-30), minus its
 /// `serviceAccountName` (the plugin never calls the Kubernetes API) and plus
-/// `dnsPolicy: Default` (no cluster-DNS dependence on the bootstrap path).
+/// `dnsPolicy: Default` (no cluster-DNS dependence on the bootstrap path),
+/// a socket `readinessProbe` and `priorityClassName: system-node-critical`.
 pub fn plan(spec: &BarbicanSpec) -> KmsPlan {
     let daemonset: DynamicObject = serde_json::from_value(serde_json::json!({
         "apiVersion": "apps/v1",
@@ -26,6 +27,8 @@ pub fn plan(spec: &BarbicanSpec) -> KmsPlan {
                 "spec": {
                     "hostNetwork": true,
                     "dnsPolicy": "Default",
+                    // The apiserver cannot read Secrets without this pod.
+                    "priorityClassName": "system-node-critical",
                     "nodeSelector": { "node-role.kubernetes.io/control-plane": "" },
                     "tolerations": [
                         { "key": "node.cloudprovider.kubernetes.io/uninitialized", "operator": "Exists", "effect": "NoSchedule" },
@@ -50,6 +53,14 @@ pub fn plan(spec: &BarbicanSpec) -> KmsPlan {
                             "initialDelaySeconds": 10,
                             "timeoutSeconds": 10,
                             "periodSeconds": 60,
+                        },
+                        // Ready (and so counted by plugin_ready) only once the
+                        // socket the apiserver dials exists.
+                        "readinessProbe": {
+                            "exec": { "command": ["ls", "/kms/kms.sock"] },
+                            "initialDelaySeconds": 5,
+                            "periodSeconds": 10,
+                            "failureThreshold": 3,
                         },
                     }],
                     "volumes": [
@@ -143,5 +154,27 @@ mod tests {
         let socket = volumes.iter().find(|v| v["name"] == "socket-dir").unwrap();
         assert_eq!(socket["hostPath"]["path"], "/var/lib/kms/");
         assert_eq!(socket["hostPath"]["type"], "DirectoryOrCreate");
+    }
+
+    #[test]
+    fn the_plugin_is_ready_only_once_its_socket_exists() {
+        // plugin_ready() counts Ready pods: without a readinessProbe a pod is
+        // Ready before the socket the apiserver needs is there.
+        let object = plan(&spec()).daemonset;
+        let probe = &object.data["spec"]["template"]["spec"]["containers"][0]["readinessProbe"];
+
+        assert_eq!(probe["exec"]["command"], serde_json::json!(["ls", "/kms/kms.sock"]));
+        assert_eq!(probe["periodSeconds"], 10);
+        assert_eq!(probe["initialDelaySeconds"], 5);
+        assert_eq!(probe["failureThreshold"], 3);
+    }
+
+    #[test]
+    fn the_plugin_runs_at_system_node_critical_priority() {
+        // The apiserver cannot read Secrets without it: it must not be
+        // preempted or evicted ahead of ordinary workloads.
+        let object = plan(&spec()).daemonset;
+
+        assert_eq!(object.data["spec"]["template"]["spec"]["priorityClassName"], "system-node-critical");
     }
 }
