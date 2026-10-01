@@ -2,6 +2,16 @@
 # installs the Barbican KMS plugin, re-encrypts every Secret through KMS, and
 # walks the cluster to "no plaintext Secrets in etcd".
 #
+# EXPERIMENTAL, NOT LIVE-VERIFIED. DO NOT USE ON A CLUSTER YOU CARE ABOUT.
+#
+# EXISTING ENCRYPTION IS NOT DETECTED: Talos's default `talosctl gen config`
+# already encrypts Secrets with secretbox (cluster.secretboxEncryptionSecret).
+# Every generated patch replaces the provider list; splice that provider into
+# each patch as a read fallback (the comment atop each patch says where), or
+# every existing Secret becomes unreadable. Key rotation (or changing
+# cloudConfigSecretRef / the key-id once rewriting started) is unsupported.
+# Deleting is multi-step: see "6. Delete protocol" in the runbook below.
+#
 # The controller cannot change the apiserver's configuration (on Talos that
 # lives in the machine config, applied through the Talos API, which this
 # controller never touches). So this is a protocol: the controller publishes
@@ -27,7 +37,9 @@
 #   kubectl apply -f examples/etcd-encryption.yaml
 #   kubectl get etcdenc default -o jsonpath='{.status.phase}{"\n"}'
 #
-# Leave every acknowledgement false until the status asks for it.
+# Leave every acknowledgement false until the status asks for it. An
+# acknowledgement only counts if set AFTER its patch appeared in
+# .status.talosPatches; if one was already true, flip it false then true.
 apiVersion: platform.rye.ninja/v1alpha1
 kind: EtcdEncryption
 metadata:

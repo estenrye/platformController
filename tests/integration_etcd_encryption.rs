@@ -1,8 +1,8 @@
-// Run manually against a real cluster (the Talos-in-Docker setup in
-// tests/integration_talos.rs is enough for this narrow check; no OpenStack is
-// needed for it to reach AwaitingKmsConfig only if the plugin pods can start,
-// so on a cluster without Barbican use the runbook instead). With the
-// controller running and all seven CRDs Established:
+// Run manually against a real cluster. Reaching AwaitingKmsConfig requires a
+// Ready plugin pod on every control-plane node (its readinessProbe waits for
+// the KMS socket), so in practice this needs valid credentials and a reachable
+// Barbican; on a cluster without one, use the runbook instead. With the controller running and all seven CRDs
+// Established:
 //
 //   kubectl apply -f examples/etcd-encryption.yaml
 //   cargo test --test integration_etcd_encryption -- --ignored --nocapture
@@ -11,7 +11,8 @@
 // DaemonSet and publish patch 1. It does NOT apply any Talos patch; the rest
 // of the protocol is a manual runbook step
 // (docs/runbooks/etcd-encryption-verification.md). It deletes the resource at
-// the end, which, with no acknowledgement set, removes the plugin immediately.
+// the end, which, with no acknowledgement set and the apiserver reporting no
+// KMS provider, removes the plugin immediately.
 
 use k8s_openapi::api::apps::v1::DaemonSet;
 use kube::api::{Api, DeleteParams};

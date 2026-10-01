@@ -1,7 +1,16 @@
 # EtcdEncryption (KMS-backed Secret encryption at rest) on Talos
 
-Status: Draft, awaiting review
+Status: Implemented, NOT live-verified
 Date: 2026-09-30
+
+> **Caveat (read first).** The controller does **not** detect or merge a
+> pre-existing encryption provider. Talos's default `talosctl gen config`
+> already encrypts Secrets with secretbox (`cluster.secretboxEncryptionSecret`);
+> every generated patch replaces the `providers` list, so the operator must
+> splice the existing provider into each patch as a read fallback (every patch
+> starts with a comment saying so). Forgetting makes every existing Secret
+> unreadable. Key rotation is unsupported, and the feature has not been run
+> against a live cluster. See "Known limitations" at the end.
 
 ## Purpose
 
@@ -55,6 +64,11 @@ verifies each step before advancing.
   at the plugin.
 - **A shared component framework** across the now-seven reconcilers. Still the
   growing case it has been since the third CRD; still out of scope.
+- **Detecting or merging a pre-existing encryption provider** (Talos's default
+  secretbox, or any `KubeEtcdEncryptionConfig` already in the machine config).
+  The controller cannot read the machine config; the operator splices it in.
+- **Key rotation**, or changing `cloudConfigSecretRef` / the `key-id` after
+  `Rewriting` has started: Secrets under the old key become unreadable.
 
 ## Design
 
@@ -96,6 +110,17 @@ spec:
 - The four `acknowledgements` fields are the operator's explicit gates; they
   are the only fields the operator flips as the protocol progresses. They are
   always `false` on first apply.
+- **An acknowledgement only counts if it was set after its patch was
+  published.** `status.patchGenerations.{enableKms,removeIdentity,revert,removeKms}`
+  records `metadata.generation` at the status write that first published each
+  patch (set once, never overwritten). An ack counts only when the current
+  generation is strictly greater. An ack already `true` when its patch
+  appeared must be flipped `false` then `true` (any later spec change would
+  do). This stops a pre-set `kmsReverted` from skipping the revert patch (the
+  rewrite would then be a no-op and `removeKms` would strand every Secret)
+  and a pre-set `plaintextRemoved` from reaching `Encrypted` without patch 2.
+  One exception: for deletion engaged-ness the controller uses the RAW
+  `kmsConfigApplied`, erring on the side of keeping the plugin.
 
 ### Provider interface (extensibility)
 
@@ -123,7 +148,10 @@ host-level components:
 - mounts the credentials Secret and a `hostPath` of `/var/lib/kms` so the unix
   socket (`/var/lib/kms/kms.sock` for Barbican) is visible to the apiserver
   static pod on the same node;
-- lives in `kube-system`; no namespace is synthesized.
+- lives in `kube-system`; no namespace is synthesized;
+- a `readinessProbe` on the socket (`ls /kms/kms.sock`), so "Ready on every
+  control-plane node" means the socket exists, and
+  `priorityClassName: system-node-critical`.
 
 ### Phases
 
@@ -135,8 +163,9 @@ phase backwards on its own and never un-acknowledges anything.
 2. **AwaitingKmsConfig.** Publish `status.talosPatches.enableKms`: a ready-to-
    apply Talos patch containing the `KubeEtcdEncryptionConfig` with the KMS
    provider **first** and `identity` **second** (so existing plaintext stays
-   readable), plus whatever apiserver volume config is needed to mount
-   `/var/lib/kms`. Advance only when **both** the apiserver probe reports a
+   readable), plus the `cluster.apiServer.extraVolumes` entry mounting
+   `/var/lib/kms`. Only this patch carries the volume; the machine config
+   keeps it, and repeating it would append a duplicate entry. Advance only when **both** the apiserver probe reports a
    KMS provider active **and** `kmsConfigApplied` is `true`. The plugin must
    already be Ready on every control-plane node before this patch is published,
    so a rolling apiserver restart can never find a missing socket.
@@ -148,7 +177,9 @@ phase backwards on its own and never un-acknowledges anything.
    complete while any Secret is unrewritten. Only Secrets are rewritten.
 4. **AwaitingPlaintextRemoval.** Publish `status.talosPatches.removeIdentity`:
    the Talos patch with `identity` removed. Advance only when
-   `plaintextRemoved` is `true` and the probes pass.
+   `plaintextRemoved` counts, the probes pass, **and every Secret can be
+   listed** through the apiserver (a list returns whole objects, so each must
+   decrypt; any error blocks).
 5. **Encrypted.** `Ready=True`. Unlike the other components, `Ready` here means
    the end state was verified, not just "manifests applied"; the status says
    what was verified and how (see Probes).
@@ -172,9 +203,11 @@ actually using KMS:
 
 For phase 2 this is conclusive. For phase 4 it is not: etcd cannot be read
 through the Kubernetes API, so "plaintext is no longer stored" is established
-indirectly (KMS is the only provider reporting, the canary round-trips, and
-`plaintextRemoved` is acknowledged) rather than by inspecting etcd. The status
-says so. This is why the acknowledgement flags are gates *in addition to* the
+indirectly (KMS is the only provider reporting, the canary round-trips,
+every Secret can be read, and `plaintextRemoved` is acknowledged) rather than
+by inspecting etcd. The status says so. Every probe reaches one apiserver
+behind the load balancer; per-node rollout is the operator's job (the runbook
+waits for each node's apiserver pod to restart before the next node). This is why the acknowledgement flags are gates *in addition to* the
 probes and not replaced by them.
 
 ### Deletion
@@ -182,19 +215,28 @@ probes and not replaced by them.
 The apiserver configuration lives in Talos, so the controller cannot undo it.
 The finalizer has two modes:
 
-- **Before the operator has acknowledged patch 1** (phase `InstallingPlugin`,
-  or `AwaitingKmsConfig` with `kmsConfigApplied: false`): delete the
-  DaemonSet and finish. Nothing depends on the plugin.
-- **After patch 1 is acknowledged** (any later phase): the CR stays
-  `Terminating` and the controller walks three steps, never returning success
-  from the finalizer until the plugin is safe to remove. (1) `RevertingKms`:
-  publish `status.talosPatches.revert`, a patch listing `identity` **first**
-  and `kms` second, so new writes are plaintext while KMS can still read old
-  ciphertext; wait for `kmsReverted`. (2) `Decrypting`: rewrite every Secret;
-  then `AwaitingKmsRemoval`: publish `status.talosPatches.removeKms` (identity
-  only) and wait for `kmsRemoved` **and** a probe showing no KMS provider
-  active. (3) Remove the DaemonSet. Going straight to `identity`-only would
-  make every KMS-encrypted Secret unreadable.
+- **Not engaged** (nothing can depend on the plugin): delete the DaemonSet
+  and finish. Engaged-ness errs on the safe side:
+  - `Pending` / `InstallingPlugin`: engaged unless the KMS probe positively
+    reports no KMS provider (an unreadable probe counts as engaged; the
+    operator may have applied a patch out of band);
+  - `AwaitingKmsConfig`: engaged if the RAW `kmsConfigApplied` is set or the
+    probe does not positively report no KMS provider;
+  - every later phase: engaged.
+- **Engaged**: the CR stays `Terminating` and the controller walks three
+  steps, never returning success from the finalizer until the plugin is safe
+  to remove. Every step but the last re-applies the plugin DaemonSet first.
+  (1) `RevertingKms`: publish `status.talosPatches.revert`, a patch listing
+  `identity` **first** and `kms` second, so new writes are plaintext while
+  KMS can still read old ciphertext; wait for `kmsReverted` (counted only if
+  set after the revert patch was published). (2) `Decrypting`: once the
+  plugin is Ready on every control-plane node, rewrite every Secret; then
+  `AwaitingKmsRemoval`: publish `status.talosPatches.removeKms` (identity
+  only) and wait for `kmsRemoved` (counted likewise), a probe showing no KMS
+  provider active, **and** every Secret listable. (3) Remove the DaemonSet.
+  Going straight to `identity`-only would make every KMS-encrypted Secret
+  unreadable. Waiting for the revert ack never moves the phase back from
+  `Decrypting` or `AwaitingKmsRemoval`.
 
 There is no force-delete in this slice.
 
@@ -249,3 +291,17 @@ live runbook must confirm before the slice is called verified:
 3. The Barbican plugin's image reference and tag.
 4. Whether any admission webhook or controller in a typical cluster rejects a
    no-op `update` of a Secret (affects the rewrite's failure accounting).
+
+## Known limitations
+
+- **Pre-existing encryption providers** (Talos default secretbox) are neither
+  detected nor merged; the operator splices them into every patch.
+- **Key rotation is unsupported**; changing `cloudConfigSecretRef` or the
+  `key-id` after `Rewriting` makes Secrets unreadable.
+- **Adding a control-plane node after `Encrypted`** requires applying the same
+  patches to it and a Ready plugin pod there before its apiserver serves.
+- **HA partial rollouts** are not detected: probes reach one apiserver behind
+  the load balancer; the runbook's per-node wait is the mitigation.
+- **Status writes are merge patches without a resourceVersion** (I6 in the
+  final review, not fixed in this slice).
+- **Not live-verified.**

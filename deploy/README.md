@@ -259,8 +259,12 @@ that uses it. **Switching an existing cluster** from `cidrs` to
 restarts and BGP sessions re-establish from the new addresses, so make sure your
 BGP peers accept them first.
 
-## etcd Secret encryption (optional)
+## etcd Secret encryption (optional, EXPERIMENTAL)
 
-`examples/etcd-encryption.yaml` is an `EtcdEncryption` that encrypts every Secret at rest through an external KMS (OpenStack Barbican today). Unlike the other components it is a **protocol**: on Talos the apiserver's encryption config is part of the machine config, applied through the Talos API, which this controller never uses. The controller installs the KMS plugin, publishes each Talos patch in `.status.talosPatches`, re-encrypts every Secret, and verifies the result; you apply each patch with `talosctl` and acknowledge it in `spec.acknowledgements`. See `docs/runbooks/etcd-encryption-verification.md` for the full walk-through.
+**EXPERIMENTAL and NOT live-verified: do not use it on a cluster you care about.**
 
-**You create and own the KMS key; losing it makes every Secret in the cluster unreadable.** Deleting the resource after the first patch is applied is also a multi-step process (it must re-save every Secret as plaintext before the plugin can go), so it stays `Terminating` until you acknowledge each step.
+`examples/etcd-encryption.yaml` is an `EtcdEncryption` that encrypts every Secret at rest through an external KMS (OpenStack Barbican today). Unlike the other components it is a **protocol**: on Talos the apiserver's encryption config is part of the machine config, applied through the Talos API, which this controller never uses. The controller installs the KMS plugin, publishes each Talos patch in `.status.talosPatches`, re-encrypts every Secret, and verifies the result; you apply each patch with `talosctl` and acknowledge it in `spec.acknowledgements` (an acknowledgement only counts if set after its patch appeared). See `docs/runbooks/etcd-encryption-verification.md` for the full walk-through.
+
+**Existing encryption is not detected.** Talos's default `talosctl gen config` already encrypts Secrets with secretbox (`cluster.secretboxEncryptionSecret`). The generated patches replace the provider list, so you must splice that provider into every patch as a read fallback (each patch starts with a comment saying where), or every existing Secret becomes unreadable.
+
+**You create and own the KMS key; losing it makes every Secret in the cluster unreadable.** Key rotation (or changing `cloudConfigSecretRef` / the `key-id` once rewriting started) is unsupported. Deleting the resource is multi-step (revert patch, re-save every Secret, remove-KMS patch, only then the plugin goes), so it stays `Terminating` until you acknowledge each step: see "6. Delete protocol" in the runbook.
