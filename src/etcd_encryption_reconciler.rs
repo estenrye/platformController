@@ -103,6 +103,18 @@ pub fn condition(type_: &str, ok: bool, reason: &str, message: &str, generation:
 /// A Ready plugin pod must exist on **every** control-plane node, and there
 /// must be at least one: patch 1 triggers a rolling apiserver restart that
 /// needs the socket on each node it lands on.
+/// The DaemonSet controller has observed the current spec and every pod is
+/// on the current revision, so stale pods from a previous image generation
+/// during a rollout never count as ready. Missing values mean not ready.
+pub fn daemonset_rollout_current(
+    generation: Option<i64>,
+    observed_generation: Option<i64>,
+    updated: Option<i32>,
+    desired: i32,
+) -> bool {
+    matches!((generation, observed_generation), (Some(g), Some(o)) if g == o) && updated.unwrap_or(0) == desired
+}
+
 pub fn daemonset_covers_all_control_plane(desired: i32, ready: i32, control_plane_nodes: usize) -> bool {
     control_plane_nodes > 0 && desired >= 0 && desired as usize == control_plane_nodes && ready == desired
 }
@@ -138,8 +150,18 @@ async fn plugin_ready(client: &kube::Client, plan: &KmsPlan) -> Result<bool, Etc
         .get_opt(&plan.daemonset_name)
         .await
         .map_err(EtcdEncryptionReconcileError::Api)?
-        .and_then(|daemonset| daemonset.status);
-    let Some(status) = status else { return Ok(false) };
+        ;
+    let Some(daemonset) = status else { return Ok(false) };
+    let generation = daemonset.metadata.generation;
+    let Some(status) = daemonset.status else { return Ok(false) };
+    if !daemonset_rollout_current(
+        generation,
+        status.observed_generation,
+        status.updated_number_scheduled,
+        status.desired_number_scheduled,
+    ) {
+        return Ok(false);
+    }
     let nodes: Api<Node> = Api::all(client.clone());
     let control_plane = nodes
         .list(&ListParams::default().labels("node-role.kubernetes.io/control-plane"))
@@ -148,6 +170,13 @@ async fn plugin_ready(client: &kube::Client, plan: &KmsPlan) -> Result<bool, Etc
         .items
         .len();
     Ok(daemonset_covers_all_control_plane(status.desired_number_scheduled, status.number_ready, control_plane))
+}
+
+/// Rewriting while KMS is not the active write provider would store Secrets
+/// under identity, and a later remove-identity patch would make them
+/// unreadable. Only rewrite while the apiserver reports an active KMS provider.
+pub fn should_run_rewrite(phase: EncryptionPhase, kms_active: bool) -> bool {
+    phase == EncryptionPhase::Rewriting && kms_active
 }
 
 /// A probe error is "not yet": it is logged and never advances a phase.
@@ -282,7 +311,7 @@ async fn reconcile_inner(
     // Walk forward as far as the facts allow in one reconcile.
     let store = KubeSecretStore::new(ctx.client.clone());
     loop {
-        if inputs.current == EncryptionPhase::Rewriting {
+        if should_run_rewrite(inputs.current, inputs.kms_active) {
             inputs.rewrite_complete = run_rewrite(&api, &name, &store, &mut status).await?;
         }
         let next = next_phase(&inputs);
@@ -297,7 +326,12 @@ async fn reconcile_inner(
             inputs.kms_active = probe_kms_active(&ctx.client).await;
         }
         if matches!(next, EncryptionPhase::AwaitingPlaintextRemoval | EncryptionPhase::Encrypted) && !inputs.canary_ok {
-            inputs.canary_ok = crate::encryption_probe::canary_round_trips(&ctx.client).await.unwrap_or(false);
+            inputs.canary_ok = crate::encryption_probe::canary_round_trips(&ctx.client)
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(error = %err, "canary probe failed; treating as not round-tripping");
+                    false
+                });
         }
     }
 
@@ -307,7 +341,12 @@ async fn reconcile_inner(
         EncryptionPhase::Encrypted => (true, !(inputs.kms_active && inputs.canary_ok && inputs.plugin_ready)),
         _ => (false, false),
     };
-    status.conditions = vec![condition("Ready", ready && !degraded, &format!("{:?}", status.phase), &phase_message(status.phase), generation)];
+    let message = if status.phase == EncryptionPhase::Rewriting && !inputs.kms_active {
+        "waiting for the apiserver to report an active KMS provider before rewriting Secrets".to_string()
+    } else {
+        phase_message(status.phase)
+    };
+    status.conditions = vec![condition("Ready", ready && !degraded, &format!("{:?}", status.phase), &message, generation)];
     if degraded {
         status.conditions.push(condition(
             "Degraded",
@@ -380,8 +419,7 @@ pub async fn cleanup(
     let step = cleanup_step(&CleanupInputs { phase: status.phase, acks: obj.spec.acknowledgements, kms_active });
     tracing::info!(installation = %name, phase = ?status.phase, ?step, "cleanup step");
 
-    debug_assert!(cleanup_may_finish(step) == (step == CleanupStep::RemovePlugin));
-    match step {
+    let result: Result<Action, EtcdEncryptionReconcileError> = async { match step {
         CleanupStep::RemovePlugin => {
             for reference in status.applied_resources.iter().rev() {
                 tracing::info!(kind = %reference.kind, resource = %reference.name, "deleting applied resource");
@@ -414,6 +452,23 @@ pub async fn cleanup(
         CleanupStep::AwaitKmsRemoval => Err(EtcdEncryptionReconcileError::CleanupBlocked(
             "waiting for spec.acknowledgements.kmsRemoved and for the apiserver to stop reporting a KMS provider".to_string(),
         )),
+    } }
+    .await;
+    enforce_cleanup_gate(step, result)
+}
+
+/// Last line of defence: `kube::runtime::finalizer` strips the finalizer on
+/// any `Ok` from Cleanup, so an `Ok` from any step other than the final one
+/// is converted into a blocking `Err`. Errors pass through unchanged.
+pub fn enforce_cleanup_gate(
+    step: CleanupStep,
+    result: Result<Action, EtcdEncryptionReconcileError>,
+) -> Result<Action, EtcdEncryptionReconcileError> {
+    match result {
+        Ok(_) if !cleanup_may_finish(step) => Err(EtcdEncryptionReconcileError::CleanupBlocked(
+            "internal: cleanup tried to finish before the plugin was safe to remove".to_string(),
+        )),
+        other => other,
     }
 }
 
@@ -533,6 +588,38 @@ mod tests {
 
         let before = patches_for(EncryptionPhase::InstallingPlugin, &plan, &TalosPatches::default());
         assert!(before.enable_kms.is_none(), "no patch before the plugin is ready everywhere");
+    }
+
+    #[test]
+    fn cleanup_gate_turns_premature_ok_into_blocked_err() {
+        for step in [CleanupStep::AwaitRevertAck, CleanupStep::Decrypt, CleanupStep::AwaitKmsRemoval] {
+            let gated = enforce_cleanup_gate(step, Ok(Action::await_change()));
+            assert!(matches!(gated, Err(EtcdEncryptionReconcileError::CleanupBlocked(_))), "{step:?}");
+        }
+        assert!(enforce_cleanup_gate(CleanupStep::RemovePlugin, Ok(Action::await_change())).is_ok());
+        let err = enforce_cleanup_gate(
+            CleanupStep::Decrypt,
+            Err(EtcdEncryptionReconcileError::NotLeader),
+        );
+        assert!(matches!(err, Err(EtcdEncryptionReconcileError::NotLeader)));
+    }
+
+    #[test]
+    fn rewrite_runs_only_in_rewriting_with_kms_active() {
+        assert!(should_run_rewrite(EncryptionPhase::Rewriting, true));
+        assert!(!should_run_rewrite(EncryptionPhase::Rewriting, false));
+        assert!(!should_run_rewrite(EncryptionPhase::AwaitingKmsConfig, true));
+        assert!(!should_run_rewrite(EncryptionPhase::Encrypted, true));
+    }
+
+    #[test]
+    fn daemonset_rollout_must_be_current() {
+        assert!(daemonset_rollout_current(Some(2), Some(2), Some(3), 3));
+        assert!(!daemonset_rollout_current(Some(2), Some(1), Some(3), 3), "controller has not observed the new spec");
+        assert!(!daemonset_rollout_current(Some(2), Some(2), Some(1), 3), "stale pods from the old revision");
+        assert!(!daemonset_rollout_current(Some(2), Some(2), None, 3));
+        assert!(!daemonset_rollout_current(None, Some(2), Some(3), 3));
+        assert!(!daemonset_rollout_current(Some(2), None, Some(3), 3));
     }
 
     #[test]
