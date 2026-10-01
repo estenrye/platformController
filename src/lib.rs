@@ -11,6 +11,7 @@ pub mod cidr;
 pub mod crd;
 pub mod crds;
 pub mod etcd_encryption;
+pub mod encryption_phase;
 pub mod kms_provider;
 pub mod kms_barbican;
 pub mod talos_patches;
