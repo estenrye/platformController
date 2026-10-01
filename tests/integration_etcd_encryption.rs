@@ -5,10 +5,13 @@
 //   kubectl apply -f examples/etcd-encryption.yaml
 //   cargo test --test integration_etcd_encryption -- --ignored --nocapture
 //
-// This checks only what the controller can do by itself and never rewrites
-// (the example leaves rewrite: Disabled): it must reach a phase other than the
-// initial one and report one status entry per control-plane node. It changes
-// nothing in the cluster apart from a canary Secret in kube-system.
+// This asserts only that, within 180s, the EtcdEncryption "default" reports at
+// least one status.nodes[] entry, that every entry has a non-empty name and
+// address, and that status.rewrite.total is 0 (the example leaves
+// rewrite: Disabled, so this test never rewrites). It prints each node's
+// verified flag, writer prefix and reason. It does not assert any particular
+// phase. It changes nothing in the cluster apart from the controller's canary
+// Secret in kube-system.
 //
 // Getting a node to `verified` (and a meaningful status at all) requires the
 // controller pod to be able to reach each control-plane node's apiserver at

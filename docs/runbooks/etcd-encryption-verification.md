@@ -72,7 +72,23 @@ Design basis, from running the old controller against a real cluster on
 ## 2. Migrating from v0.1.11
 
 The schema changed (`provider`, `barbican` and the old acknowledgements were
-removed; `kmsProviderName` is new and required). Delete the old object first:
+removed; `kmsProviderName` is new and required). Order matters: **first deploy
+the new CRD and the new controller image, then delete the old object.**
+
+```sh
+kubectl apply -f deploy/crd.yaml
+kubectl wait --for=condition=established --timeout=60s crd/etcdencryptions.platform.rye.ninja
+# roll the controller to the new image (edit deploy/bootstrap.yaml's image, apply it)
+kubectl -n platform-system rollout status deployment/platform-controller
+kubectl -n platform-system get deploy platform-controller -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+Expected: the new image, two ready replicas (adjust the namespace/name if you
+changed them in `deploy/bootstrap.yaml`). If you had scaled the controller to 0,
+scale it back to 2 **with the new image** before the next step
+(`kubectl -n platform-system scale deployment/platform-controller --replicas=2`).
+
+Only then:
 
 ```sh
 kubectl delete etcdenc default
@@ -80,18 +96,13 @@ kubectl get etcdenc default
 ```
 
 Expected: the new controller removes the v0.1.11 finalizer
-(`platform.rye.ninja/cleanup`) and the object disappears (`NotFound`). The
-controller no longer has any cleanup to do. If you scaled the controller to 0
-earlier, scale it back to 2:
+(`platform.rye.ninja/cleanup`) and the object disappears (`NotFound`).
 
-```sh
-kubectl -n platform-system scale deployment/platform-controller --replicas=2
-```
-
-(Adjust the namespace/name if you changed them in `deploy/bootstrap.yaml`.)
-Expected: two ready replicas; one is the leader. A pending deletion cannot
-finish while the controller is scaled to 0, because only the controller strips
-the old finalizer.
+Why this order: if the v0.1.11 controller is still running when you delete the
+object, deletion starts its multi-step revert protocol (it tries to publish
+revert patches and may re-apply or remove the plugin DaemonSet). Without any
+controller that strips the finalizer (for example scaled to 0, or the old
+image), the object stays `Terminating` indefinitely.
 
 ## 3. Apply and observe
 
@@ -113,7 +124,7 @@ The phase is derived from scratch on every reconcile; nothing is remembered.
 | `Observing` | Cannot yet vouch for the cluster: a node is unverifiable, writers are mixed, the apiserver is not writing with the target, legacy objects remain and `rewrite` is `Disabled`, or reads could not be confirmed. Read the `Ready` condition message. Requeued every 30 s. |
 | `NotConfigured` | No node reports a `kms-providers` readiness check and none writes with the target. The controller does not enable KMS. Requeued every 600 s. |
 | `Migrating` | Every apiserver writes with the target, at least one node completely read legacy objects, and `rewrite: Enabled`: the controller is rewriting every Secret. Requeued every 30 s. |
-| `ReadyToRemoveLegacy` | Every apiserver writes with the target and reads every Secret with zero legacy reads. It is safe (subject to the confirmations in section 5) to remove the legacy providers. Requeued every 600 s. |
+| `ReadyToRemoveLegacy` | Every apiserver writes with the target and reads every Secret with zero legacy reads. This is necessary but NOT sufficient to remove a legacy provider: follow the hard gate at the top of section 5. Requeued every 600 s. |
 | `Verified` | As above, **and** you set `acknowledgements.legacyProvidersRemoved: true`, **and** the canary Secret round-tripped. Means "the probes agree and you acknowledged removal", nothing more. `Ready=True`. Requeued every 600 s. |
 
 There is no `Failed` phase. A validation failure (empty `kmsProviderName`, or
@@ -219,12 +230,23 @@ kubectl -n platform-system logs deploy/platform-controller | grep "failed to rew
 Expected: lines carrying `namespace=` and `secret=` fields, never data. If
 several replicas run, check the leader's pod. Then either fix the webhook (or
 whatever rejects the update) so the controller's next pass succeeds, or, once
-you have confirmed you can recreate it, delete and recreate that Secret
+you have confirmed you can recreate it, back it up first
+(`kubectl get secret <name> -n <ns> -o yaml > backup.yaml`, and store the file
+securely: it holds the Secret's data) and then delete and recreate that Secret
 deliberately. Setting `rewrite: Disabled` stops the repeating passes.
 
 ## 5. Remove the legacy provider (your change)
 
-The controller does not do this. Before you do:
+**HARD GATE. Do NOT remove any legacy provider unless ALL of these hold:**
+
+1. `status.phase` is `ReadyToRemoveLegacy`;
+2. the `Ready` condition's `lastTransitionTime` is recent (section 3,
+   "Staleness"; a stale timestamp means the controller is not verifying);
+3. the 5a quiet-cluster check below passed;
+4. the 5b etcd snapshot confirmation below passed.
+
+`Observing`, `Migrating`, `NotConfigured` and a stale timestamp all mean **NO**.
+The controller does not remove the provider; you do, after the gate.
 
 ### 5a. Confirm the reader check on a quiet cluster
 
@@ -232,24 +254,47 @@ The reader check lists every Secret with a `limit` and no `resourceVersion`,
 so the apiserver reads from etcd (not its watch cache) and decrypts every
 object, and counts `from_storage` per prefix. The check is evidence, not
 proof: ambient reads by other clients can inflate the counts. Confirm the
-assumption on a quiet cluster (or by reading the counters twice around a list),
-on each control-plane apiserver in turn (use that node's address, or run
-through each node):
+assumption on a quiet cluster (or by reading the counters twice around a list)
+and **per apiserver**.
+
+`kubectl get --raw /metrics` goes through the load balancer, so before and after
+can come from different apiservers and prove nothing. Two ways to be per-node
+(commands unverified):
+
+Method 1: query the node's apiserver directly with a service-account token
+(the controller's own service account already may read `/metrics`):
 
 ```sh
-SECRETS=$(kubectl get secrets -A --no-headers | wc -l)
-kubectl get --raw /metrics | grep 'apiserver_storage_transformation_operations_total' | grep 'resource="secrets"' | grep from_storage > before.txt
-kubectl get secrets -A --chunk-size=100 -o name > /dev/null
-kubectl get --raw /metrics | grep 'apiserver_storage_transformation_operations_total' | grep 'resource="secrets"' | grep from_storage > after.txt
-diff before.txt after.txt
+TOKEN=$(kubectl -n platform-system create token platform-controller)
+# from a throwaway pod (or `kubectl debug node/<cp>` / a host with a route to the node):
+kubectl run metrics-probe --rm -i --restart=Never --image=curlimages/curl --command -- \
+  curl -sk -H "Authorization: Bearer $TOKEN" https://<node-ip>:6443/metrics
 ```
 
-Expected: the `from_storage` counters (summed over the top-level `k8s:enc:`
-prefixes, ignoring the inner `key2:`) rise by **at least** `$SECRETS`. If they
-rise by less, the list was served from the watch cache, the controller's
-completeness check will report "cannot verify reads" for that node, and you
-must not rely on it. (Through the load balancer `kubectl` reaches one apiserver
-at a time; to be per apiserver, query each node's `https://<node-ip>:6443`.)
+Method 2: stay with `kubectl get --raw /metrics` and repeat the before/list/after
+cycle until both snapshots demonstrably come from the same apiserver process:
+`process_start_time_seconds` is unique per apiserver process, so it must be
+identical in the two snapshots.
+
+Per node, a before/list/after cycle (shown with `kubectl get --raw`; substitute
+the Method 1 curl for a specific node):
+
+```sh
+snap() { kubectl get --raw /metrics > "$1"; }
+sum() { grep 'apiserver_storage_transformation_operations_total' "$1" | grep 'resource="secrets"' | grep 'transformation_type="from_storage"' | grep 'transformer_prefix="k8s:enc:' | awk '{s+=$NF} END{print s+0}'; }
+SECRETS=$(kubectl get secrets -A --no-headers | wc -l)
+snap before.txt
+kubectl get secrets -A --chunk-size=100 -o name > /dev/null
+snap after.txt
+grep '^process_start_time_seconds' before.txt after.txt   # must match
+echo "decrypted: $(( $(sum after.txt) - $(sum before.txt) )), listed: $SECRETS"
+```
+
+Expected: `decrypted` is **at least** `listed` (the sum covers the top-level
+`k8s:enc:` prefixes only, which also excludes the inner `key2:`). If it is less,
+the list was served from the watch cache, the controller's completeness check
+will report "cannot verify reads" for that node, and you must not rely on it.
+Repeat for every control-plane apiserver.
 
 ### 5b. Confirm with an etcd snapshot (unverified command)
 
@@ -266,7 +311,12 @@ using `etcdctl` or a snapshot reader. The exact command is **unverified**
 scratch `etcd` and run something like
 `etcdctl get --prefix /registry/secrets/ --print-value-only | grep -a -o -E 'k8s:enc:[a-z0-9]+(:v[0-9]+)?:' | sort | uniq -c`.
 Expected: only `k8s:enc:kms:v2:` (your target) prefixes, no
-`k8s:enc:secretbox:`. If any other prefix remains, do not remove that provider.
+`k8s:enc:secretbox:`. Also count values that carry **no** `k8s:enc:` prefix at all
+(plaintext/identity): that count must be zero (for example, count the values and
+subtract the ones that match `k8s:enc:`). If any other prefix remains, do not
+remove that provider. Caveat: a snapshot also contains old revisions of keys,
+so a few `secretbox` hits can be historical ghosts, a safe-direction false alarm;
+compare against the latest revision of each key if you can.
 
 ### 5c. Remove the provider, one control-plane node at a time
 
