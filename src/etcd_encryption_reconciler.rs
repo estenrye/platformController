@@ -109,6 +109,22 @@ pub async fn write_status(
     Ok(())
 }
 
+/// Resets status to "cannot vouch for the cluster": never leaves a previously
+/// derived safe phase or old per-node evidence behind.
+pub fn reset_unverified(
+    status: &mut EtcdEncryptionStatus,
+    generation: Option<i64>,
+    reason: &str,
+    message: &str,
+) {
+    status.phase = EncryptionPhase::Observing;
+    status.nodes = vec![];
+    status.legacy_prefixes = vec![];
+    status.rewrite = RewriteProgress::default();
+    status.observed_generation = generation.unwrap_or(0);
+    status.conditions = vec![condition("Ready", false, reason, message, generation)];
+}
+
 /// Active phases are re-checked quickly; settled ones slowly (the reader check
 /// lists every Secret on every control-plane apiserver, so it is not cheap).
 pub fn requeue_for(phase: EncryptionPhase) -> Duration {
@@ -146,10 +162,14 @@ async fn run_rewrite(
     name: &str,
     store: &KubeSecretStore,
     status: &mut EtcdEncryptionStatus,
+    is_leader: &std::sync::atomic::AtomicBool,
 ) -> Result<(), EtcdEncryptionReconcileError> {
     let mut progress = RewriteProgress::default();
     let mut token: Option<String> = None;
     loop {
+        if leader_gate(is_leader).is_some() {
+            return Err(EtcdEncryptionReconcileError::NotLeader);
+        }
         let page = rewrite_page(store, token.as_deref())
             .await
             .map_err(|err| EtcdEncryptionReconcileError::Verification(err.to_string()))?;
@@ -197,27 +217,32 @@ pub async fn reconcile(
 
     if let Err(err) = validate(&name, &obj.spec) {
         tracing::warn!(installation = %name, error = %err, "validation failed");
-        status.conditions = vec![condition("Ready", false, err.reason(), &err.to_string(), generation)];
+        reset_unverified(&mut status, generation, err.reason(), &err.to_string());
         write_status(&api, &name, &status).await?;
         return Err(EtcdEncryptionReconcileError::Validation(err));
     }
 
     let target = target_prefix(&obj.spec.kms_provider_name);
-    let probe = KubeApiserverProbe::new(ctx.client.clone())
-        .map_err(|err| EtcdEncryptionReconcileError::Verification(err.to_string()))?;
+    let probe = match KubeApiserverProbe::new(ctx.client.clone()) {
+        Ok(probe) => probe,
+        Err(err) => {
+            let message = err.to_string();
+            reset_unverified(&mut status, generation, "VerificationFailed", &message);
+            write_status(&api, &name, &status).await?;
+            return Err(EtcdEncryptionReconcileError::Verification(message));
+        }
+    };
 
     // Verify every control-plane apiserver. A discovery error is an error, never "no nodes".
     let evidence = match crate::encryption_verify::verify_cluster(&probe, &target).await {
         Ok(evidence) => evidence,
         Err(err) => {
-            status.conditions = vec![condition(
-                "Ready",
-                false,
-                "Observing",
-                &format!("cannot discover or verify the control-plane apiservers: {err}"),
+            reset_unverified(
+                &mut status,
                 generation,
-            )];
-            status.phase = EncryptionPhase::Observing;
+                "VerificationFailed",
+                &format!("cannot discover or verify the control-plane apiservers: {err}"),
+            );
             write_status(&api, &name, &status).await?;
             return Ok(Action::requeue(requeue_for(EncryptionPhase::Observing)));
         }
@@ -244,7 +269,7 @@ pub async fn reconcile(
 
     if should_run_rewrite(&obj.spec, &derivation) {
         let store = KubeSecretStore::new(ctx.client.clone());
-        run_rewrite(&api, &name, &store, &mut status).await?;
+        run_rewrite(&api, &name, &store, &mut status, &ctx.is_leader).await?;
     }
 
     // The canary is a probe, not state; do not leave it behind once settled.
@@ -350,6 +375,30 @@ mod tests {
             reason: "why".to_string(),
             nodes: vec![],
             legacy_prefixes: vec![],
+        }
+    }
+
+    #[test]
+    fn reset_unverified_clears_every_trace_of_a_safe_phase() {
+        for phase in [EncryptionPhase::Verified, EncryptionPhase::ReadyToRemoveLegacy] {
+            let mut status = EtcdEncryptionStatus {
+                phase,
+                legacy_prefixes: vec!["k8s:enc:secretbox:v1:".to_string()],
+                nodes: vec![Default::default()],
+                rewrite: RewriteProgress { total: 5, rewritten: 4, failed: 1 },
+                ..Default::default()
+            };
+
+            reset_unverified(&mut status, Some(7), "VerificationFailed", "boom");
+
+            assert_eq!(status.phase, EncryptionPhase::Observing);
+            assert!(status.nodes.is_empty() && status.legacy_prefixes.is_empty());
+            assert_eq!(status.rewrite, RewriteProgress::default());
+            assert_eq!(status.observed_generation, 7);
+            assert_eq!(status.conditions.len(), 1);
+            let c = &status.conditions[0];
+            assert_eq!((c.status.as_str(), c.reason.as_str(), c.message.as_str()), ("False", "VerificationFailed", "boom"));
+            assert_eq!(c.observed_generation, Some(7));
         }
     }
 
