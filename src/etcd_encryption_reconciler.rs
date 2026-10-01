@@ -109,6 +109,31 @@ pub async fn write_status(
     Ok(())
 }
 
+/// `Err(NotLeader)` unless this replica still holds the lease. Checked before
+/// every status write: a reconcile can outlive the leadership it started with.
+pub fn still_leader(is_leader: &std::sync::atomic::AtomicBool) -> Result<(), EtcdEncryptionReconcileError> {
+    match leader_gate(is_leader) {
+        Some(_) => Err(EtcdEncryptionReconcileError::NotLeader),
+        None => Ok(()),
+    }
+}
+
+/// `write_status`, but only while still the leader; a standby never writes.
+async fn write_status_as_leader(
+    api: &Api<EtcdEncryption>,
+    name: &str,
+    status: &EtcdEncryptionStatus,
+    is_leader: &std::sync::atomic::AtomicBool,
+) -> Result<(), EtcdEncryptionReconcileError> {
+    still_leader(is_leader)?;
+    write_status(api, name, status).await
+}
+
+/// A CR being deleted gets no probes, no status and no rewrite.
+pub fn being_deleted(obj: &EtcdEncryption) -> bool {
+    obj.metadata.deletion_timestamp.is_some()
+}
+
 /// Resets status to "cannot vouch for the cluster": never leaves a previously
 /// derived safe phase or old per-node evidence behind.
 pub fn reset_unverified(
@@ -167,9 +192,7 @@ async fn run_rewrite(
     let mut progress = RewriteProgress::default();
     let mut token: Option<String> = None;
     loop {
-        if leader_gate(is_leader).is_some() {
-            return Err(EtcdEncryptionReconcileError::NotLeader);
-        }
+        still_leader(is_leader)?;
         let page = rewrite_page(store, token.as_deref())
             .await
             .map_err(|err| EtcdEncryptionReconcileError::Verification(err.to_string()))?;
@@ -180,7 +203,7 @@ async fn run_rewrite(
             tracing::warn!(namespace = %key.namespace, secret = %key.name, "failed to rewrite secret");
         }
         status.rewrite = progress.clone();
-        write_status(api, name, status).await?;
+        write_status_as_leader(api, name, status, is_leader).await?;
         match page.next {
             Some(next) => token = Some(next),
             None => return Ok(()),
@@ -207,9 +230,10 @@ pub async fn reconcile(
         api.patch(&name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(patch))
             .await
             .map_err(EtcdEncryptionReconcileError::Api)?;
-        if obj.metadata.deletion_timestamp.is_some() {
-            return Ok(Action::await_change());
-        }
+    }
+    // A CR being deleted must not trigger probes, a status write or a rewrite.
+    if being_deleted(&obj) {
+        return Ok(Action::await_change());
     }
 
     let mut status = obj.status.clone().unwrap_or_default();
@@ -218,7 +242,7 @@ pub async fn reconcile(
     if let Err(err) = validate(&name, &obj.spec) {
         tracing::warn!(installation = %name, error = %err, "validation failed");
         reset_unverified(&mut status, generation, err.reason(), &err.to_string());
-        write_status(&api, &name, &status).await?;
+        write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
         return Err(EtcdEncryptionReconcileError::Validation(err));
     }
 
@@ -228,7 +252,7 @@ pub async fn reconcile(
         Err(err) => {
             let message = err.to_string();
             reset_unverified(&mut status, generation, "VerificationFailed", &message);
-            write_status(&api, &name, &status).await?;
+            write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
             return Err(EtcdEncryptionReconcileError::Verification(message));
         }
     };
@@ -243,7 +267,7 @@ pub async fn reconcile(
                 "VerificationFailed",
                 &format!("cannot discover or verify the control-plane apiservers: {err}"),
             );
-            write_status(&api, &name, &status).await?;
+            write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
             return Ok(Action::requeue(requeue_for(EncryptionPhase::Observing)));
         }
     };
@@ -265,7 +289,7 @@ pub async fn reconcile(
     status.legacy_prefixes = derivation.legacy_prefixes.clone();
     status.nodes = derivation.nodes.clone();
     status.conditions = vec![ready_condition_for(&derivation, generation)];
-    write_status(&api, &name, &status).await?;
+    write_status_as_leader(&api, &name, &status, &ctx.is_leader).await?;
 
     if should_run_rewrite(&obj.spec, &derivation) {
         let store = KubeSecretStore::new(ctx.client.clone());
@@ -341,6 +365,26 @@ mod tests {
     fn strip_finalizer_is_none_when_ours_is_absent() {
         assert_eq!(strip_finalizer(&["other.example/keep".to_string()]), None);
         assert_eq!(strip_finalizer(&[]), None);
+    }
+
+    #[test]
+    fn status_writes_require_current_leadership() {
+        // Final review minor: leadership is re-checked before every status write.
+        let leader = std::sync::atomic::AtomicBool::new(true);
+        assert!(still_leader(&leader).is_ok());
+
+        leader.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(still_leader(&leader), Err(EtcdEncryptionReconcileError::NotLeader)));
+    }
+
+    #[test]
+    fn a_cr_being_deleted_stops_before_any_verification() {
+        let mut obj = EtcdEncryption::new("default", spec());
+        assert!(!being_deleted(&obj));
+
+        obj.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(k8s_openapi::jiff::Timestamp::now()));
+        assert!(being_deleted(&obj));
     }
 
     #[test]

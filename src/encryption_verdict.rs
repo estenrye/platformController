@@ -168,22 +168,33 @@ pub fn derive(spec: &EtcdEncryptionSpec, nodes: &[NodeEvidence], canary_ok: bool
 
     // Every apiserver writes with the target provider.
     if all_clean(nodes, &target) {
+        // The evidence is Secrets-only: say so, every time a safe phase is reported.
+        const SCOPE: &str = "no SECRET is stored under a legacy provider on any apiserver (Secrets only: if your \
+                             EncryptionConfiguration encrypts any resource other than secrets with a legacy \
+                             provider, removing it locks those objects out; this controller does not check them)";
         return if spec.acknowledgements.legacy_providers_removed && canary_ok {
             out(
                 Verified,
                 false,
-                "every apiserver reads and writes only with the target provider, and you acknowledged \
-                 removing the legacy providers (metrics cannot prove the config no longer lists them)",
+                &format!(
+                    "{SCOPE}; every apiserver reads and writes Secrets only with the target provider, and you \
+                     acknowledged removing the legacy providers (metrics cannot prove the config no longer lists them)"
+                ),
             )
         } else if spec.acknowledgements.legacy_providers_removed {
-            out(ReadyToRemoveLegacy, false, "the canary Secret did not round-trip; not verified")
+            out(
+                ReadyToRemoveLegacy,
+                false,
+                &format!("{SCOPE}; but the canary Secret did not round-trip, so not verified"),
+            )
         } else {
             out(
                 ReadyToRemoveLegacy,
                 false,
-                "no Secret is stored under a legacy provider on any apiserver: it is safe to remove the \
-                 legacy providers from the EncryptionConfiguration, then set \
-                 acknowledgements.legacyProvidersRemoved",
+                &format!(
+                    "{SCOPE}: it is safe to remove the legacy providers for secrets from the \
+                     EncryptionConfiguration, then set acknowledgements.legacyProvidersRemoved"
+                ),
             )
         };
     }
@@ -319,6 +330,20 @@ mod tests {
         assert_eq!(derive(&spec(RewriteMode::Disabled, true), &nodes, true).phase, Verified);
         assert_eq!(derive(&spec(RewriteMode::Disabled, true), &nodes, false).phase, ReadyToRemoveLegacy);
         assert_eq!(derive(&spec(RewriteMode::Disabled, false), &nodes, true).phase, ReadyToRemoveLegacy);
+    }
+
+    #[test]
+    fn safe_phase_reasons_are_scoped_to_secrets() {
+        // Final review I4: the evidence covers Secrets only.
+        let nodes = [clean("a"), clean("b")];
+
+        for (acked, canary_ok) in [(false, false), (false, true), (true, false), (true, true)] {
+            let d = derive(&spec(RewriteMode::Disabled, acked), &nodes, canary_ok);
+
+            assert!(matches!(d.phase, ReadyToRemoveLegacy | Verified));
+            assert!(d.reason.contains("no SECRET is stored under a legacy provider"), "{}", d.reason);
+            assert!(d.reason.contains("other than secrets"), "{}", d.reason);
+        }
     }
 
     #[test]
