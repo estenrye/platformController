@@ -11,15 +11,17 @@ pub enum Writer {
     Unverifiable(String),
 }
 
-/// What one apiserver *read* while listing every Secret.
+/// What one apiserver *read* (decrypted from etcd) while every Secret was read
+/// through it with an uncached GET.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reader {
+    /// How many Secrets were read (a Secret deleted mid-check is not counted).
     pub listed: i64,
     pub reads: BTreeMap<String, i64>,
 }
 
 impl Reader {
-    /// Every listed object was decrypted at least once. A list served from the
+    /// Every object read was decrypted at least once. A read served from the
     /// watch cache decrypts nothing, so it is never complete. Any negative count
     /// (counter reset during the check) means incomplete.
     pub fn complete(&self) -> bool {

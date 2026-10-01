@@ -75,6 +75,25 @@ pub fn parse_secret_transformations(metrics: &str) -> Transformations {
     Transformations(out)
 }
 
+const PROCESS_START: &str = "process_start_time_seconds";
+
+/// The apiserver's `process_start_time_seconds` gauge (the first token after
+/// the name), or `None` if it is absent or not a finite number. Two snapshots
+/// with different values were taken across a restart.
+pub fn parse_process_start_time(metrics: &str) -> Option<f64> {
+    metrics.lines().find_map(|line| {
+        let rest = line.strip_prefix(PROCESS_START)?;
+        let rest = match rest.strip_prefix('{') {
+            Some(labels) => &labels[labels.rfind('}')? + 1..],
+            None => rest,
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest.split_whitespace().next()?.parse::<f64>().ok().filter(|v| v.is_finite())
+    })
+}
+
 /// The increase between two snapshots, positive entries only. `None` if any
 /// series decreased or vanished: an apiserver restart reset its counters, so
 /// the difference means nothing and must never be read as "no reads".
@@ -249,6 +268,27 @@ apiserver_storage_transformation_operations_total{resource="secrets",status="OK"
             parsed[&key(Direction::FromStorage, "k8s:enc:aescbc:v1:")],
             i64::MAX
         );
+    }
+
+    #[test]
+    fn process_start_time_is_the_gauge_value() {
+        let text = "# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n\
+                    # TYPE process_start_time_seconds gauge\n\
+                    process_start_time_seconds 1.75926468212e+09\n";
+
+        assert_eq!(parse_process_start_time(text), Some(1.75926468212e9));
+        assert_eq!(parse_process_start_time(&format!("{LIVE}process_start_time_seconds 1700000000 1700000005\n")), Some(1.7e9));
+    }
+
+    #[test]
+    fn process_start_time_is_absent_unless_the_gauge_has_a_finite_value() {
+        assert_eq!(parse_process_start_time(LIVE), None);
+        assert_eq!(parse_process_start_time(""), None);
+        assert_eq!(parse_process_start_time("process_start_time_seconds NaN\n"), None);
+        assert_eq!(parse_process_start_time("process_start_time_seconds +Inf\n"), None);
+        assert_eq!(parse_process_start_time("process_start_time_seconds\n"), None);
+        assert_eq!(parse_process_start_time("process_start_time_seconds_other 5\n"), None);
+        assert_eq!(parse_process_start_time("# process_start_time_seconds 5\n"), None);
     }
 
     #[test]

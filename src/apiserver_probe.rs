@@ -1,5 +1,6 @@
-use crate::secret_rewrite::{verify_listable, KubeSecretStore};
+use crate::secret_rewrite::{KubeSecretStore, SecretKey, SecretStore};
 use k8s_openapi::api::core::v1::{Node, Secret};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
 use kube::{Api, Client, Config};
 use std::collections::BTreeMap;
@@ -14,8 +15,10 @@ pub const CANARY_NAME: &str = "etcd-encryption-canary";
 pub const CANARY_NAMESPACE: &str = "kube-system";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-/// A full list of every Secret is the slow call; give it longer.
-const LIST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Reading every Secret (one GET each) is the slow call; give it much longer.
+const LIST_TIMEOUT: Duration = Duration::from_secs(900);
+/// The label every EndpointSlice of the `default/kubernetes` Service carries.
+const KUBERNETES_SERVICE_SLICES: &str = "kubernetes.io/service-name=kubernetes";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeTarget {
@@ -36,14 +39,20 @@ pub enum ProbeError {
 #[allow(async_fn_in_trait)]
 pub trait ApiserverProbe {
     async fn control_plane_nodes(&self) -> Result<Vec<NodeTarget>, ProbeError>;
+    /// Every address in the `default/kubernetes` EndpointSlices: the
+    /// apiservers that registered themselves, labelled or not.
+    async fn apiserver_endpoint_addresses(&self) -> Result<Vec<String>, ProbeError>;
     /// `kms-providers` is present and ok in `/readyz?verbose` on this node.
     async fn readyz_kms(&self, node: &NodeTarget) -> Result<bool, ProbeError>;
     /// The node's raw `/metrics` body.
     async fn metrics(&self, node: &NodeTarget) -> Result<String, ProbeError>;
     /// Write the canary Secret through this node's apiserver.
     async fn canary_write(&self, node: &NodeTarget) -> Result<(), ProbeError>;
-    /// List every Secret through this node (limit-paged, so read from etcd);
-    /// returns how many were listed.
+    /// Read every Secret from etcd through this node: page through the names,
+    /// then GET each Secret with no resourceVersion (served from storage, not
+    /// the watch cache, so the apiserver decrypts each one under its stored
+    /// prefix). A Secret deleted since it was listed (404) is skipped and not
+    /// counted; any other error is an `Err`. Returns how many were read.
     async fn list_all_secrets(&self, node: &NodeTarget) -> Result<u64, ProbeError>;
     /// Write and read back the canary through the normal API endpoint.
     async fn canary_round_trip(&self) -> Result<bool, ProbeError>;
@@ -63,7 +72,9 @@ pub fn apiserver_url(address: &str) -> String {
 }
 
 /// The control-plane Nodes' InternalIPs, in the order given. Nodes without the
-/// control-plane label or without an InternalIP are skipped.
+/// control-plane label are skipped. A control-plane node without an InternalIP
+/// is kept with an EMPTY address (verification reports it unverifiable): it is
+/// still an apiserver, and dropping it would let the rest look like the whole.
 pub fn node_targets(nodes: &[Node]) -> Vec<NodeTarget> {
     nodes
         .iter()
@@ -76,16 +87,65 @@ pub fn node_targets(nodes: &[Node]) -> Vec<NodeTarget> {
         .filter_map(|n| {
             let address = n
                 .status
-                .as_ref()?
-                .addresses
-                .as_ref()?
-                .iter()
-                .find(|a| a.type_ == "InternalIP")?
-                .address
-                .clone();
+                .as_ref()
+                .and_then(|s| s.addresses.as_ref())
+                .and_then(|a| a.iter().find(|a| a.type_ == "InternalIP"))
+                .map(|a| a.address.clone())
+                .unwrap_or_default();
             Some(NodeTarget { name: n.metadata.name.clone()?, address })
         })
         .collect()
+}
+
+/// Every address of every endpoint in these EndpointSlices, in order.
+pub fn endpoint_addresses(slices: &[EndpointSlice]) -> Vec<String> {
+    slices.iter().flat_map(|s| s.endpoints.iter().flatten()).flat_map(|e| e.addresses.iter().cloned()).collect()
+}
+
+/// The same IP address however it is spelled (`fd00::11` and
+/// `fd00:0:0:0:0:0:0:11`); otherwise exact string equality.
+pub fn same_address(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The outcome of one uncached Secret GET.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretRead {
+    /// Read (so decrypted) from etcd; the object itself is dropped at once.
+    Read,
+    /// Deleted since it was listed (404): nothing to read, not counted.
+    Gone,
+}
+
+/// Pages through `store`'s Secret names and calls `get` for each one. Returns
+/// how many were read; a `Gone` is skipped and not counted; any list or get
+/// error is an `Err` naming the Secret (never its data).
+pub async fn read_every_secret<S, G, F>(store: &S, mut get: G) -> Result<u64, ProbeError>
+where
+    S: SecretStore,
+    G: FnMut(SecretKey) -> F,
+    F: std::future::Future<Output = Result<SecretRead, ProbeError>>,
+{
+    let mut read = 0u64;
+    let mut token: Option<String> = None;
+    loop {
+        let page = store.list_page(token.as_deref()).await.map_err(request_err)?;
+        for key in page.keys {
+            let id = format!("{}/{}", key.namespace, key.name);
+            match get(key).await {
+                Ok(SecretRead::Read) => read += 1,
+                Ok(SecretRead::Gone) => {}
+                Err(err) => return Err(ProbeError::Request(format!("get secret {id}: {err}"))),
+            }
+        }
+        match page.next {
+            Some(next) => token = Some(next),
+            None => return Ok(read),
+        }
+    }
 }
 
 pub fn canary_secret(value: &str) -> Secret {
@@ -149,6 +209,14 @@ impl ApiserverProbe for KubeApiserverProbe {
         Ok(node_targets(&list.items))
     }
 
+    async fn apiserver_endpoint_addresses(&self) -> Result<Vec<String>, ProbeError> {
+        let slices: Api<EndpointSlice> = Api::namespaced(self.client.clone(), "default");
+        let list = bounded(slices.list(&ListParams::default().labels(KUBERNETES_SERVICE_SLICES)))
+            .await?
+            .map_err(request_err)?;
+        Ok(endpoint_addresses(&list.items))
+    }
+
     async fn readyz_kms(&self, node: &NodeTarget) -> Result<bool, ProbeError> {
         Ok(kms_check_ok(&self.get_text(node, "/readyz?verbose").await?))
     }
@@ -167,8 +235,23 @@ impl ApiserverProbe for KubeApiserverProbe {
     }
 
     async fn list_all_secrets(&self, node: &NodeTarget) -> Result<u64, ProbeError> {
-        let store = KubeSecretStore::new(self.node_client(node)?);
-        bounded_for(LIST_TIMEOUT, verify_listable(&store)).await?.map_err(request_err)
+        // A limit-paged LIST may be served from the watch cache (Kubernetes
+        // >= 1.33), which decrypts nothing, so it only supplies the names. A
+        // GET with no resourceVersion is served from etcd, decrypting the
+        // Secret under its stored prefix. The Secret is dropped unread.
+        let client = self.node_client(node)?;
+        let store = KubeSecretStore::new(client.clone());
+        let get = |key: SecretKey| {
+            let api: Api<Secret> = Api::namespaced(client.clone(), &key.namespace);
+            async move {
+                match bounded(api.get(&key.name)).await? {
+                    Ok(_secret) => Ok(SecretRead::Read),
+                    Err(kube::Error::Api(status)) if status.code == 404 => Ok(SecretRead::Gone),
+                    Err(err) => Err(request_err(err)),
+                }
+            }
+        };
+        bounded_for(LIST_TIMEOUT, read_every_secret(&store, get)).await?
     }
 
     async fn canary_round_trip(&self) -> Result<bool, ProbeError> {
@@ -252,10 +335,128 @@ mod tests {
     }
 
     #[test]
-    fn a_control_plane_node_without_an_internal_ip_is_skipped() {
+    fn a_control_plane_node_without_an_internal_ip_is_kept_with_an_empty_address() {
+        // Final review I1: skipping it would silently drop an apiserver.
         let nodes = [node("cp1", &[("node-role.kubernetes.io/control-plane", "")], &[("Hostname", "cp1")])];
 
-        assert!(node_targets(&nodes).is_empty());
+        assert_eq!(node_targets(&nodes), vec![NodeTarget { name: "cp1".to_string(), address: String::new() }]);
+    }
+
+    #[test]
+    fn a_control_plane_node_without_any_status_is_kept_with_an_empty_address() {
+        let n: Node = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "cp1", "labels": { "node-role.kubernetes.io/control-plane": "" } }
+        }))
+        .unwrap();
+
+        assert_eq!(node_targets(&[n]), vec![NodeTarget { name: "cp1".to_string(), address: String::new() }]);
+    }
+
+    fn slice(addresses: &[&[&str]]) -> EndpointSlice {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": { "name": "kubernetes", "namespace": "default" },
+            "addressType": "IPv4",
+            "endpoints": addresses.iter().map(|a| serde_json::json!({ "addresses": a })).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn endpoint_addresses_are_every_address_of_every_endpoint_in_every_slice() {
+        let slices = [slice(&[&["10.0.0.11"], &["10.0.0.12", "10.0.0.13"]]), slice(&[&["fd00::11"]])];
+
+        assert_eq!(endpoint_addresses(&slices), ["10.0.0.11", "10.0.0.12", "10.0.0.13", "fd00::11"]);
+    }
+
+    #[test]
+    fn same_address_compares_ips_and_falls_back_to_strings() {
+        assert!(same_address("fd00::11", "fd00:0:0:0:0:0:0:11"));
+        assert!(same_address("10.0.0.1", "10.0.0.1"));
+        assert!(!same_address("10.0.0.1", "10.0.0.2"));
+        assert!(same_address("cp1.example", "cp1.example"));
+        assert!(!same_address("", "10.0.0.1"));
+    }
+
+    use crate::secret_rewrite::{SecretKey, SecretPage, SecretStore, StoreError, TouchOutcome};
+    use std::sync::Mutex;
+
+    /// Two pages of names; any page fetch after the scripted ones panics.
+    struct Pages(Mutex<Vec<Result<SecretPage, StoreError>>>);
+
+    impl SecretStore for Pages {
+        async fn list_page(&self, _token: Option<&str>) -> Result<SecretPage, StoreError> {
+            self.0.lock().unwrap().remove(0)
+        }
+        async fn touch(&self, _key: &SecretKey) -> Result<TouchOutcome, StoreError> {
+            panic!("the reader never writes")
+        }
+    }
+
+    fn key(ns: &str, name: &str) -> SecretKey {
+        SecretKey { namespace: ns.to_string(), name: name.to_string() }
+    }
+
+    fn two_pages() -> Pages {
+        Pages(Mutex::new(vec![
+            Ok(SecretPage { keys: vec![key("a", "s1"), key("a", "s2")], next: Some("t".to_string()) }),
+            Ok(SecretPage { keys: vec![key("b", "s3")], next: None }),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn read_every_secret_gets_each_listed_secret_and_counts_the_reads() {
+        let seen = Mutex::new(Vec::new());
+
+        let n = read_every_secret(&two_pages(), |k: SecretKey| {
+            seen.lock().unwrap().push(format!("{}/{}", k.namespace, k.name));
+            async { Ok(SecretRead::Read) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(n, 3);
+        assert_eq!(*seen.lock().unwrap(), ["a/s1", "a/s2", "b/s3"]);
+    }
+
+    #[tokio::test]
+    async fn read_every_secret_skips_secrets_deleted_since_listed_without_counting_them() {
+        let n = read_every_secret(&two_pages(), |k: SecretKey| async move {
+            Ok(if k.name == "s2" { SecretRead::Gone } else { SecretRead::Read })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn read_every_secret_fails_on_any_other_get_error() {
+        // A 500 from a Secret no provider can decrypt must never read as clean.
+        let err = read_every_secret(&two_pages(), |k: SecretKey| async move {
+            if k.name == "s3" {
+                Err(ProbeError::Request("500: failed to decrypt".to_string()))
+            } else {
+                Ok(SecretRead::Read)
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("b/s3") && err.to_string().contains("decrypt"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn read_every_secret_fails_on_a_list_error() {
+        let pages = Pages(Mutex::new(vec![
+            Ok(SecretPage { keys: vec![key("a", "s1")], next: Some("t".to_string()) }),
+            Err(StoreError("410 Gone: continue token expired".to_string())),
+        ]));
+
+        assert!(read_every_secret(&pages, |_k: SecretKey| async { Ok(SecretRead::Read) }).await.is_err());
     }
 
     #[test]
